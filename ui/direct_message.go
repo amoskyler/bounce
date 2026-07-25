@@ -344,6 +344,9 @@ func (ui *ui) NewDirectMessage(bounceUser chat.User) {
 	})
 	addFiles.Importance = widget.LowImportance
 	dm.pendingMessageAttachments = newPendingMessageAttachments()
+	entry.pasteAttachments = func() bool {
+		return ui.pasteAttachments(dm.pendingMessageAttachments, func() { ui.window.Canvas().Focus(entry) })
+	}
 
 	var messageButtons *fyne.Container
 	if fyne.CurrentDevice().IsMobile() {

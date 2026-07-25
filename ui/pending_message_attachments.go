@@ -194,6 +194,12 @@ func newPendingMessageAttachment(id uuid.UUID, reader fyne.URIReadCloser, action
 		}
 	}
 
+	// A file at or over the embedded limit picked from disk reaches here having
+	// taken none of the branches above, and every attachment needs an icon
+	if icon == nil {
+		icon = canvas.NewImageFromResource(theme.FileIcon())
+	}
+
 	ma := &messageAttachment{
 		id:       id,
 		reader:   reader,
@@ -360,6 +366,13 @@ func (pmas *pendingMessageAttachments) add(reader fyne.URIReadCloser, refocus fu
 		if newFile.fileSize > chat.EmbeddedFileLimit && runtime.GOOS == "android" {
 			os.Remove(newFile.reader.URI().Path())
 		}
+
+		// An image pasted from the clipboard has no home outside of the staging
+		// directory, so cancelling it is the end of it
+		if staged := stagedAttachmentDirectory(newFile.reader.URI().Path()); staged != "" {
+			newFile.reader.Close()
+			removeStagedAttachment(staged)
+		}
 	})
 	if err == nil {
 		pmas.files = append(pmas.files, newFile)
@@ -384,6 +397,12 @@ func (pmas *pendingMessageAttachments) extract() []*messageAttachment {
 	content := pmas.files
 	pmas.files = []*messageAttachment{}
 	pmas.Refresh()
+
+	// This is the moment a staged attachment stops being an abandoned draft and
+	// becomes something a message out there depends on
+	for _, file := range content {
+		retainStagedAttachment(file.reader.URI().Path())
+	}
 
 	return content
 }

@@ -213,6 +213,10 @@ func (ui *ui) build() {
 	ui.app = app.NewWithID("chat.bounce")
 	ui.app.SetIcon(newEmbeddedResource("assets/icon.png"))
 
+	// Images pasted into a message are staged on disk until they are sent, and
+	// nothing can be pending yet, so anything still here is from a previous run
+	clearStagedAttachments()
+
 	// Keep track of the focused state and use focus to report if the device is active
 	var activeTicker *time.Ticker
 	var activeTickerCleanup chan bool

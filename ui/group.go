@@ -637,6 +637,9 @@ func (ui *ui) buildNewGroupChat(bounceGroup chat.Group) {
 	})
 	addFiles.Importance = widget.LowImportance
 	g.pendingMessageAttachments = newPendingMessageAttachments()
+	entry.pasteAttachments = func() bool {
+		return ui.pasteAttachments(g.pendingMessageAttachments, func() { ui.window.Canvas().Focus(entry) })
+	}
 
 	var messageButtons *fyne.Container
 	if fyne.CurrentDevice().IsMobile() {

@@ -12,6 +12,7 @@ import (
 type threadEntry struct {
 	widget.Entry
 	hasAttachments    func() bool
+	pasteAttachments  func() bool
 	customOnSubmitted func()
 	customFocusLost   func()
 	selectKeyDown     bool
@@ -87,6 +88,19 @@ func (entry *threadEntry) TypedKey(ev *fyne.KeyEvent) {
 			entry.customOnSubmitted()
 		}
 	}
+}
+
+// TypedShortcut lets a paste attach an image from the clipboard instead of
+// inserting text.  This covers the keyboard shortcut and the right click menu
+// alike, because both are delivered through the focused widget.
+func (e *threadEntry) TypedShortcut(shortcut fyne.Shortcut) {
+	if _, ok := shortcut.(*fyne.ShortcutPaste); ok && e.pasteAttachments != nil && !e.Disabled() {
+		if e.pasteAttachments() {
+			return
+		}
+	}
+
+	e.Entry.TypedShortcut(shortcut)
 }
 
 func (e *threadEntry) KeyDown(key *fyne.KeyEvent) {

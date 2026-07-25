@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"errors"
 	"image"
 
 	"fyne.io/fyne/v2"
@@ -16,6 +17,7 @@ import (
 type imageViewer struct {
 	viewer    *fyne.Container
 	imageArea *fyne.Container
+	copy      *widget.Button
 	download  *widget.Button
 	left      *widget.Button
 	right     *widget.Button
@@ -81,6 +83,37 @@ func (ui *ui) buildImageViewer() {
 	})
 	download.Importance = widget.LowImportance
 
+	copyButton := widget.NewButtonWithIcon("", theme.ContentCopyIcon(), func() {
+		if ui.widgets.imageViewer.index > len(ui.widgets.imageViewer.data)-1 {
+			log.WithFields(log.Fields{
+				"index":       ui.widgets.imageViewer.index,
+				"data_length": len(ui.widgets.imageViewer.data),
+			}).Error("cannot copy image data with invalid index")
+			return
+		}
+
+		data := ui.widgets.imageViewer.data[ui.widgets.imageViewer.index]
+
+		// Anything that is not already png has to be re-encoded, which on a full
+		// sized photo takes long enough to be felt if it is done on the
+		// goroutine that draws the window
+		go func() {
+			if copyImageToClipboard(data) {
+				return
+			}
+
+			fyne.Do(func() {
+				ui.showDialog(dialog.NewError(errors.New("This image could not be copied to the clipboard"), ui.window), nil)
+			})
+		}()
+	})
+	copyButton.Importance = widget.LowImportance
+
+	// Nothing on this platform can take an image from us, so do not offer
+	if !clipboardImagesSupported() {
+		copyButton.Hide()
+	}
+
 	closeButton := widget.NewButtonWithIcon("", theme.CancelIcon(), func() {
 		if fyne.CurrentDevice().IsMobile() {
 			ui.mobileBack()
@@ -90,7 +123,7 @@ func (ui *ui) buildImageViewer() {
 	})
 	closeButton.Importance = widget.LowImportance
 
-	buttons := container.NewHBox(download, closeButton)
+	buttons := container.NewHBox(copyButton, download, closeButton)
 	downloadAndClose := container.New(
 		layout.NewBorderLayout(nil, nil, nil, buttons),
 		buttons,
@@ -112,6 +145,7 @@ func (ui *ui) buildImageViewer() {
 	right.Importance = widget.LowImportance
 
 	ui.widgets.imageViewer = &imageViewer{
+		copy:     copyButton,
 		download: download,
 		left:     left,
 		right:    right,
@@ -162,7 +196,9 @@ func (ui *ui) refreshImageViewer() {
 	data := ui.widgets.imageViewer.data[ui.widgets.imageViewer.index]
 	if len(data) == 0 {
 		ui.widgets.imageViewer.download.Disable()
+		ui.widgets.imageViewer.copy.Disable()
 	} else {
 		ui.widgets.imageViewer.download.Enable()
+		ui.widgets.imageViewer.copy.Enable()
 	}
 }
