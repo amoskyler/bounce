@@ -293,3 +293,88 @@ fn a_fresh_database_records_the_current_version() {
     let connection = Connection::open(&path).unwrap();
     assert_eq!(schema::version(&connection).unwrap(), schema::SCHEMA_VERSION);
 }
+
+#[test]
+fn contacts_with_history_are_opened_once_when_the_flag_starts_being_honoured() {
+    // `open_dm` had no producer for the whole life of the port, so every
+    // contact carries the column's default of false. The renderer papered over
+    // that by showing anyone with history regardless — which made closing a
+    // conversation a no-op. Honouring the flag without this repair would empty
+    // an existing user's sidebar on the first launch after upgrading.
+    let path = temp_path("open-dm-backfill");
+    let _ = std::fs::remove_file(&path);
+
+    let me = uuid::Uuid::new_v4();
+    let chatty = uuid::Uuid::new_v4();
+    let silent = uuid::Uuid::new_v4();
+    let blocked = uuid::Uuid::new_v4();
+
+    drop(Store::open(&path).expect("creates"));
+
+    {
+        let connection = Connection::open(&path).unwrap();
+        for (id, profile, is_blocked) in
+            [(me, 1, 0), (chatty, 0, 0), (silent, 0, 0), (blocked, 0, 1)]
+        {
+            connection
+                .execute(
+                    "INSERT INTO users (id, name, profile, blocked, open_dm)
+                     VALUES (?1, 'x', ?2, ?3, 0)",
+                    rusqlite::params![id.as_bytes().to_vec(), profile, is_blocked],
+                )
+                .unwrap();
+        }
+
+        // History with `chatty` and with `blocked`, but not with `silent`.
+        for other in [chatty, blocked] {
+            let thread = bounce_core::xor(me, other);
+            connection
+                .execute(
+                    "INSERT INTO direct_messages (id, author, xor, text, original_payload, signature)
+                     VALUES (?1, ?2, ?3, 'hi', x'', x'')",
+                    rusqlite::params![
+                        uuid::Uuid::new_v4().as_bytes().to_vec(),
+                        other.as_bytes().to_vec(),
+                        thread.as_bytes().to_vec(),
+                    ],
+                )
+                .unwrap();
+        }
+
+        // The fresh create already marked the repair done against an empty
+        // database; clear it so it runs against the rows above.
+        connection
+            .execute("DELETE FROM backfills WHERE name = 'open_dm_from_history'", [])
+            .unwrap();
+    }
+
+    drop(Store::open(&path).expect("migrates"));
+
+    let open = |id: uuid::Uuid| -> i64 {
+        Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT open_dm FROM users WHERE id = ?1",
+                rusqlite::params![id.as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+
+    assert_eq!(open(chatty), 1, "somebody we have talked to should stay visible");
+    assert_eq!(open(silent), 0, "a contact with no history should not be conjured up");
+    assert_eq!(open(blocked), 0, "and a blocked contact must not be reopened");
+
+    // Closing it afterwards must stick, or the repair would undo the user's
+    // choice on every launch.
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE users SET open_dm = 0 WHERE id = ?1",
+            rusqlite::params![chatty.as_bytes().to_vec()],
+        )
+        .unwrap();
+
+    drop(Store::open(&path).expect("reopens"));
+    assert_eq!(open(chatty), 0, "the repair must run once, not on every open");
+}

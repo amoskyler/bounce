@@ -274,6 +274,22 @@ function ContactDetails({
             confirm={`Clear the history of your conversation with ${user.name}? This removes it for both of you.`}
             onConfirm={() => window.bounce.clearHistory(user.id)}
           />
+          {/*
+            The two halves of what people mean by "delete this chat": the
+            messages go, and the row leaves the list. The contact stays,
+            because there is nothing useful to delete — their devices are what
+            make your remaining history verifiable, and a shared group would
+            recreate the record anyway.
+          */}
+          <DestructiveButton
+            label="Delete conversation"
+            confirm={
+              `Delete your conversation with ${user.name}? The messages are removed for ` +
+              'both of you and it leaves your chat list. They stay in your contacts, and ' +
+              'the conversation comes back if either of you writes again.'
+            }
+            onConfirm={() => deleteConversation(user.id)}
+          />
           {user.blocked ? (
             <button className="details__action" onClick={() => void unblockContact(user.id)}>
               Unblock {user.name}
@@ -872,4 +888,17 @@ async function pickGroupPicture(
   } catch (failure) {
     onError(failure instanceof Error ? failure.message : String(failure));
   }
+}
+
+/**
+ * Clear a conversation and take it off the list.
+ *
+ * Two existing operations rather than a new one, in the order that matters:
+ * the history goes first, so that if closing fails the user is left with the
+ * outcome they asked for rather than an empty conversation still sitting
+ * there. Nothing about the contact is deleted.
+ */
+async function deleteConversation(userId: string): Promise<void> {
+  await window.bounce.clearHistory(userId);
+  await window.bounce.setOpenDm(userId, false);
 }

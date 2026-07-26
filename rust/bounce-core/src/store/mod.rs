@@ -12,7 +12,7 @@
 
 pub mod schema;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -27,22 +27,42 @@ use crate::frames::message::{
 };
 use crate::frames::pairing::{AddUser, SyncDeviceOffer};
 use crate::frames::transport::{CustomScope, DeliveryRecord, FrameReference};
-use crate::frames::update::{UpdateDevice, UpdateDm, UpdateUser};
+use crate::frames::update::{UpdateDevice, UpdateDm, UpdateSettings, UpdateUser};
 use crate::frames::SignedFrame;
 use crate::types::FrameType;
 
 /// A handle to the device's database.
 pub struct Store {
     connection: Mutex<Connection>,
+    /// Where files too large to keep in the database live.
+    ///
+    /// A chunk is capped at a megabyte and an embedded file at twenty, so
+    /// those sit in `chunks.data` quite happily. Anything larger is seeded
+    /// from, and downloaded to, a file on disk — holding a gigabyte of
+    /// ciphertext in SQLite rows would mean loading it all to read any of it.
+    ///
+    /// `None` for an in-memory database, which has nowhere to put them.
+    blobs: Option<PathBuf>,
 }
 
 impl Store {
     /// Open, creating or migrating the schema as needed.
+    ///
+    /// Large-file storage goes in a `blobs` directory beside the database, as
+    /// it does in the Go implementation.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
         let connection = Connection::open(path)?;
         schema::ensure(&connection)?;
+
+        let blobs = path.parent().map(|parent| parent.join("blobs"));
+        if let Some(directory) = &blobs {
+            std::fs::create_dir_all(directory)?;
+        }
+
         Ok(Store {
             connection: Mutex::new(connection),
+            blobs,
         })
     }
 
@@ -52,7 +72,24 @@ impl Store {
         schema::ensure(&connection)?;
         Ok(Store {
             connection: Mutex::new(connection),
+            blobs: None,
         })
+    }
+
+    /// Give an in-memory store somewhere to put large files.
+    pub fn with_blobs_directory(mut self, directory: impl AsRef<Path>) -> Result<Self> {
+        let directory = directory.as_ref().to_path_buf();
+        std::fs::create_dir_all(&directory)?;
+        self.blobs = Some(directory);
+        Ok(self)
+    }
+
+    /// Where a file's bytes live on this device, for a file too large to
+    /// embed. `None` when there is nowhere to put one.
+    pub fn blob_path(&self, file_id: Uuid) -> Option<PathBuf> {
+        self.blobs
+            .as_ref()
+            .map(|directory| directory.join(file_id.to_string()))
     }
 
     fn with<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
@@ -279,6 +316,43 @@ impl Store {
     }
 
     /// Overwrite the mutable, locally-owned fields of a user row.
+    /// Replace this profile's user-level keys.
+    ///
+    /// Separate from [`Store::save_user`] because that deliberately refuses to
+    /// touch key columns on conflict: a user record relayed from a peer must
+    /// never be able to overwrite our own keys, which is exactly what an upsert
+    /// would let it do. Rolling keys is the one legitimate reason to write
+    /// them, so it gets its own statement — and one restricted to the profile
+    /// row, so it cannot be aimed at somebody else.
+    pub fn replace_profile_keys(
+        &self,
+        user_id: Uuid,
+        public_ecdsa: &[u8],
+        private_ecdsa: &[u8],
+        public_ecdh: &[u8],
+        private_ecdh: &[u8],
+    ) -> Result<()> {
+        self.with(|connection| {
+            let changed = connection.execute(
+                "UPDATE users
+                 SET public_ecdsa_key = ?2, private_ecdsa_key = ?3,
+                     public_ecdh_key = ?4, private_ecdh_key = ?5
+                 WHERE id = ?1 AND profile = 1",
+                params![
+                    uuid_bytes(user_id),
+                    public_ecdsa,
+                    private_ecdsa,
+                    public_ecdh,
+                    private_ecdh,
+                ],
+            )?;
+            if changed == 0 {
+                return Err(Error::NoProfile);
+            }
+            Ok(())
+        })
+    }
+
     pub fn update_user_local_state(&self, user: &User) -> Result<()> {
         self.with(|connection| {
             connection.execute(
@@ -462,6 +536,43 @@ impl Store {
                 params![address, at],
             )?;
             Ok(())
+        })
+    }
+
+    /// Store a change to the profile-wide settings.
+    pub fn save_update_settings(&self, update: &UpdateSettings) -> Result<()> {
+        self.with(|connection| {
+            connection.execute(
+                r#"INSERT INTO update_settings (
+                    id, type, data, timestamp, saved_at, author,
+                    signer, original_payload, signature
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                ON CONFLICT (id) DO NOTHING"#,
+                params![
+                    uuid_bytes(update.id),
+                    update.update_type,
+                    update.data,
+                    update.timestamp,
+                    update.saved_at,
+                    uuid_bytes(update.author),
+                    update.signed.signer,
+                    update.signed.original_payload,
+                    update.signed.signature,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn update_settings_frame(&self, id: Uuid) -> Result<Option<UpdateSettings>> {
+        self.with(|connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT * FROM update_settings WHERE id = ?1",
+                    params![uuid_bytes(id)],
+                    row_to_update_settings,
+                )
+                .optional()?)
         })
     }
 
@@ -1675,6 +1786,10 @@ impl Store {
                 .update_device(frame_id)?
                 .map(|update| update.payload())
                 .transpose()?,
+            FrameType::UpdateSettings => self
+                .update_settings_frame(frame_id)?
+                .map(|update| update.payload())
+                .transpose()?,
             FrameType::UpdateUser => self
                 .update_user(frame_id)?
                 .map(|update| update.payload())
@@ -1926,6 +2041,20 @@ impl Store {
         })
     }
 
+    /// Record that we now hold a chunk whose bytes live on disk.
+    ///
+    /// A large file's chunks carry no `data`, so "do we have it" cannot be
+    /// answered by looking for bytes in the row.
+    pub fn mark_chunk_downloaded(&self, file_id: Uuid, index: i64) -> Result<()> {
+        self.with(|connection| {
+            connection.execute(
+                "UPDATE chunks SET downloaded = 1 WHERE file_id = ?1 AND idx = ?2",
+                params![uuid_bytes(file_id), index],
+            )?;
+            Ok(())
+        })
+    }
+
     /// The bytes of a chunk, by content hash.
     ///
     /// Content-addressed, so a chunk fetched for one file also serves any other
@@ -1942,8 +2071,21 @@ impl Store {
         })
     }
 
+    /// Whether this device holds a chunk's bytes, wherever they live.
+    ///
+    /// Not `chunk_data(..).is_some()`: a large file's chunks are on disk and
+    /// carry no row data, so that test would say no forever and the same chunk
+    /// would be requested on every offer.
     pub fn has_chunk(&self, hash: &str) -> Result<bool> {
-        Ok(self.chunk_data(hash)?.is_some())
+        self.with(|connection| {
+            let count: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM chunks
+                 WHERE hash = ?1 AND (data IS NOT NULL OR downloaded = 1)",
+                params![hash],
+                |row| row.get(0),
+            )?;
+            Ok(count > 0)
+        })
     }
 
     /// Reassemble a file, or `None` if any chunk is still missing.
@@ -1974,11 +2116,17 @@ impl Store {
             // that shares one with another file already has it. Reporting
             // otherwise would leave an assemblable file stuck below 100%, and
             // the interface only asks for the bytes once it reaches that.
+            //
+            // `downloaded` is checked as well as `data`, because a file too
+            // large to embed keeps its bytes on disk and its rows carry no
+            // data at all — counting only `data` would leave every large
+            // transfer stuck at zero for ever.
             let (total, held) = connection.query_row(
                 r#"SELECT COUNT(*),
                           SUM(CASE WHEN EXISTS (
                               SELECT 1 FROM chunks AS held
-                              WHERE held.hash = wanted.hash AND held.data IS NOT NULL
+                              WHERE held.hash = wanted.hash
+                                AND (held.data IS NOT NULL OR held.downloaded = 1)
                           ) THEN 1 ELSE 0 END)
                    FROM chunks AS wanted WHERE wanted.file_id = ?1"#,
                 params![uuid_bytes(id)],
@@ -1991,6 +2139,28 @@ impl Store {
                 return Ok(0.0);
             }
             Ok(held as f64 / total as f64)
+        })
+    }
+
+    /// Mark a file as one this device wants after all.
+    pub fn mark_file_wanted(&self, id: Uuid) -> Result<()> {
+        self.with(|connection| {
+            connection.execute(
+                "UPDATE files SET wanted = 1 WHERE id = ?1",
+                params![uuid_bytes(id)],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Record where a file's bytes will live on this device.
+    pub fn set_file_path(&self, id: Uuid, path: &str) -> Result<()> {
+        self.with(|connection| {
+            connection.execute(
+                "UPDATE files SET path = ?2 WHERE id = ?1",
+                params![uuid_bytes(id), path],
+            )?;
+            Ok(())
         })
     }
 
@@ -2333,6 +2503,18 @@ fn row_to_update_user(row: &Row) -> rusqlite::Result<UpdateUser> {
         timestamp: row.get("timestamp")?,
         saved_at: row.get("saved_at")?,
         seen: row.get("seen")?,
+    })
+}
+
+fn row_to_update_settings(row: &Row) -> rusqlite::Result<UpdateSettings> {
+    Ok(UpdateSettings {
+        signed: row_to_signed_frame(row)?,
+        id: row_uuid(row, "id")?,
+        update_type: row.get("type")?,
+        data: row.get::<_, Option<Vec<u8>>>("data")?.unwrap_or_default(),
+        timestamp: row.get("timestamp")?,
+        saved_at: row.get("saved_at")?,
+        author: row_uuid(row, "author")?,
     })
 }
 

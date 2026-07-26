@@ -13,12 +13,12 @@
 //!   epoch. That is the protocol's convention, and using `NULL` instead would
 //!   force every comparison to handle three states.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::error::{Error, Result};
 
 /// Bumped whenever the schema changes in a way that needs a migration.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// Create every table and index, if they do not already exist.
 pub fn create(connection: &Connection) -> Result<()> {
@@ -421,6 +421,33 @@ pub fn create(connection: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_update_devices_target ON update_devices (target);
 
+        -- A change to the profile-wide settings.
+        --
+        -- Sync-scoped, so these never reach a contact; kept as frames so a
+        -- device that was offline for a change replays it rather than staying
+        -- on a stale preference.
+        CREATE TABLE IF NOT EXISTS update_settings (
+            id                BLOB PRIMARY KEY NOT NULL,
+            type              INTEGER NOT NULL DEFAULT 0,
+            data              BLOB,
+            timestamp         INTEGER NOT NULL DEFAULT 0,
+            saved_at          INTEGER NOT NULL DEFAULT 0,
+            author            BLOB,
+            signer            TEXT NOT NULL DEFAULT '',
+            original_payload  BLOB NOT NULL DEFAULT x'',
+            signature         BLOB NOT NULL DEFAULT x''
+        );
+
+        -- Data repairs that have already been applied.
+        --
+        -- The schema converges automatically, but a repair to *rows* has no
+        -- structure to compare against — running one twice would undo a
+        -- choice the user made in between. This records which have run.
+        CREATE TABLE IF NOT EXISTS backfills (
+            name        TEXT PRIMARY KEY NOT NULL,
+            applied_at  INTEGER NOT NULL DEFAULT 0
+        );
+
         -- The secret behind an "add me as a contact" code.
         CREATE TABLE IF NOT EXISTS pairing_offers (
             id         BLOB PRIMARY KEY NOT NULL,
@@ -537,6 +564,88 @@ fn converge(connection: &Connection) -> Result<()> {
     // violate it, and the deduplication that makes room for it needs the
     // columns to exist first.
     create_deferred_indexes(connection)?;
+
+    backfill(connection)?;
+    Ok(())
+}
+
+/// Repairs to *data* that a schema change makes necessary.
+///
+/// Distinct from the convergence above, which only ever adds structure. Each
+/// one here has to be safe to run repeatedly, because `ensure` runs on every
+/// open and there is no per-step bookkeeping.
+fn backfill(connection: &Connection) -> Result<()> {
+    // Runs once. A repair to rows has no structure to compare against, so a
+    // second pass would undo whatever the user did in between — here, closing
+    // a conversation the first pass had opened.
+    let done: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM backfills WHERE name = 'open_dm_from_history'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    if done > 0 {
+        return Ok(());
+    }
+
+    // `open_dm` decides whether a conversation appears on the thread list, and
+    // for the whole of this port's life nothing ever wrote it — so every
+    // contact adopted before now carries the `false` the column defaults to.
+    // The renderer papered over that by showing anyone with message history
+    // regardless, which is what made closing a conversation a no-op.
+    //
+    // Now that the flag is honoured, that default would empty an existing
+    // user's sidebar on the first launch after upgrading. So anyone actually
+    // corresponded with is opened, once.
+    //
+    // A thread is keyed by the XOR of the two participants rather than by
+    // naming them, and SQLite has no XOR over blobs, so the pairing is
+    // computed here instead of in the statement.
+    let profile: Option<Vec<u8>> = connection
+        .query_row("SELECT id FROM users WHERE profile = 1", [], |row| row.get(0))
+        .optional()?;
+    let Some(profile) = profile.and_then(|bytes| uuid::Uuid::from_slice(&bytes).ok()) else {
+        // No profile yet: a fresh database has nothing to repair, and marking
+        // it done costs nothing because there will never be anything either.
+        connection.execute(
+            "INSERT INTO backfills (name, applied_at) VALUES ('open_dm_from_history', ?1)",
+            rusqlite::params![crate::now()],
+        )?;
+        return Ok(());
+    };
+
+    let candidates: Vec<Vec<u8>> = {
+        let mut statement = connection
+            .prepare("SELECT id FROM users WHERE profile = 0 AND blocked = 0 AND open_dm = 0")?;
+        let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+
+    for bytes in candidates {
+        let Ok(user_id) = uuid::Uuid::from_slice(&bytes) else {
+            continue;
+        };
+        let thread = crate::xor(profile, user_id);
+
+        let messages: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM direct_messages WHERE xor = ?1 LIMIT 1",
+            rusqlite::params![thread.as_bytes().to_vec()],
+            |row| row.get(0),
+        )?;
+
+        if messages > 0 {
+            connection.execute(
+                "UPDATE users SET open_dm = 1 WHERE id = ?1",
+                rusqlite::params![bytes],
+            )?;
+        }
+    }
+
+    connection.execute(
+        "INSERT INTO backfills (name, applied_at) VALUES ('open_dm_from_history', ?1)",
+        rusqlite::params![crate::now()],
+    )?;
     Ok(())
 }
 

@@ -140,15 +140,30 @@ test('a contact with an open conversation gets a sidebar row', () => {
   assert.deepEqual(ids(conversations(state)).sort(), ['ada', ME].sort());
 });
 
-test('history keeps a conversation in the sidebar whatever the flag says', () => {
-  // `open_dm` had no producer for the whole of the port's life, so a false one
-  // on a conversation with messages in it means nothing.
+test('a closed conversation leaves the sidebar even if it has history', () => {
+  // This used to assert the opposite. History outranked the flag because
+  // `open_dm` had no producer and every contact carried a false one — but that
+  // made closing a no-op for anyone you had ever messaged, which is the entire
+  // point of closing. A one-time migration now opens everyone with history,
+  // and the engine reopens a conversation when a message arrives, so a false
+  // flag here is a deliberate choice rather than a missing value.
   const state = stateWith({
-    users: { ada: user('ada') },
+    users: { ada: user('ada', { openDm: false }) },
     messagesByThread: { ada: [message('ada', 100)] },
   });
 
-  assert.deepEqual(ids(conversations(state)).sort(), ['ada', ME].sort());
+  assert.deepEqual(ids(conversations(state)), [ME]);
+});
+
+test('an open conversation is a sidebar row whether or not it has history', () => {
+  const withHistory = stateWith({
+    users: { ada: user('ada', { openDm: true }) },
+    messagesByThread: { ada: [message('ada', 100)] },
+  });
+  const empty = stateWith({ users: { bo: user('bo', { openDm: true }) } });
+
+  assert.deepEqual(ids(conversations(withHistory)).sort(), ['ada', ME].sort());
+  assert.deepEqual(ids(conversations(empty)).sort(), ['bo', ME].sort());
 });
 
 test('a blocked contact is never a sidebar row, even with history', () => {
@@ -227,8 +242,8 @@ test('a contact knows whether the sidebar is showing it', () => {
   const state = stateWith({
     users: {
       open: user('open', { openDm: true }),
-      shut: user('shut'),
-      chatty: user('chatty'),
+      shut: user('shut', { openDm: false }),
+      chatty: user('chatty', { openDm: true }),
     },
     messagesByThread: { chatty: [message('chatty', 10)] },
   });
@@ -238,11 +253,13 @@ test('a contact knows whether the sidebar is showing it', () => {
   assert.equal(byId.get('shut')?.open, false);
   assert.equal(byId.get('chatty')?.open, true);
 
-  // Hiding is only offered where it would take a row off the list: history
-  // holds `chatty` there whatever the flag becomes.
+  // Hiding is offered wherever the row is showing. It used to be withheld from
+  // a conversation with history, because history pinned it to the sidebar and
+  // the control would have done nothing; the flag decides now, so closing one
+  // with messages in it works like any other.
   assert.equal(byId.get('open')?.hideable, true);
   assert.equal(byId.get('shut')?.hideable, false);
-  assert.equal(byId.get('chatty')?.hideable, false);
+  assert.equal(byId.get('chatty')?.hideable, true);
 });
 
 test('the contact search matches on the displayed name', () => {

@@ -143,6 +143,169 @@ impl Broadcastable for UpdateUser {
     }
 }
 
+/// The kind of change an [`UpdateSettings`] applies.
+///
+/// The numbers are the Go implementation's and are wire values, so they cannot
+/// be renumbered or reordered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum UpdateSettingsType {
+    DefaultGroupRetention = 0,
+    DefaultReadReceipts = 1,
+    DefaultTypingIndicators = 2,
+    NewGroupRestrictUserManagement = 3,
+    NewGroupRestrictGroupEdits = 4,
+    NewGroupRestrictPosting = 5,
+    AutoJoinGroups = 6,
+    DefaultDmRetention = 7,
+}
+
+impl UpdateSettingsType {
+    pub fn as_u16(self) -> u16 {
+        self as u16
+    }
+
+    pub fn from_u16(value: u16) -> Result<Self> {
+        use UpdateSettingsType::*;
+        Ok(match value {
+            0 => DefaultGroupRetention,
+            1 => DefaultReadReceipts,
+            2 => DefaultTypingIndicators,
+            3 => NewGroupRestrictUserManagement,
+            4 => NewGroupRestrictGroupEdits,
+            5 => NewGroupRestrictPosting,
+            6 => AutoJoinGroups,
+            7 => DefaultDmRetention,
+            other => return Err(Error::UnknownFrameType(other)),
+        })
+    }
+
+    /// Whether the payload is an eight byte integer rather than a single byte.
+    fn takes_an_integer(self) -> bool {
+        matches!(
+            self,
+            UpdateSettingsType::DefaultGroupRetention | UpdateSettingsType::DefaultDmRetention
+        )
+    }
+}
+
+/// A change to the profile-wide settings.
+///
+/// Always sync-scoped: these are one person's preferences, and every device
+/// they own needs them. Nothing here reaches a contact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateSettings {
+    #[serde(skip)]
+    pub signed: SignedFrame,
+
+    #[serde(rename = "ID")]
+    pub id: Uuid,
+
+    #[serde(rename = "Type")]
+    pub update_type: u16,
+
+    #[serde(rename = "Data", with = "serde_bytes")]
+    pub data: Vec<u8>,
+
+    #[serde(rename = "Timestamp")]
+    pub timestamp: i64,
+
+    #[serde(skip)]
+    pub saved_at: i64,
+    /// Whose settings these are. Derived from the signing device rather than
+    /// carried, exactly as Go does — a frame that named its own owner would be
+    /// a frame that could claim to be somebody else's.
+    #[serde(skip)]
+    pub author: Uuid,
+}
+
+impl UpdateSettings {
+    pub fn new(update_type: UpdateSettingsType, data: Vec<u8>, timestamp: i64) -> Self {
+        UpdateSettings {
+            signed: SignedFrame::default(),
+            id: Uuid::new_v4(),
+            update_type: update_type.as_u16(),
+            data,
+            timestamp,
+            saved_at: 0,
+            author: Uuid::nil(),
+        }
+    }
+
+    pub fn kind(&self) -> Result<UpdateSettingsType> {
+        UpdateSettingsType::from_u16(self.update_type)
+    }
+
+    /// Whether the payload is the right shape for the change it claims.
+    ///
+    /// Checked before anything is applied, because a malformed one would
+    /// otherwise be stored and replayed to every other device forever.
+    pub fn has_valid_payload(&self) -> bool {
+        let Ok(kind) = self.kind() else {
+            return false;
+        };
+
+        if kind.takes_an_integer() {
+            return self.data.len() == 8;
+        }
+        if self.data.len() != 1 {
+            return false;
+        }
+
+        match kind {
+            // 0 joins only groups with no unknown users, 1 never, 2 always.
+            UpdateSettingsType::AutoJoinGroups => self.data[0] <= 2,
+            _ => self.data[0] <= 1,
+        }
+    }
+
+    /// Read an eight byte little-endian payload.
+    pub fn data_as_i64(&self) -> Option<i64> {
+        <[u8; 8]>::try_from(self.data.as_slice())
+            .ok()
+            .map(i64::from_le_bytes)
+    }
+
+    pub fn data_as_bool(&self) -> Option<bool> {
+        (self.data.len() == 1).then(|| self.data[0] != 0)
+    }
+
+    pub fn encode_i64(value: i64) -> Vec<u8> {
+        value.to_le_bytes().to_vec()
+    }
+
+    pub fn encode_bool(value: bool) -> Vec<u8> {
+        vec![u8::from(value)]
+    }
+}
+
+impl Broadcastable for UpdateSettings {
+    fn id(&self) -> Uuid {
+        self.id
+    }
+    fn frame_type(&self) -> FrameType {
+        FrameType::UpdateSettings
+    }
+    fn payload(&self) -> Result<Vec<u8>> {
+        msgpack::to_vec(&self.signed.to_container())
+    }
+    fn scope(&self, _my_id: Uuid) -> Scope {
+        Scope::Sync
+    }
+    fn destination(&self, my_id: Uuid) -> Uuid {
+        my_id
+    }
+    fn author(&self) -> Uuid {
+        self.author
+    }
+    fn timestamp(&self) -> i64 {
+        self.timestamp
+    }
+    fn saved_at(&self) -> i64 {
+        self.saved_at
+    }
+}
+
 /// The kind of change an [`UpdateDevice`] applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]

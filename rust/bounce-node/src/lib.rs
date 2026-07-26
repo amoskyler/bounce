@@ -699,47 +699,57 @@ impl BounceNode {
 
     /// Retention, in seconds, for conversations started from now on.
     #[napi]
-    pub fn set_default_retention(&self, seconds: i64) -> Result<()> {
-        self.engine.set_default_retention(seconds).map_err(to_napi_error)
+    pub async fn set_default_retention(&self, seconds: i64) -> Result<()> {
+        self.engine.set_default_retention(seconds)
+            .await
+            .map_err(to_napi_error)
     }
 
     #[napi]
-    pub fn set_default_read_receipts(&self, enabled: bool) -> Result<()> {
-        self.engine.set_default_read_receipts(enabled).map_err(to_napi_error)
+    pub async fn set_default_read_receipts(&self, enabled: bool) -> Result<()> {
+        self.engine.set_default_read_receipts(enabled)
+            .await
+            .map_err(to_napi_error)
     }
 
     #[napi]
-    pub fn set_default_typing_indicators(&self, enabled: bool) -> Result<()> {
+    pub async fn set_default_typing_indicators(&self, enabled: bool) -> Result<()> {
         self.engine
             .set_default_typing_indicators(enabled)
+            .await
             .map_err(to_napi_error)
     }
 
     #[napi]
-    pub fn set_new_group_restrict_posting(&self, restricted: bool) -> Result<()> {
+    pub async fn set_new_group_restrict_posting(&self, restricted: bool) -> Result<()> {
         self.engine
             .set_new_group_restrict_posting(restricted)
+            .await
             .map_err(to_napi_error)
     }
 
     #[napi]
-    pub fn set_new_group_restrict_edits(&self, restricted: bool) -> Result<()> {
+    pub async fn set_new_group_restrict_edits(&self, restricted: bool) -> Result<()> {
         self.engine
             .set_new_group_restrict_edits(restricted)
+            .await
             .map_err(to_napi_error)
     }
 
     #[napi]
-    pub fn set_new_group_restrict_user_management(&self, restricted: bool) -> Result<()> {
+    pub async fn set_new_group_restrict_user_management(&self, restricted: bool) -> Result<()> {
         self.engine
             .set_new_group_restrict_user_management(restricted)
+            .await
             .map_err(to_napi_error)
     }
 
     /// 0 joins only groups with no unknown users, 1 never joins, 2 always does.
     #[napi]
-    pub fn set_auto_join_groups(&self, setting: i64) -> Result<()> {
-        self.engine.set_auto_join_groups(setting).map_err(to_napi_error)
+    pub async fn set_auto_join_groups(&self, setting: i64) -> Result<()> {
+        self.engine.set_auto_join_groups(setting)
+            .await
+            .map_err(to_napi_error)
     }
 
     // -- this profile's devices ----------------------------------------------

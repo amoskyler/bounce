@@ -232,6 +232,35 @@ impl<N: Network + 'static> Engine<N> {
         }
     }
 
+    /// Put a closed conversation back on the list because something arrived
+    /// in it.
+    ///
+    /// Closing a conversation only hides it — nothing is deleted, and the
+    /// messages keep arriving. Without this they would keep arriving
+    /// *invisibly*, which turns a tidying gesture into silent message loss.
+    /// Go reopens in its interface (`ui/direct_message.go:1207`); doing it in
+    /// the engine means a second client gets the same behaviour for free, and
+    /// a message that lands while no window is open is not missed.
+    fn reopen_conversation(&self, user_id: Uuid) -> Result<()> {
+        let Some(user) = self.store.user(user_id)? else {
+            return Ok(());
+        };
+        // A blocked contact stays closed: their messages are refused, and
+        // reopening would put somebody back on the list who was deliberately
+        // taken off it.
+        if user.open_dm || user.blocked {
+            return Ok(());
+        }
+
+        let mut reopened = user;
+        reopened.open_dm = true;
+        self.store.update_user_local_state(&reopened)?;
+        self.emit(Event::UserUpdated {
+            user: self.user_view(&reopened, false),
+        });
+        Ok(())
+    }
+
     fn note_activity_in(&self, group_id: Uuid, at: i64) {
         if let Err(error) = self.store.note_group_activity(group_id, at) {
             tracing::debug!(%error, "could not record group activity");
@@ -2848,6 +2877,7 @@ impl<N: Network + 'static> Engine<N> {
             FrameType::AddUserRequestRejected => self.handle_add_user_rejected(peer).await,
             FrameType::AddUser => self.handle_add_user(peer, &frame.payload).await,
             FrameType::UpdateDevice => self.handle_update_device(peer, &frame.payload).await,
+            FrameType::UpdateSettings => self.handle_update_settings(peer, &frame.payload).await,
             FrameType::SyncDeviceRequest => {
                 self.handle_sync_device_request(peer, &frame.payload).await
             }
@@ -2951,6 +2981,7 @@ impl<N: Network + 'static> Engine<N> {
 
         let counterparty = message.destination(my_id);
         self.note_activity_with(counterparty, message.written_at);
+        self.reopen_conversation(counterparty)?;
 
         // The author has evidently stopped composing.
         self.clear_typing_indicator(message.author, counterparty).await;
@@ -3528,6 +3559,7 @@ impl<N: Network + 'static> Engine<N> {
             FrameType::Draft => self.handle_draft(peer, &frame.payload).await,
             FrameType::Confirmation => self.handle_confirmation(peer, &frame.payload).await,
             FrameType::UpdateDevice => self.handle_update_device(peer, &frame.payload).await,
+            FrameType::UpdateSettings => self.handle_update_settings(peer, &frame.payload).await,
             other => {
                 // Loud, because this is what the omission above looked like:
                 // a frame accepted into catch-up, counted towards progress,

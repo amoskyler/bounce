@@ -32,15 +32,21 @@
 //! it has it. Losing a peer mid-download costs the chunks in flight, not the
 //! message.
 //!
-//! ## What is not here
+//! ## Files too large to embed
 //!
-//! Only files small enough to embed ([`crate::EMBEDDED_FILE_LIMIT`]) can be
-//! sent. Larger ones are seeded in place from disk in the Go implementation,
-//! which needs a path that survives restarts and a reader that streams rather
-//! than buffering; sending one here fails with a message saying so rather than
-//! silently truncating. Encrypted-device storage — where a device holds
-//! ciphertext chunks it cannot read — is likewise unimplemented; those frame
-//! types are reserved but never sent.
+//! A chunk is capped at a megabyte and an embedded file at
+//! [`crate::EMBEDDED_FILE_LIMIT`], so those live in the database. Anything
+//! larger is seeded *in place*: the `File` record points at a path on disk,
+//! chunk rows carry hashes and no bytes, and a request is answered by seeking
+//! into the file. Holding a gigabyte in SQLite rows would mean loading all of
+//! it to read any of it.
+//!
+//! A large file arriving is written to `<blob>.bouncedownload` until every
+//! chunk is present, then renamed — so an interrupted transfer is never
+//! mistaken for a complete file.
+//!
+//! Encrypted-device storage — where a device holds ciphertext chunks it cannot
+//! read — remains unimplemented; those frame types are reserved but never sent.
 
 use uuid::Uuid;
 
@@ -284,7 +290,7 @@ impl<N: Network + 'static> Engine<N> {
     /// Profile updates replay in timestamp order and timestamps have
     /// one-second resolution, so two changes in the same second would be
     /// ordered by their random ids and the older one could win.
-    fn next_profile_update_timestamp(&self, user_id: Uuid) -> Result<i64> {
+    pub(super) fn next_profile_update_timestamp(&self, user_id: Uuid) -> Result<i64> {
         let latest = self
             .store
             .updates_for_user(user_id)?
@@ -388,8 +394,11 @@ impl<N: Network + 'static> Engine<N> {
             return Err(Error::InvalidFrame("refusing to send an empty file".into()));
         }
         if attachment.data.len() as i64 > crate::EMBEDDED_FILE_LIMIT {
+            // Buffering it was the caller's choice, and at this size it is the
+            // wrong one — `stage_large_file` takes a path and never holds more
+            // than a chunk at a time.
             return Err(Error::InvalidFrame(format!(
-                "{} is larger than the {} MiB attachment limit",
+                "{} is larger than the {} MiB embedding limit; send it from a path instead",
                 attachment.name,
                 crate::EMBEDDED_FILE_LIMIT / (1024 * 1024)
             )));
@@ -435,6 +444,43 @@ impl<N: Network + 'static> Engine<N> {
         }
 
         Ok(record)
+    }
+
+    /// Announce one file: its metadata, then every chunk we hold of it.
+    ///
+    /// Separate from sending a message, because a picture or a seeded file has
+    /// no message to travel with.
+    pub async fn announce_file(&self, record: &File) -> Result<()> {
+        self.announce_files(std::slice::from_ref(record)).await
+    }
+
+    /// Ask for a file we have the metadata for but chose not to fetch.
+    ///
+    /// Anything above the embedding limit arrives as a record and nothing
+    /// else — downloading half a gigabyte because somebody mentioned it would
+    /// not be a favour. This is what a person clicking "download" calls.
+    pub async fn request_file(&self, file_id: Uuid) -> Result<()> {
+        let Some(mut record) = self.store.file(file_id)? else {
+            return Err(Error::InvalidFrame("no such file".into()));
+        };
+
+        if !record.wanted {
+            record.wanted = true;
+            self.store.mark_file_wanted(file_id)?;
+        }
+
+        // A large file needs somewhere to land before any of it arrives.
+        if !record.is_embedded() && record.path.is_empty() {
+            let Some(path) = self.store.blob_path(file_id) else {
+                return Err(Error::InvalidFrame(
+                    "this device has nowhere to put a file that large".into(),
+                ));
+            };
+            record.path = path.to_string_lossy().into_owned();
+            self.store.set_file_path(file_id, &record.path)?;
+        }
+
+        self.request_missing_chunks(&record).await
     }
 
     /// Broadcast each file's metadata, then advertise every chunk of it.
@@ -531,6 +577,21 @@ impl<N: Network + 'static> Engine<N> {
         record.wanted = record.is_embedded();
         record.downloaded = false;
 
+        // The sender's path is theirs, not ours. A large file lands in our own
+        // blobs directory, under the file's id — and if we have nowhere to put
+        // one, we do not pretend we can take it.
+        if record.is_embedded() {
+            record.path = String::new();
+        } else {
+            match self.store.blob_path(record.id) {
+                Some(path) => record.path = path.to_string_lossy().into_owned(),
+                None => {
+                    record.path = String::new();
+                    record.wanted = false;
+                }
+            }
+        }
+
         tracing::info!(
             file = %record.id, name = %record.name, size = record.size,
             chunks = hashes.len(), wanted = record.wanted,
@@ -615,7 +676,7 @@ impl<N: Network + 'static> Engine<N> {
     pub(super) async fn handle_chunk_request(&self, peer: &str, payload: &[u8]) -> Result<()> {
         let request: ChunkRequest = crate::msgpack::from_slice(payload)?;
 
-        match self.store.chunk_data(&request.hash)? {
+        match self.chunk_bytes(&request.hash)? {
             Some(data) => {
                 tracing::debug!(hash = %request.hash, to = %peer, bytes = data.len(), "serving a chunk");
                 // The payload is the chunk itself. See `frames::file::Chunk`:
@@ -672,7 +733,14 @@ impl<N: Network + 'static> Engine<N> {
             .iter()
             .position(|candidate| candidate == &hash)
             .unwrap_or(0) as i64;
-        self.store.save_chunk(file_id, index, &hash, Some(payload))?;
+        if record.is_embedded() {
+            self.store.save_chunk(file_id, index, &hash, Some(payload))?;
+        } else {
+            // Too big for a row. The bytes go into the file being assembled,
+            // and the row records only that we now hold this chunk.
+            self.write_chunk_to_disk(&record, index as usize, payload)?;
+            self.store.mark_chunk_downloaded(file_id, index)?;
+        }
 
         // Having it means we can serve it.
         self.offer_chunk(&record, &hash).await?;
@@ -760,6 +828,12 @@ impl<N: Network + 'static> Engine<N> {
 
         if fraction >= 1.0 {
             if !record.downloaded {
+                // Drop the `.bouncedownload` suffix first: until that happens
+                // the file is not there under the name the record gives, and
+                // anything acting on `FileComplete` would find nothing.
+                if !record.is_embedded() && !record.path.is_empty() {
+                    self.finish_disk_download(record)?;
+                }
                 self.store.mark_file_downloaded(record.id)?;
             }
             self.emit(Event::FileComplete { file_id: record.id });
@@ -810,6 +884,162 @@ impl<N: Network + 'static> Engine<N> {
         }
         views
     }
+    // ---------------------------------------------------------------------
+    // Files too large to embed
+    // ---------------------------------------------------------------------
+
+    /// Stage a file that stays on disk, hashing it a chunk at a time.
+    ///
+    /// Nothing is copied and nothing is buffered: the record points at the
+    /// path it was given, and every chunk is read back from there when asked
+    /// for. That is what makes a file larger than memory sendable at all.
+    pub fn stage_large_file(
+        &self,
+        path: &std::path::Path,
+        attached_to: Uuid,
+        scope: Scope,
+        destination: Uuid,
+    ) -> Result<File> {
+        use std::io::Read;
+
+        let author = self.store.my_user_id()?;
+        let size = std::fs::metadata(path)?.len() as i64;
+
+        let mut handle = std::fs::File::open(path)?;
+        let mut buffer = vec![0u8; crate::CHUNK_SIZE];
+        let mut hashes = Vec::new();
+        let mut whole = blake3::Hasher::new();
+
+        loop {
+            // `read` is allowed to return short of the buffer, so fill it
+            // deliberately — a short read would otherwise split a chunk and
+            // give it a hash no other implementation computes.
+            let mut filled = 0;
+            while filled < buffer.len() {
+                match handle.read(&mut buffer[filled..])? {
+                    0 => break,
+                    n => filled += n,
+                }
+            }
+            if filled == 0 {
+                break;
+            }
+            whole.update(&buffer[..filled]);
+            hashes.push(hex::encode(crate::crypto::hash(&buffer[..filled])));
+        }
+
+        let file_id = Uuid::new_v4();
+        let mut record = File {
+            signed: SignedFrame::default(),
+            id: file_id,
+            name: path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "file".into()),
+            file_type: FileType::MessageAttachment as i64,
+            attached_to,
+            hash: hex::encode(whole.finalize().as_bytes()),
+            size,
+            chunk_size: crate::CHUNK_SIZE as i64,
+            hash_list: hashes.join(","),
+            encrypted_hash_list: String::new(),
+            key: Vec::new(),
+            nonce: Vec::new(),
+            path: path.to_string_lossy().into_owned(),
+            wanted: true,
+            downloaded: true,
+            scope: scope.as_i64(),
+            destination,
+            author,
+            timestamp: crate::now(),
+            saved_at: crate::now(),
+        };
+
+        let body = crate::msgpack::to_vec(&record)?;
+        let container = SignedContainer::create(&self.key, body);
+        record.signed = SignedFrame::from_container(&container);
+
+        self.store.save_file(&record)?;
+        // Hashes only. The bytes stay where they are.
+        for (index, hash) in hashes.iter().enumerate() {
+            self.store.save_chunk(file_id, index as i64, hash, None)?;
+        }
+
+        Ok(record)
+    }
+
+    /// The bytes of one chunk, wherever they happen to live.
+    ///
+    /// An embedded file keeps them in the database. A large one keeps them in
+    /// the file itself, so the chunk is read by seeking to its offset — which
+    /// is why the chunk size is part of the record rather than a constant the
+    /// reader assumes.
+    fn chunk_bytes(&self, hash: &str) -> Result<Option<Vec<u8>>> {
+        if let Some(data) = self.store.chunk_data(hash)? {
+            return Ok(Some(data));
+        }
+
+        let Some(file_id) = self.store.file_for_chunk(hash)? else {
+            return Ok(None);
+        };
+        let Some(record) = self.store.file(file_id)? else {
+            return Ok(None);
+        };
+        if record.path.is_empty() {
+            return Ok(None);
+        }
+
+        let Some(index) = record
+            .chunk_hashes()
+            .iter()
+            .position(|candidate| candidate == hash)
+        else {
+            return Ok(None);
+        };
+
+        read_chunk_from_disk(&record, index)
+    }
+
+    /// Write an arriving chunk into a file being assembled on disk.
+    ///
+    /// Into `<path>.bouncedownload` until every chunk is present, so a
+    /// transfer interrupted halfway is never mistaken for a finished file.
+    fn write_chunk_to_disk(&self, record: &File, index: usize, data: &[u8]) -> Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let partial = std::path::PathBuf::from(format!("{}{}", record.path, DOWNLOAD_SUFFIX));
+        if let Some(parent) = partial.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let mut handle = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&partial)?;
+
+        handle.seek(SeekFrom::Start(index as u64 * record.chunk_size.max(1) as u64))?;
+        handle.write_all(data)?;
+        Ok(())
+    }
+
+    /// Finish a large download: size the file correctly and drop the suffix.
+    fn finish_disk_download(&self, record: &File) -> Result<()> {
+        let partial = std::path::PathBuf::from(format!("{}{}", record.path, DOWNLOAD_SUFFIX));
+        if !partial.exists() {
+            return Ok(());
+        }
+
+        // The last chunk is short, and seeking past the end to write earlier
+        // chunks can leave the file longer than the record says.
+        let handle = std::fs::OpenOptions::new().write(true).open(&partial)?;
+        handle.set_len(record.size.max(0) as u64)?;
+        drop(handle);
+
+        std::fs::rename(&partial, &record.path)?;
+        Ok(())
+    }
+
 }
 
 /// Hang staged files off a message as attachment records.
@@ -857,4 +1087,50 @@ fn push_image(existing: &str, image: Uuid) -> String {
         return existing.to_string();
     }
     format!("{existing},{image}")
+}
+
+/// Suffix worn by a large file that has not finished downloading.
+const DOWNLOAD_SUFFIX: &str = ".bouncedownload";
+
+/// Read one chunk out of a file on disk.
+///
+/// Reads from the finished file if it is there, and from the partial download
+/// otherwise — a device that has some of a file can serve the parts it holds,
+/// which is what lets a large file spread through a group rather than coming
+/// from one device.
+fn read_chunk_from_disk(record: &File, index: usize) -> Result<Option<Vec<u8>>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let finished = std::path::PathBuf::from(&record.path);
+    let partial = std::path::PathBuf::from(format!("{}{}", record.path, DOWNLOAD_SUFFIX));
+
+    let path = if finished.exists() { finished } else { partial };
+    let Ok(mut handle) = std::fs::File::open(&path) else {
+        return Ok(None);
+    };
+
+    let chunk_size = record.chunk_size.max(1) as usize;
+    let offset = index as u64 * chunk_size as u64;
+    handle.seek(SeekFrom::Start(offset))?;
+
+    // The last chunk is short, so ask for no more than the file holds.
+    let remaining = (record.size.max(0) as u64).saturating_sub(offset) as usize;
+    let wanted = chunk_size.min(remaining);
+    if wanted == 0 {
+        return Ok(None);
+    }
+
+    let mut buffer = vec![0u8; wanted];
+    let mut filled = 0;
+    while filled < wanted {
+        match handle.read(&mut buffer[filled..])? {
+            0 => break,
+            n => filled += n,
+        }
+    }
+    if filled != wanted {
+        return Ok(None);
+    }
+
+    Ok(Some(buffer))
 }

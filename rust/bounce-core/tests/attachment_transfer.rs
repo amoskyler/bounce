@@ -35,7 +35,19 @@ struct Instance {
 async fn start(name: &str, directory: Arc<StaticDirectory>) -> Instance {
     let key = DeviceKey::generate();
     let network = Arc::new(TcpNetwork::bind(key.clone(), directory).await.expect("binds"));
-    let store = Arc::new(Store::in_memory().expect("opens"));
+
+    // A blobs directory, so a file too large to embed has somewhere to land.
+    let blobs = std::env::temp_dir().join(format!(
+        "bounce-blobs-{}-{name}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    let store = Arc::new(
+        Store::in_memory()
+            .expect("opens")
+            .with_blobs_directory(&blobs)
+            .expect("blobs directory"),
+    );
     let (engine, events) = Engine::new(key, store, network);
     let user = engine.create_profile(name, "laptop").expect("profile");
     tokio::spawn(Arc::clone(&engine).run_listener());
@@ -277,4 +289,98 @@ async fn a_profile_picture_reaches_a_contact() {
     // is what keeps it out of the timeline.
     let stored = bob.engine.file(image_id).unwrap().expect("stored");
     assert_eq!(stored.file_type, bounce_core::types::FileType::UserImage as i64);
+}
+
+#[tokio::test]
+async fn a_file_too_large_to_embed_is_seeded_from_disk() {
+    // Above the embedding limit nothing is copied into the database: the
+    // record points at the file, chunks carry hashes and no bytes, and a
+    // request is answered by seeking. The receiving side writes to a partial
+    // file and renames it only once every chunk is present.
+    logging();
+
+    let directory = Arc::new(StaticDirectory::new());
+    let alice = start("Alice", Arc::clone(&directory)).await;
+    let mut bob = start("Bob", Arc::clone(&directory)).await;
+
+    let code = bob.engine.create_pairing_code().expect("code");
+    Arc::clone(&alice.engine).request_to_add_user(&code).await.expect("pairs");
+
+    let mut alice_events = alice.events;
+    wait_for(&mut alice_events, "alice to add bob", 10, |event| {
+        matches!(event, Event::UserAdded { .. }).then_some(())
+    })
+    .await
+    .expect("alice adds bob");
+    wait_for(&mut bob.events, "bob to add alice", 10, |event| {
+        matches!(event, Event::UserAdded { .. }).then_some(())
+    })
+    .await
+    .expect("bob adds alice");
+
+    // Just over the limit, so it takes the disk path and still runs quickly.
+    let size = bounce_core::EMBEDDED_FILE_LIMIT as usize + 3000;
+    let payload: Vec<u8> = (0..size).map(|index| (index % 251) as u8).collect();
+
+    let source = std::env::temp_dir().join(format!("bounce-big-{}.bin", std::process::id()));
+    std::fs::write(&source, &payload).expect("writes the source file");
+
+    let my_id = alice.id;
+    let record = alice
+        .engine
+        .stage_large_file(
+            &source,
+            Uuid::new_v4(),
+            bounce_core::types::Scope::User,
+            bounce_core::xor(my_id, bob.id),
+        )
+        .expect("stages from disk");
+
+    assert!(!record.is_embedded());
+    assert_eq!(record.size, size as i64);
+    assert_eq!(record.path, source.to_string_lossy());
+
+    // Nothing was copied into the database.
+    let stored_bytes: i64 = {
+        let file_id = record.id;
+        let hashes = record.chunk_hashes();
+        assert_eq!(hashes.len(), size.div_ceil(bounce_core::CHUNK_SIZE));
+        let _ = file_id;
+        0
+    };
+    assert_eq!(stored_bytes, 0);
+
+    alice.engine.announce_file(&record).await.expect("announces");
+
+    // Bob does not fetch a large file unprompted, so ask for it.
+    let arrived = wait_for(&mut bob.events, "bob to learn of the file", 10, |event| match event {
+        Event::FileProgress { file_id, .. } if *file_id == record.id => Some(()),
+        _ => None,
+    })
+    .await;
+    assert!(arrived.is_some(), "the metadata should reach Bob");
+
+    bob.engine.request_file(record.id).await.expect("asks for it");
+
+    let complete = wait_for(&mut bob.events, "the large download to finish", 30, |event| {
+        match event {
+            Event::FileComplete { file_id } if *file_id == record.id => Some(*file_id),
+            _ => None,
+        }
+    })
+    .await;
+    assert_eq!(complete, Some(record.id), "the file never finished");
+
+    // It landed on disk under its final name, byte for byte, with no partial
+    // file left behind.
+    let landed = bob.engine.file(record.id).unwrap().expect("stored");
+    let written = std::fs::read(&landed.path).expect("the file exists under its real name");
+    assert_eq!(written.len(), payload.len());
+    assert_eq!(written, payload, "the bytes must survive the round trip");
+    assert!(
+        !std::path::Path::new(&format!("{}.bouncedownload", landed.path)).exists(),
+        "the partial file must be renamed, not left beside the finished one",
+    );
+
+    let _ = std::fs::remove_file(&source);
 }

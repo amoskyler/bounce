@@ -254,6 +254,7 @@ async fn a_group_message_reaches_every_member() {
     // members are all people he has already accepted, and Alice is one.
     bob.engine
         .set_auto_join_groups(bounce_core::engine::auto_join::NEVER)
+        .await
         .expect("sets the policy");
 
     // Alice founds a group and invites Bob.
@@ -2210,4 +2211,68 @@ async fn a_confirmation_reaches_the_other_side_of_a_group() {
             "a stored confirmation must name the device that signed it",
         );
     }
+}
+
+#[tokio::test]
+async fn a_closed_conversation_reopens_when_a_message_arrives() {
+    // Closing only hides. The messages keep arriving, so without reopening
+    // they would keep arriving invisibly — a tidying gesture turned into
+    // silent message loss.
+    let directory = Arc::new(StaticDirectory::new());
+    let alice = start("Alice", Arc::clone(&directory)).await;
+    let mut bob = start("Bob", Arc::clone(&directory)).await;
+
+    introduce(&alice, &bob);
+    Arc::clone(&alice.engine).connect(&bob.address).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Bob tidies Alice off his list.
+    bob.engine.set_open_dm(alice.user.id, false).await.unwrap();
+    assert!(!bob.store.user(alice.user.id).unwrap().unwrap().open_dm);
+
+    alice
+        .engine
+        .send_direct_message(bob.user.id, "still here")
+        .await
+        .unwrap();
+
+    let received = wait_for(&mut bob.events, "Bob to receive the message", |event| match event {
+        Event::MessageReceived { message } => Some(message.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(received.text, "still here");
+
+    assert!(
+        bob.store.user(alice.user.id).unwrap().unwrap().open_dm,
+        "the conversation must come back, or the message is invisible",
+    );
+}
+
+#[tokio::test]
+async fn a_blocked_contact_stays_closed_when_they_write() {
+    // Blocking and closing are different intentions. A blocked contact's
+    // messages are refused outright, and reopening would put somebody back on
+    // the list who was deliberately taken off it.
+    let directory = Arc::new(StaticDirectory::new());
+    let alice = start("Alice", Arc::clone(&directory)).await;
+    let bob = start("Bob", Arc::clone(&directory)).await;
+
+    introduce(&alice, &bob);
+    Arc::clone(&alice.engine).connect(&bob.address).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    bob.engine.set_user_blocked(alice.user.id, true).await.unwrap();
+    bob.engine.set_open_dm(alice.user.id, false).await.unwrap();
+
+    alice
+        .engine
+        .send_direct_message(bob.user.id, "let me back in")
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let stored = bob.store.user(alice.user.id).unwrap().unwrap();
+    assert!(stored.blocked);
+    assert!(!stored.open_dm, "a blocked contact must not reappear");
 }

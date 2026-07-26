@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use bounce_core::crypto::DeviceKey;
 use bounce_core::engine::{Engine, Event};
+use bounce_core::frames::Broadcastable;
 use bounce_core::net::{StaticDirectory, TcpNetwork};
 use bounce_core::store::Store;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -18,6 +19,8 @@ struct Instance {
     store: Arc<Store>,
     events: UnboundedReceiver<Event>,
     address: String,
+    /// Kept so a test can forge a frame the way a peer would.
+    key: DeviceKey,
 }
 
 /// Start an instance with no profile; the caller decides whether it gets one.
@@ -26,9 +29,9 @@ async fn start(directory: Arc<StaticDirectory>) -> Instance {
     let address = key.address();
     let network = Arc::new(TcpNetwork::bind(key.clone(), directory).await.expect("binds"));
     let store = Arc::new(Store::in_memory().expect("opens"));
-    let (engine, events) = Engine::new(key, Arc::clone(&store), network);
+    let (engine, events) = Engine::new(key.clone(), Arc::clone(&store), network);
     tokio::spawn(Arc::clone(&engine).run_listener());
-    Instance { engine, store, events, address }
+    Instance { engine, store, events, address, key }
 }
 
 async fn wait_for<T>(
@@ -330,4 +333,151 @@ async fn one_user_cannot_revoke_anothers_device() {
         .unwrap()
         .unwrap()
         .is_revoked());
+}
+
+#[tokio::test]
+async fn revoking_a_device_replaces_the_profile_keys() {
+    // Revoking stops a device signing as us from now on. It does not make it
+    // forget the profile keys it already holds, so a stolen device would keep
+    // every ability that depended on them. Go ends `RevokeDevice` with
+    // `rollKeys()` for exactly this reason.
+    let directory = Arc::new(StaticDirectory::new());
+    let laptop = start(Arc::clone(&directory)).await;
+    let mut phone = start(Arc::clone(&directory)).await;
+
+    let before = laptop.engine.create_profile("Ada", "laptop").unwrap();
+    assert!(!before.private_ecdsa_key.is_empty());
+
+    let code = laptop.engine.create_sync_code().unwrap();
+    Arc::clone(&phone.engine).request_to_sync(&code).await.unwrap();
+    wait_for(&mut phone.events, 10, |event| {
+        matches!(event, Event::ProfileCreated { .. }).then_some(())
+    })
+    .await
+    .expect("the phone joins");
+
+    // The phone now holds the same private keys the laptop does — that is what
+    // pairing hands over, and what makes revocation insufficient on its own.
+    let shared = phone.store.profile().unwrap().unwrap();
+    assert_eq!(shared.private_ecdsa_key, before.private_ecdsa_key);
+
+    let phone_device = laptop
+        .store
+        .devices_for_user(before.id)
+        .unwrap()
+        .into_iter()
+        .find(|device| device.address == phone.address)
+        .expect("the laptop knows the phone");
+
+    laptop.engine.revoke_device(phone_device.id).await.expect("revokes");
+
+    let after = laptop.store.profile().unwrap().unwrap();
+    assert_ne!(
+        after.private_ecdsa_key, before.private_ecdsa_key,
+        "the signing key must be replaced",
+    );
+    assert_ne!(
+        after.private_ecdh_key, before.private_ecdh_key,
+        "the agreement key must be replaced too",
+    );
+    assert_ne!(after.public_ecdh_key, before.public_ecdh_key);
+    assert!(!after.private_ecdsa_key.is_empty(), "and must still be usable");
+
+    // The device group is untouched: an address *is* a device key, so rolling
+    // those would rename every device and orphan the group.
+    assert_eq!(
+        laptop.store.profile().unwrap().unwrap().devices.len(),
+        2,
+        "revoked devices are kept, and nothing else changed",
+    );
+    assert_eq!(laptop.engine.address(), laptop.address);
+}
+
+#[tokio::test]
+async fn a_setting_changed_on_one_device_reaches_the_other() {
+    // Profile-wide preferences are one person's, so every device they own
+    // needs them. Until a second device could exist this was invisible; now a
+    // change made on the laptop that never reaches the phone leaves one person
+    // with two answers to the same question.
+    let directory = Arc::new(StaticDirectory::new());
+    let laptop = start(Arc::clone(&directory)).await;
+    let mut phone = start(Arc::clone(&directory)).await;
+
+    laptop.engine.create_profile("Ada", "laptop").unwrap();
+    let code = laptop.engine.create_sync_code().unwrap();
+    Arc::clone(&phone.engine).request_to_sync(&code).await.unwrap();
+    wait_for(&mut phone.events, 10, |event| {
+        matches!(event, Event::ProfileCreated { .. }).then_some(())
+    })
+    .await
+    .expect("the phone joins");
+
+    let before = phone.engine.settings().expect("reads settings");
+    assert!(before.default_read_receipts, "the default we are about to change");
+
+    laptop
+        .engine
+        .set_default_read_receipts(false)
+        .await
+        .expect("changes it on the laptop");
+
+    let announced = wait_for(&mut phone.events, 10, |event| match event {
+        Event::SettingsUpdated { settings } => Some(settings.clone()),
+        _ => None,
+    })
+    .await
+    .expect("the phone is told");
+
+    assert!(!announced.default_read_receipts);
+    assert!(
+        !phone.engine.settings().unwrap().default_read_receipts,
+        "and it is stored, not merely announced",
+    );
+}
+
+#[tokio::test]
+async fn a_contact_cannot_change_our_settings() {
+    // Settings are sync-scoped, so one should never arrive from a contact at
+    // all — but the handler is what makes that a rule rather than an
+    // assumption about who can reach us.
+    let directory = Arc::new(StaticDirectory::new());
+    let ada = start(Arc::clone(&directory)).await;
+    let mut bo = start(Arc::clone(&directory)).await;
+
+    ada.engine.create_profile("Ada", "laptop").unwrap();
+    bo.engine.create_profile("Bo", "laptop").unwrap();
+
+    let code = bo.engine.create_pairing_code().unwrap();
+    Arc::clone(&ada.engine).request_to_add_user(&code).await.unwrap();
+    wait_for(&mut bo.events, 10, |event| {
+        matches!(event, Event::UserAdded { .. }).then_some(())
+    })
+    .await
+    .expect("introduced");
+
+    let before = bo.engine.settings().unwrap().default_read_receipts;
+
+    // Ada signs a settings change and aims it at Bo.
+    let mut update = bounce_core::frames::update::UpdateSettings::new(
+        bounce_core::frames::update::UpdateSettingsType::DefaultReadReceipts,
+        vec![0],
+        bounce_core::now(),
+    );
+    let body = bounce_core::msgpack::to_vec(&update).unwrap();
+    let container = bounce_core::signed::SignedContainer::create(&ada.key, body);
+    update.signed = bounce_core::frames::SignedFrame::from_container(&container);
+
+    let result = bo
+        .engine
+        .handle_frame(
+            &ada.address,
+            bounce_core::wire::RawFrame::new(
+                bounce_core::types::FrameType::UpdateSettings.as_u16(),
+                update.payload().unwrap(),
+            ),
+        )
+        .await;
+
+    assert!(result.is_err(), "a contact's device may not reconfigure us");
+    assert_eq!(bo.engine.settings().unwrap().default_read_receipts, before);
 }

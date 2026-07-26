@@ -24,6 +24,10 @@ use crate::frames::identity::{self, ProfileSettings};
 use crate::net::Network;
 
 use super::{DeviceView, Engine, Event};
+use crate::frames::update::{UpdateSettings, UpdateSettingsType};
+use crate::frames::SignedFrame;
+use crate::signed::SignedContainer;
+use crate::types::FrameType;
 
 /// The three answers to "should I join a group I have been invited to without
 /// being asked?".
@@ -87,51 +91,79 @@ impl<N: Network + 'static> Engine<N> {
     /// Conversations already under way are untouched — their retention was
     /// fixed when they were created, and changing it is
     /// [`Engine::set_retention`]'s job.
-    pub fn set_default_retention(&self, seconds: i64) -> Result<()> {
+    pub async fn set_default_retention(&self, seconds: i64) -> Result<()> {
         // A negative retention would put every new message's expiry in the
         // past, deleting conversations as fast as they were written.
         if seconds < 0 {
             return Err(Error::InvalidFrame("retention cannot be negative".into()));
         }
 
-        self.update_settings(|settings| {
-            settings.default_group_retention = seconds;
-            settings.default_dm_retention = seconds;
-        })
+        // Two frames, because Go keeps the group and conversation defaults
+        // apart on the wire even though one control drives both here.
+        self.apply_setting(
+            UpdateSettingsType::DefaultGroupRetention,
+            UpdateSettings::encode_i64(seconds),
+        )
+        .await?;
+        self.apply_setting(
+            UpdateSettingsType::DefaultDmRetention,
+            UpdateSettings::encode_i64(seconds),
+        )
+        .await
     }
 
     /// Whether read receipts are sent for conversations that have not
     /// overridden the choice themselves.
-    pub fn set_default_read_receipts(&self, enabled: bool) -> Result<()> {
-        self.update_settings(|settings| settings.default_send_read_receipts = enabled)
+    pub async fn set_default_read_receipts(&self, enabled: bool) -> Result<()> {
+        self.apply_setting(
+            UpdateSettingsType::DefaultReadReceipts,
+            UpdateSettings::encode_bool(enabled),
+        )
+        .await
     }
 
     /// Whether typing indicators are sent for conversations that have not
     /// overridden the choice themselves.
-    pub fn set_default_typing_indicators(&self, enabled: bool) -> Result<()> {
-        self.update_settings(|settings| settings.default_send_typing_indicators = enabled)
+    pub async fn set_default_typing_indicators(&self, enabled: bool) -> Result<()> {
+        self.apply_setting(
+            UpdateSettingsType::DefaultTypingIndicators,
+            UpdateSettings::encode_bool(enabled),
+        )
+        .await
     }
 
     /// Whether groups created on this device start with posting restricted to
     /// administrators.
-    pub fn set_new_group_restrict_posting(&self, restricted: bool) -> Result<()> {
-        self.update_settings(|settings| settings.new_group_restrict_posting = restricted)
+    pub async fn set_new_group_restrict_posting(&self, restricted: bool) -> Result<()> {
+        self.apply_setting(
+            UpdateSettingsType::NewGroupRestrictPosting,
+            UpdateSettings::encode_bool(restricted),
+        )
+        .await
     }
 
     /// Whether groups created on this device start with renaming and images
     /// restricted to administrators.
-    pub fn set_new_group_restrict_edits(&self, restricted: bool) -> Result<()> {
-        self.update_settings(|settings| settings.new_group_restrict_group_edits = restricted)
+    pub async fn set_new_group_restrict_edits(&self, restricted: bool) -> Result<()> {
+        self.apply_setting(
+            UpdateSettingsType::NewGroupRestrictGroupEdits,
+            UpdateSettings::encode_bool(restricted),
+        )
+        .await
     }
 
     /// Whether groups created on this device start with inviting and removing
     /// restricted to administrators.
-    pub fn set_new_group_restrict_user_management(&self, restricted: bool) -> Result<()> {
-        self.update_settings(|settings| settings.new_group_restrict_user_management = restricted)
+    pub async fn set_new_group_restrict_user_management(&self, restricted: bool) -> Result<()> {
+        self.apply_setting(
+            UpdateSettingsType::NewGroupRestrictUserManagement,
+            UpdateSettings::encode_bool(restricted),
+        )
+        .await
     }
 
     /// Choose when an invitation is accepted without asking; see [`auto_join`].
-    pub fn set_auto_join_groups(&self, setting: i64) -> Result<()> {
+    pub async fn set_auto_join_groups(&self, setting: i64) -> Result<()> {
         // The stored value is read back as a mode rather than a flag, so an
         // unrecognised one would be silently treated as
         // `ONLY_WITHOUT_NEW_USERS` — the least restrictive of the three, and
@@ -145,7 +177,11 @@ impl<N: Network + 'static> Engine<N> {
             )));
         }
 
-        self.update_settings(|settings| settings.auto_join_groups = setting)
+        self.apply_setting(
+            UpdateSettingsType::AutoJoinGroups,
+            vec![u8::try_from(setting).unwrap_or(0)],
+        )
+        .await
     }
 
     /// The settings row for this profile, falling back to the defaults.
@@ -162,10 +198,71 @@ impl<N: Network + 'static> Engine<N> {
             .unwrap_or_else(|| ProfileSettings::defaults(my_id)))
     }
 
-    /// Load, change one thing, store, and announce the result.
-    fn update_settings(&self, change: impl FnOnce(&mut ProfileSettings)) -> Result<()> {
+    /// Apply one setting, store it, tell the interface, and tell our other
+    /// devices.
+    ///
+    /// The broadcast is the point. These are profile-wide preferences, so a
+    /// change made on a laptop that never reaches the phone leaves one person
+    /// with two answers to the same question — and until a second device could
+    /// exist at all, that was invisible.
+    ///
+    /// Sync-scoped, so nothing here reaches a contact.
+    async fn apply_setting(&self, kind: UpdateSettingsType, data: Vec<u8>) -> Result<()> {
+        let my_id = self.store.my_user_id()?;
+
+        let mut update = UpdateSettings::new(kind, data, crate::now());
+        if !update.has_valid_payload() {
+            return Err(Error::InvalidFrame("invalid settings payload".into()));
+        }
+        update.author = my_id;
+        update.saved_at = crate::now();
+
+        self.apply_setting_locally(&update)?;
+
+        let body = crate::msgpack::to_vec(&update)?;
+        let container = SignedContainer::create(&self.key, body);
+        update.signed = SignedFrame::from_container(&container);
+
+        // Stored as well as sent: a device that was offline for the change
+        // replays it through the reference flow rather than staying behind.
+        self.store.save_update_settings(&update)?;
+        self.broadcast(&update).await
+    }
+
+    /// Fold one change into the stored settings and announce the result.
+    ///
+    /// Shared by the local path and by [`Engine::handle_update_settings`], so a
+    /// setting means the same thing whichever device set it.
+    pub(super) fn apply_setting_locally(&self, update: &UpdateSettings) -> Result<()> {
         let mut settings = self.profile_settings()?;
-        change(&mut settings);
+
+        match update.kind()? {
+            UpdateSettingsType::DefaultGroupRetention => {
+                settings.default_group_retention = update.data_as_i64().unwrap_or(0).max(0);
+            }
+            UpdateSettingsType::DefaultDmRetention => {
+                settings.default_dm_retention = update.data_as_i64().unwrap_or(0).max(0);
+            }
+            UpdateSettingsType::DefaultReadReceipts => {
+                settings.default_send_read_receipts = update.data_as_bool().unwrap_or(true);
+            }
+            UpdateSettingsType::DefaultTypingIndicators => {
+                settings.default_send_typing_indicators = update.data_as_bool().unwrap_or(true);
+            }
+            UpdateSettingsType::NewGroupRestrictPosting => {
+                settings.new_group_restrict_posting = update.data_as_bool().unwrap_or(false);
+            }
+            UpdateSettingsType::NewGroupRestrictGroupEdits => {
+                settings.new_group_restrict_group_edits = update.data_as_bool().unwrap_or(false);
+            }
+            UpdateSettingsType::NewGroupRestrictUserManagement => {
+                settings.new_group_restrict_user_management = update.data_as_bool().unwrap_or(true);
+            }
+            UpdateSettingsType::AutoJoinGroups => {
+                settings.auto_join_groups = i64::from(update.data.first().copied().unwrap_or(0));
+            }
+        }
+
         self.store.save_profile_settings(&settings)?;
 
         // The whole set goes out rather than the one field, so a client can
@@ -247,6 +344,49 @@ impl<N: Network + 'static> Engine<N> {
         });
         Ok(())
     }
+
+    /// A setting changed on another of this profile's devices.
+    ///
+    /// Only our own devices may change our settings, so the check is that the
+    /// signer belongs to this profile — not merely that it is a device we
+    /// know. A contact's device signing one of these is a contact trying to
+    /// reconfigure us.
+    pub(super) async fn handle_update_settings(&self, peer: &str, payload: &[u8]) -> Result<()> {
+        let (mut update, signed) = self.unpack_signed::<UpdateSettings>(payload)?;
+        update.signed = signed;
+
+        let my_id = self.store.my_user_id()?;
+        let Some(device) = self.store.device_by_address(&update.signed.signer)? else {
+            return Err(Error::InvalidFrame(
+                "settings update signed by a device we do not know".into(),
+            ));
+        };
+        if device.user_id != my_id {
+            return Err(Error::NotPermitted(
+                "only this profile's own devices may change its settings",
+            ));
+        }
+        update.author = my_id;
+
+        if !update.has_valid_payload() {
+            self.send_ack(peer, update.id, FrameType::UpdateSettings).await;
+            return Err(Error::InvalidFrame("invalid settings payload".into()));
+        }
+
+        if self.store.has_frame(update.id, FrameType::UpdateSettings)? {
+            self.send_ack(peer, update.id, FrameType::UpdateSettings).await;
+            return Ok(());
+        }
+
+        update.saved_at = crate::now();
+        self.store.save_update_settings(&update)?;
+        self.send_ack(peer, update.id, FrameType::UpdateSettings).await;
+
+        self.apply_setting_locally(&update)?;
+        self.broadcast(&update).await?;
+        Ok(())
+    }
+
 }
 
 #[cfg(test)]
@@ -313,8 +453,8 @@ mod tests {
         (engine, store, events)
     }
 
-    #[test]
-    fn a_changed_default_round_trips_through_the_store() {
+    #[tokio::test]
+    async fn a_changed_default_round_trips_through_the_store() {
         let (engine, store, _events) = engine();
 
         // Assert the starting value, or a setter that did nothing at all would
@@ -325,8 +465,9 @@ mod tests {
 
         engine
             .set_default_read_receipts(false)
+            .await
             .expect("stores the choice");
-        engine.set_default_retention(60).expect("stores the choice");
+        engine.set_default_retention(60).await.expect("stores the choice");
 
         let after = engine.settings().expect("reads settings");
         assert!(!after.default_read_receipts);
@@ -345,8 +486,8 @@ mod tests {
         assert_eq!(stored.default_dm_retention, 60);
     }
 
-    #[test]
-    fn setting_something_announces_the_whole_set() {
+    #[tokio::test]
+    async fn setting_something_announces_the_whole_set() {
         let (engine, _store, mut events) = engine();
 
         // Drain the profile creation event.
@@ -354,6 +495,7 @@ mod tests {
 
         engine
             .set_new_group_restrict_posting(true)
+            .await
             .expect("stores the choice");
 
         match events.try_recv().expect("a settings event was emitted") {
@@ -367,15 +509,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn an_unknown_auto_join_setting_is_refused() {
+    #[tokio::test]
+    async fn an_unknown_auto_join_setting_is_refused() {
         let (engine, _store, _events) = engine();
 
         assert!(matches!(
-            engine.set_auto_join_groups(7),
+            engine.set_auto_join_groups(7).await,
             Err(Error::InvalidFrame(_))
         ));
-        assert!(engine.set_auto_join_groups(auto_join::NEVER).is_ok());
+        assert!(engine.set_auto_join_groups(auto_join::NEVER).await.is_ok());
         assert_eq!(
             engine.settings().expect("reads settings").auto_join_groups,
             auto_join::NEVER

@@ -32,7 +32,7 @@ import {
   overrideSetting,
 } from '../DetailsPanel';
 import { SettingsPanel, visibleContacts } from '../SettingsPanel';
-import { initialState, type Conversation, type State } from '../state';
+import { initialState, reducer, type Conversation, type State } from '../state';
 import type { User } from '../../preload';
 
 /* -------------------------------------------------------------------------
@@ -252,4 +252,36 @@ test('contacts are ordered by the name actually shown', () => {
     visibleContacts(users, 'me', false).map((user) => user.id),
     ['c', 'b', 'a'],
   );
+});
+
+test('an update about ourselves lands on the profile, not in the contact list', () => {
+  // The engine emits `userUpdated` for the profile's own record when the name
+  // or picture changes. Routing that into `users` left `profile` stale, so a
+  // new picture showed up in every avatar drawn from `users` and not in the
+  // settings panel, which reads `profile` — until a reload re-fetched the
+  // snapshot and hid the bug.
+  const me = { ...contact(), id: 'me', name: 'Ada', images: [] as string[] };
+  const start = reducer(initialState, {
+    type: 'loaded',
+    address: 'addr',
+    state: {
+      profile: me,
+      networkOnline: true,
+      deviceRevoked: false,
+      syncDevices: [],
+      users: [],
+      groups: [],
+      messages: [],
+      systemMessages: [],
+      drafts: [],
+    },
+  });
+
+  const updated = reducer(start, {
+    type: 'engineEvent',
+    event: { type: 'userUpdated', user: { ...me, images: ['picture-1'] } },
+  });
+
+  assert.deepEqual(updated.profile?.images, ['picture-1'], 'the profile must see it');
+  assert.equal(updated.users.me, undefined, 'and we must not become our own contact');
 });

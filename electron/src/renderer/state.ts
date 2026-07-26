@@ -403,6 +403,18 @@ function applyEvent(state: State, event: EngineEvent): State {
     case 'userAdded':
     case 'userUpdated': {
       const user = event.user;
+
+      // Our own record lives in `profile`, not in `users`. `initial_state`
+      // leaves the profile out of that map on purpose — the sidebar and the
+      // contacts list both rely on it being absent — so an update about
+      // ourselves has to be routed there instead. Writing it to `users` left
+      // `profile` holding whatever the last full snapshot said, which is why
+      // a new profile picture appeared everywhere except the settings panel
+      // until the window was reloaded.
+      if (state.profile && user.id === state.profile.id) {
+        return { ...state, profile: user };
+      }
+
       return { ...state, users: { ...state.users, [user.id]: user } };
     }
 
@@ -509,11 +521,14 @@ export function conversations(state: State): Conversation[] {
     // history rule below cannot drag them back in.
     if (user.blocked) continue;
 
-    // History outranks the flag. `open_dm` had no producer for the whole of
-    // this port's life, so a conversation somebody has genuinely been having
-    // may well carry a false one; hiding it would be a worse failure than
-    // showing a row Go would have left out.
-    if (!user.openDm && !hasHistory(state, user.id)) continue;
+    // The flag decides, full stop. It used to be overridden by "has history",
+    // because `open_dm` had no producer and every contact carried a false one
+    // — but that made closing a conversation a no-op for anyone you had ever
+    // messaged, which is the whole point of closing. The engine now writes the
+    // flag, a one-time migration opens everyone with history, and an arriving
+    // message reopens a closed conversation, so nothing can be stranded
+    // out of sight.
+    if (!user.openDm) continue;
 
     const lastActivity = lastActivityFor(state, user.id, user.lastActivity);
     result.push({
@@ -591,15 +606,18 @@ export function contacts(state: State, includeBlocked = false): Contact[] {
     if (user.id === myId) continue;
     if (user.blocked && !includeBlocked) continue;
 
-    const history = hasHistory(state, user.id);
     result.push({
       id: user.id,
       name: user.alias || user.name,
       images: user.images,
       online: user.online,
       blocked: user.blocked,
-      open: !user.blocked && (user.openDm || history),
-      hideable: !user.blocked && user.openDm && !history,
+      // The flag alone, matching the sidebar. Closing used to be refused for
+      // anyone with history, on the reasoning that hiding a real conversation
+      // was worse than showing a stale row — but nothing is hidden by closing,
+      // and an arriving message reopens it.
+      open: !user.blocked && user.openDm,
+      hideable: !user.blocked && user.openDm,
     });
   }
 
@@ -611,11 +629,6 @@ export function filterContacts(list: Contact[], query: string): Contact[] {
   const trimmed = query.trim().toLowerCase();
   if (!trimmed) return list;
   return list.filter((contact) => contact.name.toLowerCase().includes(trimmed));
-}
-
-function hasHistory(state: State, thread: string): boolean {
-  const messages = state.messagesByThread[thread];
-  return messages !== undefined && messages.length > 0;
 }
 
 function lastActivityFor(state: State, thread: string, fallback: number): number {

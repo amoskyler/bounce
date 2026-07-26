@@ -45,8 +45,8 @@ use uuid::Uuid;
 
 use crate::device_group;
 use crate::error::{Error, Result};
-use crate::frames::identity::{Device, IntroductionSignature, User};
-use crate::frames::update::{UpdateDevice, UpdateDeviceType};
+use crate::frames::identity::{Device, IntroductionSignature, KeySet, User};
+use crate::frames::update::{UpdateDevice, UpdateDeviceType, UpdateUser, UpdateUserType};
 use crate::frames::SignedFrame;
 use crate::frames::pairing::{
     SyncDeviceOffer, SyncDeviceRequest, SyncDeviceRequestAccepted, SyncDeviceRequestRejected,
@@ -450,7 +450,95 @@ impl<N: Network + 'static> Engine<N> {
         self.apply_device_revocation(&device.address, update.timestamp)?;
         self.store.save_update_device(&update)?;
         self.broadcast(&update).await?;
+
+        // Revoking stops the device signing as us from now on. It does not
+        // make it forget the profile keys it already held, so those have to be
+        // replaced or a stolen device keeps every ability that depended on
+        // them. Go ends `RevokeDevice` the same way.
+        self.roll_keys().await?;
         Ok(())
+    }
+
+    /// Re-issue this profile's user-level keys.
+    ///
+    /// Two frames, because the audiences differ and one of them must never
+    /// leave the device group:
+    ///
+    /// - [`UpdateUserType::ReplaceKeys`] carries the whole set, private halves
+    ///   included, and is sync-scoped.
+    /// - [`UpdateUserType::ReplaceEcdhPublicKey`] carries only the new public
+    ///   key and is global, because contacts encrypt to it.
+    ///
+    /// The device keys are untouched: a device's address *is* its key, so
+    /// rolling those would change every address and orphan the group. What is
+    /// replaced is the user-level pair that a revoked device could otherwise
+    /// go on using.
+    pub async fn roll_keys(&self) -> Result<()> {
+        let mut profile = self.store.profile()?.ok_or(Error::NoProfile)?;
+
+        let signing = crate::crypto::DeviceKey::generate();
+        let (private_ecdh, public_ecdh) = crate::crypto::generate_x25519_keypair();
+
+        let key_set = KeySet {
+            private_ecdsa_key: signing.to_private_bytes(),
+            public_ecdsa_key: signing.public_key().to_vec(),
+            private_ecdh_key: private_ecdh.to_vec(),
+            public_ecdh_key: public_ecdh.to_vec(),
+            // Carried even though encrypted devices are not implemented, so a
+            // Go peer in this device group is not handed a set it cannot use.
+            kek: crate::crypto::random_bytes(32),
+        };
+
+        // Not `save_user`: its upsert refuses to touch key columns, so that a
+        // relayed record cannot overwrite our own. This is the one write that
+        // legitimately replaces them.
+        self.store.replace_profile_keys(
+            profile.id,
+            &key_set.public_ecdsa_key,
+            &key_set.private_ecdsa_key,
+            &key_set.public_ecdh_key,
+            &key_set.private_ecdh_key,
+        )?;
+
+        profile.private_ecdsa_key = key_set.private_ecdsa_key.clone();
+        profile.public_ecdsa_key = key_set.public_ecdsa_key.clone();
+        profile.private_ecdh_key = key_set.private_ecdh_key.clone();
+        profile.public_ecdh_key = key_set.public_ecdh_key.clone();
+
+        self.publish_profile_update(
+            profile.id,
+            UpdateUserType::ReplaceKeys,
+            crate::msgpack::to_vec(&key_set)?,
+        )
+            .await?;
+        self.publish_profile_update(
+            profile.id,
+            UpdateUserType::ReplaceEcdhPublicKey,
+            key_set.public_ecdh_key.clone(),
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// Sign, store and broadcast one change to this profile.
+    async fn publish_profile_update(
+        &self,
+        my_id: Uuid,
+        kind: UpdateUserType,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        let mut update = UpdateUser::new(my_id, kind, data, self.next_profile_update_timestamp(my_id)?);
+        update.saved_at = crate::now();
+
+        let body = crate::msgpack::to_vec(&update)?;
+        let container = SignedContainer::create(&self.key, body);
+        update.signed = SignedFrame::from_container(&container);
+
+        // Stored as well as sent, so a device that was offline for the roll
+        // replays it rather than being left on keys nobody else holds.
+        self.store.save_update_user(&update)?;
+        self.broadcast(&update).await
     }
 
     /// Somebody's device group changed.
