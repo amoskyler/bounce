@@ -115,6 +115,7 @@ type ConversationProps = {
   onLeaveGroup: () => void;
   onCopyAddress: () => void;
   onShowDetails: () => void;
+  onShowMessageInfo: (message: Message) => void;
   onError: (message: string) => void;
 };
 
@@ -138,6 +139,7 @@ export function ConversationView({
   onLeaveGroup,
   onCopyAddress,
   onShowDetails,
+  onShowMessageInfo,
   onError,
 }: ConversationProps) {
   const messages = state.messagesByThread[conversation.id] ?? [];
@@ -171,6 +173,7 @@ export function ConversationView({
         isGroup={conversation.kind === 'group'}
         typing={typing}
         onOpenImage={(src, alt) => setViewerImage({ src, alt })}
+        onShowInfo={onShowMessageInfo}
       />
 
       {conversation.invitationPending ? (
@@ -355,6 +358,7 @@ function Timeline({
   isGroup,
   typing,
   onOpenImage,
+  onShowInfo,
 }: {
   threadId: string;
   messages: Message[];
@@ -364,6 +368,7 @@ function Timeline({
   /** User ids currently composing, oldest first. */
   typing: readonly string[];
   onOpenImage: (src: string, alt: string) => void;
+  onShowInfo: (message: Message) => void;
 }) {
   const scrollRef = React.useRef<HTMLDivElement>(null);
   const atBottomRef = React.useRef(true);
@@ -593,6 +598,7 @@ function Timeline({
         grouped={grouped}
         continuesAfter={continuesAfter}
         onOpenImage={onOpenImage}
+        onShowInfo={onShowInfo}
       />,
     );
 
@@ -721,6 +727,7 @@ function MessageRow({
   grouped,
   continuesAfter,
   onOpenImage,
+  onShowInfo,
 }: {
   /** Position in the whole thread, so the scroller can find this row again. */
   index: number;
@@ -730,10 +737,12 @@ function MessageRow({
   grouped: boolean;
   continuesAfter: boolean;
   onOpenImage: (src: string, alt: string) => void;
+  onShowInfo: (message: Message) => void;
 }) {
   const author = state.users[message.author];
   const authorName = author ? author.alias || author.name : 'Unknown';
   const attachments = useAttachmentUrls(message.attachments);
+  const [menuAt, setMenuAt] = React.useState<{ x: number; y: number } | null>(null);
 
   const groupClassName = [
     'message-group',
@@ -767,7 +776,16 @@ function MessageRow({
           </div>
         )}
 
-        <div className={bubbleClassName}>
+        <div
+          className={bubbleClassName}
+          // Right-click opens the same menu Signal's does. Bound on the bubble
+          // rather than the row so the empty column beside a message is not a
+          // target for something that acts on it.
+          onContextMenu={(event) => {
+            event.preventDefault();
+            setMenuAt({ x: event.clientX, y: event.clientY });
+          }}
+        >
           {/* Ahead of the footer, so the floated timestamp wraps around the
               text rather than around the pictures. */}
           <AttachmentList attachments={attachments} onOpenImage={onOpenImage} />
@@ -779,6 +797,121 @@ function MessageRow({
           <MessageText text={message.text} />
         </div>
       </div>
+
+      {menuAt && (
+        <MessageMenu
+          at={menuAt}
+          onDismiss={() => setMenuAt(null)}
+          onInfo={() => {
+            setMenuAt(null);
+            onShowInfo(message);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+/**
+ * The right-click menu on a message.
+ *
+ * Positioned at the pointer and rendered in place rather than in a portal: the
+ * timeline does not clip, and a portal would have to re-derive a position that
+ * the event already gave us.
+ */
+function MessageMenu({
+  at,
+  onDismiss,
+  onInfo,
+}: {
+  at: { x: number; y: number };
+  onDismiss: () => void;
+  onInfo: () => void;
+}) {
+  const menuRef = React.useRef<HTMLDivElement>(null);
+  const [placement, setPlacement] = React.useState<{ left: number; top: number }>({
+    left: at.x,
+    top: at.y,
+  });
+
+  // Measured after mount and nudged back inside the window, because a message
+  // near the bottom right is exactly where a menu would otherwise open
+  // half-off the screen.
+  React.useLayoutEffect(() => {
+    const element = menuRef.current;
+    if (!element) return;
+
+    const box = element.getBoundingClientRect();
+    setPlacement({
+      left: Math.min(at.x, window.innerWidth - box.width - 8),
+      top: Math.min(at.y, window.innerHeight - box.height - 8),
+    });
+  }, [at.x, at.y]);
+
+  React.useEffect(() => {
+    /*
+     * Anything outside the menu closes it — but `mousedown` inside it must not,
+     * because that is the first half of choosing an item. Dismissing there
+     * unmounts the button before its `click` ever fires, and the item does
+     * nothing at all. Calling `.click()` in a test does not reproduce it: that
+     * dispatches `click` alone, with no `mousedown` in front of it.
+     */
+    const dismiss = (event: Event) => {
+      const target = event.target;
+      if (target instanceof Node && menuRef.current?.contains(target)) return;
+      onDismiss();
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onDismiss();
+    };
+
+    /*
+     * Attached on the next task, not this one.
+     *
+     * The right-click that opened this menu is still bubbling. React dispatches
+     * `onContextMenu` at the root and flushes the state update synchronously,
+     * so an effect that binds to `document` right here is in place before the
+     * very same event reaches it — and the menu dismisses itself in the act of
+     * opening. A synthetic `dispatchEvent` does not reproduce it; a real click
+     * does, every time.
+     */
+    const timer = window.setTimeout(() => {
+      // `mousedown` anywhere closes it, including a second right-click, which
+      // should move the menu rather than open a second one.
+      document.addEventListener('mousedown', dismiss);
+      document.addEventListener('contextmenu', dismiss);
+      window.addEventListener('blur', dismiss);
+    }, 0);
+
+    // Escape is safe to bind immediately: no key is in flight.
+    document.addEventListener('keydown', onKeyDown, true);
+
+    return () => {
+      window.clearTimeout(timer);
+      document.removeEventListener('mousedown', dismiss);
+      document.removeEventListener('contextmenu', dismiss);
+      window.removeEventListener('blur', dismiss);
+      document.removeEventListener('keydown', onKeyDown, true);
+    };
+  }, [onDismiss]);
+
+  return (
+    <div
+      className="menu menu--at-pointer"
+      ref={menuRef}
+      style={{ left: placement.left, top: placement.top }}
+      role="menu"
+      aria-label="Message actions"
+    >
+      <button
+        className="menu__item menu__item--icon"
+        onClick={onInfo}
+        role="menuitem"
+        type="button"
+      >
+        <InfoIcon size={16} />
+        Info
+      </button>
     </div>
   );
 }

@@ -124,6 +124,78 @@ app.whenReady().then(async () => {
   }
 
   /*
+   * Put a real file into the composer's picker, the way choosing one does.
+   *
+   * `DOM.setFileInputFiles` is the DevTools protocol call that browser
+   * automation uses for uploads. It matters that it is this and not a
+   * synthesised `File`: only a file the browser opened itself has a path on
+   * disk, and the path is the whole point of the streaming attachment flow.
+   */
+  if (process.env.BOUNCE_PREVIEW_PICK_FILE) {
+    const debug = window.webContents.debugger;
+    debug.attach('1.3');
+
+    const { root } = await debug.sendCommand('DOM.getDocument');
+    const { nodeId } = await debug.sendCommand('DOM.querySelector', {
+      nodeId: root.nodeId,
+      selector: '.composer-area input[type=file]',
+    });
+
+    if (!nodeId) {
+      console.log('pick: no file input found');
+    } else {
+      await debug.sendCommand('DOM.setFileInputFiles', {
+        nodeId,
+        files: [process.env.BOUNCE_PREVIEW_PICK_FILE],
+      });
+      console.log(`pick: set ${process.env.BOUNCE_PREVIEW_PICK_FILE}`);
+      await new Promise((r) => setTimeout(r, 800));
+    }
+
+    debug.detach();
+  }
+
+  /*
+   * A real right-click, delivered as an input event rather than a synthetic
+   * DOM one.
+   *
+   * The difference matters: the browser sends `mousedown`, then `contextmenu`,
+   * then `mouseup`, and React's own dispatch happens in the middle of that
+   * sequence. A `dispatchEvent` of `contextmenu` alone skips the other two and
+   * can pass while the real thing fails.
+   *
+   *     BOUNCE_PREVIEW_RIGHT_CLICK='760,620'
+   */
+  if (process.env.BOUNCE_PREVIEW_RIGHT_CLICK) {
+    const [x, y] = process.env.BOUNCE_PREVIEW_RIGHT_CLICK.split(',').map(Number);
+    const at = { x, y, button: 'right', clickCount: 1 };
+
+    window.webContents.sendInputEvent({ type: 'mouseDown', ...at });
+    window.webContents.sendInputEvent({ type: 'mouseUp', ...at });
+    await new Promise((r) => setTimeout(r, 400));
+    console.log(`right-clicked at ${x},${y}`);
+  }
+
+  /*
+   * A real left click, as a full mousedown/mouseup pair.
+   *
+   *     BOUNCE_PREVIEW_CLICK_AT='910,600'
+   *
+   * Distinct from BOUNCE_PREVIEW_CLICK, which calls `.click()` on a selector
+   * and so dispatches `click` with no `mousedown` in front of it — enough to
+   * miss a handler that fires on the press rather than the release.
+   */
+  if (process.env.BOUNCE_PREVIEW_CLICK_AT) {
+    const [x, y] = process.env.BOUNCE_PREVIEW_CLICK_AT.split(',').map(Number);
+    const at = { x, y, button: 'left', clickCount: 1 };
+
+    window.webContents.sendInputEvent({ type: 'mouseDown', ...at });
+    window.webContents.sendInputEvent({ type: 'mouseUp', ...at });
+    await new Promise((r) => setTimeout(r, 600));
+    console.log(`clicked at ${x},${y}`);
+  }
+
+  /*
    * An expression evaluated in the page and logged, for the times a
    * screenshot shows that something is wrong but not by how much:
    *

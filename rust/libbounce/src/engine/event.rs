@@ -260,6 +260,38 @@ pub enum Event {
     Error { message: String },
 }
 
+/// One person's receipt for a message, and when it happened.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Receipt {
+    pub user_id: Uuid,
+    /// Unix seconds. Zero when the record predates the column.
+    pub at: i64,
+}
+
+/// Everything known about one message's fate, for the info panel.
+///
+/// Delivery is recorded per device and read per person, which is not a
+/// mismatch worth hiding: a message reaches devices, and a person reads it.
+/// Devices are folded back into their owners here, keeping the earliest time,
+/// because "delivered to Ada at 14:02" is the honest summary of a frame that
+/// reached her laptop then her phone.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageInfo {
+    pub message_id: Uuid,
+    /// When the author wrote it, in unix seconds.
+    pub written_at: i64,
+    /// When it disappears, or zero if it does not.
+    pub expires_at: i64,
+    /// Who has read it, earliest first.
+    pub read_by: Vec<Receipt>,
+    /// Who has received it, earliest first. A reader is always a recipient.
+    pub delivered_to: Vec<Receipt>,
+    /// Everyone it is addressed to. Empty for a direct message's own thread.
+    pub audience: Vec<Uuid>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

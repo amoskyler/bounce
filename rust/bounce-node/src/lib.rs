@@ -371,6 +371,21 @@ impl BounceNode {
         serde_json::to_string(&message).map_err(to_napi_error)
     }
 
+    /// Everything known about what happened to one message.
+    ///
+    /// Returned as JSON rather than a napi object because it is a tree of
+    /// records and the renderer only ever reads it — declaring the shape a
+    /// fourth time would be a fourth place to forget a field.
+    #[napi]
+    pub fn message_info(&self, message_id: String) -> Result<Option<String>> {
+        let id = parse_uuid(&message_id)?;
+        let info = self.engine.message_info(id).map_err(to_napi_error)?;
+        match info {
+            Some(info) => Ok(Some(serde_json::to_string(&info).map_err(to_napi_error)?)),
+            None => Ok(None),
+        }
+    }
+
     /// The bytes of an attachment, or null while it is still downloading.
     #[napi]
     pub fn file_data(&self, file_id: String) -> Result<Option<Buffer>> {

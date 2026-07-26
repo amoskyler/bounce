@@ -8,6 +8,7 @@ import type { PendingAttachment } from './Attachments';
 import { Avatar } from './Avatar';
 import { blurHashFromImage } from './blurhash';
 import { ConversationView, NoConversationSelected } from './Conversation';
+import { MessageInfoPanel } from './MessageInfo';
 import { QrCode } from './icons';
 import { DetailsPanel } from './DetailsPanel';
 import { LeftPane } from './LeftPane';
@@ -45,6 +46,10 @@ export function App() {
   const [transport, setTransport] = React.useState<TransportInfo | null>(null);
   const [detailsOpen, setDetailsOpen] = React.useState(false);
   const [settingsOpen, setSettingsOpen] = React.useState(false);
+  // The message behind the info drawer, or null. Held by value rather than by
+  // id so the panel keeps showing what you opened even if the thread reloads
+  // underneath it.
+  const [infoMessage, setInfoMessage] = React.useState<Message | null>(null);
 
   const windowFocused = useWindowFocus();
 
@@ -388,6 +393,13 @@ export function App() {
           }}
           onCopyAddress={() => void navigator.clipboard.writeText(state.address)}
           onShowDetails={() => setDetailsOpen(true)}
+          onShowMessageInfo={(message) => {
+            // The three right-hand panels share one column, so opening this
+            // has to close whichever of the others was up.
+            setDetailsOpen(false);
+            setSettingsOpen(false);
+            setInfoMessage(message);
+          }}
           onError={(message) => dispatch({ type: 'engineEvent', event: { type: 'error', message } })}
         />
       ) : (
@@ -395,7 +407,15 @@ export function App() {
       )}
 
       {/* Both are 340px right-hand asides, so they are mutually exclusive. */}
-      {selected && detailsOpen && !settingsOpen && (
+      {infoMessage && (
+        <MessageInfoPanel
+          message={infoMessage}
+          state={state}
+          onClose={() => setInfoMessage(null)}
+        />
+      )}
+
+      {selected && detailsOpen && !settingsOpen && !infoMessage && (
         <DetailsPanel
           conversation={selected}
           state={state}
@@ -403,7 +423,9 @@ export function App() {
         />
       )}
 
-      {settingsOpen && <SettingsPanel state={state} onClose={() => setSettingsOpen(false)} />}
+      {settingsOpen && !infoMessage && (
+        <SettingsPanel state={state} onClose={() => setSettingsOpen(false)} />
+      )}
 
       {dialog === 'contacts' && (
         <ContactsDialog

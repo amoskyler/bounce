@@ -7,6 +7,9 @@
  * enumerated surface in the preload script.
  */
 
+import { toNative, type NativeAttachment, type OutgoingAttachment } from './attachments';
+export type { OutgoingAttachment } from './attachments';
+
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
@@ -37,6 +40,7 @@ interface NativeNode {
     attachments: NativeAttachment[],
   ): Promise<string>;
   fileData(fileId: string): Buffer | null;
+  messageInfo(messageId: string): string | null;
   createGroup(name: string, invites: string[]): Promise<string>;
   inviteToGroup(groupId: string, userId: string): Promise<void>;
   respondToInvite(groupId: string, accept: boolean): Promise<void>;
@@ -78,45 +82,6 @@ interface NativeNode {
   devices(): string;
   renameDevice(deviceId: string, name: string): void;
   shutdown(): void;
-}
-
-/** A file crossing into the engine, as napi-rs expects it. */
-interface NativeAttachment {
-  name: string;
-  data: Buffer;
-  isImage: boolean;
-  width: number;
-  height: number;
-  blurHash: string;
-}
-
-/** The same, as it arrives over IPC from the renderer. */
-export interface OutgoingAttachment {
-  name: string;
-  data: Uint8Array;
-  isImage: boolean;
-  width: number;
-  height: number;
-  blurHash?: string;
-}
-
-/**
- * Adapt a renderer attachment for the native module.
- *
- * Structured cloning delivers the bytes as a `Uint8Array`, and napi-rs wants a
- * `Buffer`. `Buffer.from(view)` would copy; the three-argument form wraps the
- * same memory.
- */
-function toNative(attachment: OutgoingAttachment): NativeAttachment {
-  const bytes = attachment.data;
-  return {
-    name: attachment.name,
-    data: Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength),
-    isImage: attachment.isImage,
-    width: attachment.width,
-    height: attachment.height,
-    blurHash: attachment.blurHash ?? '',
-  };
 }
 
 interface NativeModule {
@@ -264,6 +229,17 @@ export class BounceEngine extends EventEmitter {
   }
 
   /** An attachment's bytes, or null while chunks are still missing. */
+  /**
+   * Everything known about what happened to one message.
+   *
+   * The native side hands this over as JSON rather than an object, so the
+   * shape is declared once — in Rust — instead of a fourth time here.
+   */
+  messageInfo(messageId: string): unknown {
+    const json = this.node.messageInfo(messageId);
+    return json === null ? null : JSON.parse(json);
+  }
+
   fileData(fileId: string): Uint8Array | null {
     return this.node.fileData(fileId);
   }

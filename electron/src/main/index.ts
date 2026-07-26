@@ -9,6 +9,7 @@
 import { app, BrowserWindow, ipcMain, nativeTheme, shell } from 'electron';
 import { join } from 'node:path';
 
+import { checkAttachments } from './attachments';
 import { BounceEngine, type OutgoingAttachment } from './engine';
 
 /*
@@ -178,15 +179,20 @@ function registerHandlers(): void {
 
   handle(
     'bounce:sendDirectMessageWithAttachments',
-    (recipient: string, text: string, attachments: OutgoingAttachment[]) =>
-      engine!.sendDirectMessageWithAttachments(recipient, text, attachments),
+    (recipient: string, text: string, attachments: OutgoingAttachment[]) => {
+      checkAttachments(attachments);
+      return engine!.sendDirectMessageWithAttachments(recipient, text, attachments);
+    },
   );
   handle(
     'bounce:sendGroupMessageWithAttachments',
-    (groupId: string, text: string, attachments: OutgoingAttachment[]) =>
-      engine!.sendGroupMessageWithAttachments(groupId, text, attachments),
+    (groupId: string, text: string, attachments: OutgoingAttachment[]) => {
+      checkAttachments(attachments);
+      return engine!.sendGroupMessageWithAttachments(groupId, text, attachments);
+    },
   );
   handle('bounce:fileData', (fileId: string) => engine!.fileData(fileId));
+  handle('bounce:messageInfo', (messageId: string) => engine!.messageInfo(messageId));
 
   handle('bounce:createGroup', (name: string, invites: string[]) =>
     engine!.createGroup(name, invites),

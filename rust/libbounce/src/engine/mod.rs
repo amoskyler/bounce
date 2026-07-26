@@ -44,8 +44,8 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use uuid::Uuid;
 
 pub use event::{
-    AttachmentView, DeviceView, DraftView, Event, GroupView, InitialState, MessageView,
-    SystemMessageView, UserView,
+    AttachmentView, DeviceView, DraftView, Event, GroupView, InitialState, MessageInfo,
+    MessageView, Receipt, SystemMessageView, UserView,
 };
 pub use files::OutgoingAttachment;
 pub use settings::{auto_join, SettingsView};
@@ -3632,6 +3632,57 @@ impl<N: Network + 'static> Engine<N> {
             restrict_group_edits: group.restrict_group_edits,
             restrict_user_management: group.restrict_user_management,
         }
+    }
+
+    /// Everything known about what happened to one message.
+    ///
+    /// Looked up on demand rather than carried on every `MessageView`: this is
+    /// four extra queries, and a thread of ten thousand messages would run them
+    /// ten thousand times to populate a panel showing one.
+    pub fn message_info(&self, message_id: Uuid) -> Result<Option<MessageInfo>> {
+        let (written_at, expires_at, audience) =
+            if let Some(message) = self.store.direct_message(message_id)? {
+                (message.written_at, message.delete_at, Vec::new())
+            } else if let Some(message) = self.store.group_message(message_id)? {
+                let audience = self
+                    .store
+                    .group(message.destination)?
+                    .map(|group| group.member_ids())
+                    .unwrap_or_default();
+                (message.written_at, message.delete_at, audience)
+            } else {
+                return Ok(None);
+            };
+
+        let read_by = self
+            .store
+            .read_times_for(message_id)?
+            .into_iter()
+            .map(|(user_id, at)| Receipt { user_id, at })
+            .collect();
+
+        // Delivery is per device; the panel is about people. Earliest wins, so
+        // a second device receiving it later does not push the time out.
+        let mut delivered: Vec<Receipt> = Vec::new();
+        for (address, at) in self.store.delivery_times_for(message_id)? {
+            let Some(user_id) = self.store.device_owner(&address)? else {
+                continue;
+            };
+            match delivered.iter_mut().find(|entry| entry.user_id == user_id) {
+                Some(entry) => entry.at = entry.at.min(at),
+                None => delivered.push(Receipt { user_id, at }),
+            }
+        }
+        delivered.sort_by_key(|entry| entry.at);
+
+        Ok(Some(MessageInfo {
+            message_id,
+            written_at,
+            expires_at,
+            read_by,
+            delivered_to: delivered,
+            audience,
+        }))
     }
 
     fn direct_message_view(

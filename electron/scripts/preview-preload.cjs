@@ -7,7 +7,7 @@
  * preload script, so the renderer cannot tell the difference.
  */
 
-const { contextBridge } = require('electron');
+const { contextBridge, webUtils } = require('electron');
 const { deflateSync } = require('node:zlib');
 
 const HOUR = 3600;
@@ -293,6 +293,25 @@ const api = {
    * the bytes ready to serve. A client that asks once and gives up shows a
    * blurhash for the rest of the session.
    */
+  // Enough shape for the info panel to be worth looking at: one reader, one
+  // recipient who has not read it, and one member of the group who has neither.
+  messageInfo: async (messageId) => {
+    const message = state.messages.find((candidate) => candidate.id === messageId);
+    if (!message) return null;
+    const group = state.groups.find((candidate) => candidate.id === message.thread);
+    return {
+      messageId,
+      writtenAt: message.writtenAt,
+      expiresAt: message.expiresAt || now + 6 * HOUR,
+      readBy: [{ userId: grace, at: message.writtenAt + 240 }],
+      deliveredTo: [
+        { userId: grace, at: message.writtenAt + 12 },
+        { userId: alan, at: message.writtenAt + 40 },
+      ],
+      audience: group ? group.members : [],
+    };
+  },
+
   fileData: async (fileId) => {
     const withhold = Number(process.env.BOUNCE_PREVIEW_SLOW_FILES || '0');
     if (withhold > 0) {
@@ -343,6 +362,16 @@ const api = {
       const at = listeners.indexOf(listener);
       if (at >= 0) listeners.splice(at, 1);
     };
+  },
+  // The real implementation, not a stub: resolving a File to a path is the
+  // one thing in this flow that only the preload can do, so faking it would
+  // skip the part most likely to be wrong.
+  pathForFile: (file) => {
+    try {
+      return webUtils.getPathForFile(file);
+    } catch (error) {
+      return 'THREW: ' + error.message;
+    }
   },
   onThemeChange: () => () => undefined,
   platform: process.platform,

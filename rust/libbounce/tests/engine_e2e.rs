@@ -2277,3 +2277,66 @@ async fn a_blocked_contact_stays_closed_when_they_write() {
     assert!(stored.blocked);
     assert!(!stored.open_dm, "a blocked contact must not reappear");
 }
+
+#[tokio::test]
+async fn message_info_reports_who_received_and_who_read() {
+    // The panel behind "Info" on a message. Delivery is recorded per device and
+    // reading per person; both have to come back as people, with times, or the
+    // panel is guesswork dressed up as fact.
+    let directory = Arc::new(StaticDirectory::new());
+    let mut alice = start("Alice", Arc::clone(&directory)).await;
+    let bob = start("Bob", Arc::clone(&directory)).await;
+
+    introduce(&alice, &bob);
+    Arc::clone(&alice.engine).connect(&bob.address).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let sent = alice
+        .engine
+        .send_direct_message(bob.user.id, "did you get this?")
+        .await
+        .unwrap();
+
+    // Nothing has happened to it yet beyond being written.
+    let fresh = alice.engine.message_info(sent.id).unwrap().expect("exists");
+    assert_eq!(fresh.message_id, sent.id);
+    assert_eq!(fresh.written_at, sent.written_at);
+    assert!(fresh.read_by.is_empty(), "nobody has read it yet");
+
+    wait_for(&mut alice.events, "a delivery confirmation", |event| match event {
+        Event::MessageDelivered { message_id, .. } if *message_id == sent.id => Some(()),
+        _ => None,
+    })
+    .await;
+
+    let delivered = alice.engine.message_info(sent.id).unwrap().expect("exists");
+    assert_eq!(
+        delivered.delivered_to.iter().map(|r| r.user_id).collect::<Vec<_>>(),
+        vec![bob.user.id],
+        "delivery should name the person, not the device",
+    );
+    assert!(delivered.delivered_to[0].at > 0, "a delivery with no time is no use");
+    assert!(delivered.read_by.is_empty(), "delivered is not read");
+
+    // Bob reads it, which sends a receipt back.
+    bob.engine
+        .mark_as_read(sent.id, libbounce::types::FrameType::DirectMessage)
+        .await
+        .unwrap();
+
+    wait_for(&mut alice.events, "the read receipt", |event| match event {
+        Event::MessageRead { message_id, .. } if *message_id == sent.id => Some(()),
+        _ => None,
+    })
+    .await;
+
+    let read = alice.engine.message_info(sent.id).unwrap().expect("exists");
+    assert_eq!(
+        read.read_by.iter().map(|r| r.user_id).collect::<Vec<_>>(),
+        vec![bob.user.id],
+    );
+    assert!(read.read_by[0].at > 0, "a read with no time is no use");
+
+    // A message nobody has ever heard of has no info, rather than empty info.
+    assert!(alice.engine.message_info(Uuid::new_v4()).unwrap().is_none());
+}

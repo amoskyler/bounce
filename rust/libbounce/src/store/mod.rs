@@ -1164,6 +1164,46 @@ impl Store {
     }
 
     /// The users who have read a given message.
+    /// Who has read something, and when they said so.
+    ///
+    /// The plain `readers_of` is enough to tick a message off; this is what a
+    /// person asking "who has actually seen this" wants. Kept as the earliest
+    /// receipt per reader: a device that reports twice has not read it twice.
+    pub fn read_times_for(&self, target: Uuid) -> Result<Vec<(Uuid, i64)>> {
+        self.with(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT actor, MIN(timestamp) FROM read_receipts
+                 WHERE target = ?1 GROUP BY actor ORDER BY MIN(timestamp)",
+            )?;
+            let rows = statement.query_map(params![uuid_bytes(target)], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            Ok(rows
+                .collect::<std::result::Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter_map(|(bytes, at)| Uuid::from_slice(&bytes).ok().map(|id| (id, at)))
+                .collect())
+        })
+    }
+
+    /// Which device addresses a frame reached, and when.
+    ///
+    /// Delivery is recorded per device rather than per person, because that is
+    /// what actually happened — somebody with a phone and a laptop has two of
+    /// these. The caller folds them back into people.
+    pub fn delivery_times_for(&self, frame_id: Uuid) -> Result<Vec<(String, i64)>> {
+        self.with(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT destination, MIN(created_at) FROM delivery_records
+                 WHERE frame_id = ?1 GROUP BY destination ORDER BY MIN(created_at)",
+            )?;
+            let rows = statement.query_map(params![uuid_bytes(frame_id)], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
     pub fn readers_of(&self, target: Uuid) -> Result<Vec<Uuid>> {
         self.with(|connection| {
             let mut statement =

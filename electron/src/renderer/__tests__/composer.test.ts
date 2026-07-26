@@ -24,6 +24,8 @@ import { renderToStaticMarkup } from 'react-dom/server';
 
 import { Composer } from '../Conversation';
 import { EMBEDDED_FILE_LIMIT, stageFile } from '../Attachments';
+import { partition } from '../MessageInfo';
+import type { MessageInfo } from '../../preload';
 import { EmojiPicker, EmojiSuggestions } from '../EmojiPicker';
 import { emojiForShortcode } from '../emoji';
 import {
@@ -281,4 +283,77 @@ test('exactly at the limit is embedded, one byte over is streamed', async () => 
 
   assert.ok(!('error' in at) && at.path === undefined);
   assert.ok(!('error' in over) && over.path === '/tmp/b');
+});
+
+/* --------------------------------------------------------------------------
+ * Message info
+ * -------------------------------------------------------------------------- */
+
+function info(overrides: Partial<MessageInfo> = {}): MessageInfo {
+  return {
+    messageId: 'm1',
+    writtenAt: 1_700_000_000,
+    expiresAt: 0,
+    readBy: [],
+    deliveredTo: [],
+    audience: [],
+    ...overrides,
+  };
+}
+
+test('somebody who read a message is not also listed as merely delivered', () => {
+  // A read receipt implies delivery, so both records exist. Listing both would
+  // count the same person twice and make a group look larger than it is.
+  const split = partition(
+    info({
+      readBy: [{ userId: 'ada', at: 200 }],
+      deliveredTo: [{ userId: 'ada', at: 100 }, { userId: 'bob', at: 110 }],
+      audience: ['me', 'ada', 'bob'],
+    }),
+    'me',
+  );
+
+  assert.deepEqual(split.read.map((r) => r.userId), ['ada']);
+  assert.deepEqual(split.delivered.map((r) => r.userId), ['bob']);
+  assert.deepEqual(split.pending, []);
+});
+
+test('the author is never waiting for their own message', () => {
+  const split = partition(info({ audience: ['me', 'ada'] }), 'me');
+  assert.deepEqual(split.pending, ['ada'], 'the sender should not be pending');
+});
+
+test('a group member with no record at all is reported as pending', () => {
+  // The reason the panel exists: one tick can mean four people out of five.
+  const split = partition(
+    info({
+      readBy: [{ userId: 'ada', at: 300 }],
+      deliveredTo: [{ userId: 'bob', at: 100 }],
+      audience: ['me', 'ada', 'bob', 'carol', 'dan'],
+    }),
+    'me',
+  );
+
+  assert.deepEqual(split.pending, ['carol', 'dan']);
+});
+
+test('a reader with no delivery record still counts as having read it', () => {
+  // Delivery records are pruned; receipts are not. Losing the reader because
+  // the delivery record aged out would be the worst possible reading of it.
+  const split = partition(
+    info({ readBy: [{ userId: 'ada', at: 300 }], audience: ['me', 'ada'] }),
+    'me',
+  );
+
+  assert.deepEqual(split.read.map((r) => r.userId), ['ada']);
+  assert.deepEqual(split.pending, []);
+});
+
+test('a direct message has no audience, so nobody is ever pending', () => {
+  // Only a group knows who was addressed. Inventing a recipient for a one to
+  // one would be stating something the engine never recorded.
+  const split = partition(info({ deliveredTo: [{ userId: 'ada', at: 100 }] }), 'me');
+
+  assert.deepEqual(split.delivered.map((r) => r.userId), ['ada']);
+  assert.deepEqual(split.pending, []);
 });

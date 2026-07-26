@@ -168,6 +168,27 @@ export interface OutgoingAttachment {
   path?: string;
 }
 
+/** One person's receipt for a message, and when it happened. */
+export interface Receipt {
+  userId: string;
+  /** Unix seconds. Zero when the record predates the column. */
+  at: number;
+}
+
+/** Everything known about one message's fate, for the info panel. */
+export interface MessageInfo {
+  messageId: string;
+  writtenAt: number;
+  /** When it disappears, or zero if it does not. */
+  expiresAt: number;
+  /** Who has read it, earliest first. */
+  readBy: Receipt[];
+  /** Who has received it, earliest first. A reader is always a recipient. */
+  deliveredTo: Receipt[];
+  /** Everyone it is addressed to. Empty for a direct message. */
+  audience: string[];
+}
+
 export interface InitialState {
   profile: User | null;
   networkOnline: boolean;
@@ -298,6 +319,15 @@ const api = {
    * the preload, so this is the one place that can answer. A file from the
    * clipboard — a pasted screenshot — is a blob with no path, and gets ''.
    */
+  /**
+   * Everything known about what happened to one message.
+   *
+   * Fetched on demand rather than carried on every message: it is four extra
+   * queries, and a thread only ever shows this for the one you asked about.
+   */
+  messageInfo: (messageId: string): Promise<MessageInfo | null> =>
+    ipcRenderer.invoke('bounce:messageInfo', messageId),
+
   pathForFile: (file: File): string => {
     try {
       return webUtils.getPathForFile(file);

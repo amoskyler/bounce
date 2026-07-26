@@ -91,6 +91,7 @@
   --scrollbar-thumb: rgba(0, 0, 0, 0.2);
   --overlay: rgba(0, 0, 0, 0.4);
   --panel-background: #ffffff;
+  --menu-item-active: var(--gray-15);
   --shadow: 0 4px 20px rgba(0, 0, 0, 0.16);
 }
 
@@ -124,6 +125,7 @@
   --scrollbar-thumb: rgba(255, 255, 255, 0.2);
   --overlay: rgba(0, 0, 0, 0.6);
   --panel-background: var(--gray-80);
+  --menu-item-active: var(--gray-65);
   --shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
 }
 
@@ -254,7 +256,8 @@ textarea {
 }
 
 .app > .details,
-.app > .settings {
+.app > .settings,
+.app > .message-info {
   grid-column: 3;
   grid-row: 2;
   min-height: 0;
@@ -266,7 +269,8 @@ textarea {
  * squashes the panes above it rather than sitting beside them.
  */
 .app:has(> .details),
-.app:has(> .settings) {
+.app:has(> .settings),
+.app:has(> .message-info) {
   grid-template-columns: auto 1fr auto;
 }
 
@@ -1147,6 +1151,20 @@ textarea {
   white-space: nowrap;
 }
 
+/*
+ * Positioned at the pointer, for a context menu.
+ *
+ * Fixed rather than absolute: the coordinates come from a mouse event, which
+ * is in viewport space, and the timeline it opens over is scrolled.
+ */
+.menu--at-pointer {
+  position: fixed;
+  top: auto;
+  right: auto;
+  z-index: 40;
+  min-width: 150px;
+}
+
 /* Opens upwards, for anchors that sit at the bottom of the window. */
 .menu--above {
   top: auto;
@@ -1169,8 +1187,20 @@ textarea {
   color: var(--icon);
 }
 
-.menu__item:hover {
-  background: var(--row-hover);
+/*
+ * A menu sits on `--panel-background`, which is the same white as the window
+ * in light mode — so `--row-hover`, tuned for a row on that same background,
+ * was very nearly invisible here. A menu item is a thing you are about to
+ * click, and it should look like it.
+ */
+.menu__item:hover,
+.menu__item:focus-visible {
+  background: var(--row-selected);
+  outline: none;
+}
+
+.menu__item:active {
+  background: var(--menu-item-active);
 }
 
 .menu__item--destructive {
