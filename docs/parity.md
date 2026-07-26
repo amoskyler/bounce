@@ -8,9 +8,9 @@ port's design document lists what is verified end to end. What follows is the
 audit of everything else — twenty-six places where the port either does less
 than `chat/` does, or does it somewhere the interface cannot reach. Three
 themes account for most of it. **`handle_frame`'s catch-all arm**
-(`rust/bounce-core/src/engine/mod.rs:2328`) silently drops six frame types that
+(`rust/libbounce/src/engine/mod.rs:2328`) silently drops six frame types that
 Go handles, so profile changes, device revocations, settings and drafts arrive
-and evaporate. **`UserView`** (`rust/bounce-core/src/engine/event.rs:21-33`) is
+and evaporate. **`UserView`** (`rust/libbounce/src/engine/event.rs:21-33`) is
 missing four fields the `users` row already stores, so settings the engine
 persists correctly are invisible to the renderer and read back as their
 defaults. And **the port collapsed Go's two lists** — the contact store and the
@@ -79,7 +79,7 @@ The port decodes the invitee's `User` in three places and stores it in none:
 `address_map`, `consensus/state.rs:338-356` records the addresses in
 `GroupState::devices`, and `engine/system.rs:137-143` takes the subject id for a
 status row. `recompute_group` then rebuilds membership with `if let Some(user) =
-self.store.user(*member)?` (`rust/bounce-core/src/engine/mod.rs:707-712`),
+self.store.user(*member)?` (`rust/libbounce/src/engine/mod.rs:707-712`),
 silently skipping anyone absent. `types.rs:273`'s `introduction::GROUP` has no
 assignment anywhere in the crate.
 
@@ -134,7 +134,7 @@ ones that arrive before the update they refer to; `getConfirmationsToOffer`
 In the port, `Confirmation` exists with a full `Broadcastable` impl
 (`frames/group.rs:209,237`) and `store/mod.rs:1061`'s `save_confirmation` has no
 caller outside its own definition. `recompute_group`
-(`rust/bounce-core/src/engine/mod.rs:673`) writes state and emits `GroupUpdated`
+(`rust/libbounce/src/engine/mod.rs:673`) writes state and emits `GroupUpdated`
 without minting anything. `handle_frame` has no `FrameType::Confirmation` arm, so
 type 19 lands in the catch-all at `engine/mod.rs:2328`.
 `references_not_delivered_to` (`store/mod.rs:1275-1291`) lists seven source tables
@@ -189,7 +189,7 @@ is refused before the insert (`chat/direct_message.go:236-244`,
 
 The port writes the field and never reads it back for anything but display.
 `message.delete_at = crate::now() + retention` at
-`rust/bounce-core/src/engine/mod.rs:410` and `:450`, and the attachment
+`rust/libbounce/src/engine/mod.rs:410` and `:450`, and the attachment
 equivalents at `engine/files.rs:101,171`. There is no `WHERE delete_at` query in
 the crate, no trigger in `store/schema.rs`, and the single `DELETE FROM` against a
 message table (`store/mod.rs:914`, inside `delete_messages_before`) is called only
@@ -244,7 +244,7 @@ a fresh X25519 and Ed25519 pair, pushes them to encrypted devices signed with th
 The port has no `update_devices` table in `store/schema.rs` and no
 `FrameType::UpdateDevice` arm, so an inbound revocation reaches
 `engine/mod.rs:2328` and is logged away. `Store::revoke_device`
-(`rust/bounce-core/src/store/mod.rs:428`) exists with callers only at
+(`rust/libbounce/src/store/mod.rs:428`) exists with callers only at
 `store/mod.rs:2226,2232,2244`, all tests. There is no `Engine::revoke_device`, no
 `roll_keys`, no `revoke_unauthorized_device_actions`, and `frames/identity.rs:345`
 `KeySet` is defined and never produced or consumed. `rename_device`
@@ -288,7 +288,7 @@ re-run. `Engine::revoke_device` and `roll_keys` come with [P14](#p14).
 This is the ordinary case for a serverless system, and the loss is silent and
 permanent.
 
-`handle_frame_unlocked` (`rust/bounce-core/src/engine/mod.rs:2835-2845`) is the
+`handle_frame_unlocked` (`rust/libbounce/src/engine/mod.rs:2835-2845`) is the
 only path catch-up uses, and it dispatches five frame types —
 `DirectMessage`, `GroupMessage`, `GroupCreation`, `UpdateGroup`, `ReadReceipt` —
 with `_ => Ok(())` for everything else. The full `handle_frame` *does* handle
@@ -408,7 +408,7 @@ pairing-code exchange, not a browser.
 
 There is no out-of-band workaround either. `apply_add_user` preserves local state
 when re-adopting a known contact, including `adopted.blocked = known.blocked`
-(`rust/bounce-core/src/engine/mod.rs:1079-1086`), and `peering.rs:239` skips
+(`rust/libbounce/src/engine/mod.rs:1079-1086`), and `peering.rs:239` skips
 dialling blocked users — so physically re-pairing with the person in front of you
 does not restore them. Recovery means editing SQLite.
 
@@ -446,7 +446,7 @@ mutedUntil={user.mutedUntil} />` with no retention prop
 back to `value={retention ?? 0}` (`DetailsPanel.tsx:373`). It cannot be a
 forgotten prop: the group path five lines up passes `retention={group.retention}`
 (`DetailsPanel.tsx:310-314`), and the field is absent one layer lower too —
-`UserView` (`rust/bounce-core/src/engine/event.rs:21-33`) carries `muted_until`
+`UserView` (`rust/libbounce/src/engine/event.rs:21-33`) carries `muted_until`
 and no retention, while `GroupView` carries both, and `user_view`
 (`engine/mod.rs:2851-2864`) never populates it despite `User` owning the field
 (`store/mod.rs:82,111,1820`).
@@ -533,7 +533,7 @@ The port collapsed the two lists into one. `conversations()`
 `direct` conversation for each, skipping only blocked ones, and nothing upstream
 filters (`App.tsx:154-157` applies only the search box). It could not honour the
 flag even if it wanted to: `UserView` has no `open_dm`
-(`rust/bounce-core/src/engine/event.rs:21-33`) and `user_view` drops it
+(`rust/libbounce/src/engine/event.rs:21-33`) and `user_view` drops it
 (`engine/mod.rs:2851-2864`), though the field is stored (`store/schema.rs:42`),
 written (`store/mod.rs:107,223`), read back (`store/mod.rs:1777`), preserved
 across re-adoption (`engine/mod.rs:1064`) and correctly mutated by inbound frames
@@ -575,7 +575,7 @@ contacts surface from [P7](#p7) for everyone the sidebar no longer shows.
 **Users learned from a group creation frame emit no `UserAdded`**
 
 `handle_group_creation` saves each founding user with `self.store.save_user(user)?`
-(`rust/bounce-core/src/engine/mod.rs:2528`) and emits no event. `Event::UserAdded`
+(`rust/libbounce/src/engine/mod.rs:2528`) and emits no event. `Event::UserAdded`
 comes from exactly one place, the add-user adoption path
 (`engine/mod.rs:1101-1110`). The renderer's `state.users` is populated only by the
 boot snapshot (`App.tsx:111-114`) and by `userAdded`/`userUpdated`
@@ -669,7 +669,7 @@ have; they are `msgpack:"-"` and never travel inside a user record
 (`chat/user.go:41,50-52`).
 
 The port persists two. `leaves_a_record()` is `ChangeRetention | SetClearBefore`
-(`rust/bounce-core/src/frames/update.rs:307-312`) and gates `save_update_dm` on
+(`rust/libbounce/src/frames/update.rs:307-312`) and gates `save_update_dm` on
 both the local path (`engine/mod.rs:1221-1224`) and the inbound one (`:1272-1274`);
 everything else is folded straight into the `users` row by
 `apply_dm_setting_locally` (`engine/mod.rs:1298-1349`). So state is no longer
@@ -730,7 +730,7 @@ triggers a catch-up.
 
 All four frames exist in the port (`frames/pairing.rs:216,238,267,277`) and encode
 correctly. Nothing sends or handles them: `handle_frame`
-(`rust/bounce-core/src/engine/mod.rs:2302-2332`) has no arm for types 7, 8, 9 or
+(`rust/libbounce/src/engine/mod.rs:2302-2332`) has no arm for types 7, 8, 9 or
 10, so they reach the catch-all at `:2328`. `create_pairing_code`
 (`engine/mod.rs:755`) reuses the `SyncDeviceOffer` row for the *contact* add-user
 flow, so there is no device-pairing offer at all, and `bounce-node/src/lib.rs`
@@ -870,7 +870,7 @@ copies eight fields and not that one (`state.ts:189-201`). `.banner--offline` an
 which is where the wiring stopped.
 
 It is dead one layer lower too: `initial_state` hardcodes `network_online: true,
-device_revoked: false` (`rust/bounce-core/src/engine/mod.rs:378-379`), and
+device_revoked: false` (`rust/libbounce/src/engine/mod.rs:378-379`), and
 `Event::NetworkOnline`/`NetworkOffline` (`engine/event.rs:166-167`) are never
 emitted anywhere in the Rust tree. So the flags are pinned even if a component
 read them.
@@ -1001,7 +1001,7 @@ the entire Go tree is the auto-join decision: under
 not auto-joined (`chat/consensus_store.go:591-624`), and the Fyne UI exposes the
 setting (`ui/settings_container.go:24-32,125,190-198`).
 
-`respond_to_invite` (`rust/bounce-core/src/engine/mod.rs:526-541`) signs and
+`respond_to_invite` (`rust/libbounce/src/engine/mod.rs:526-541`) signs and
 applies the update and does nothing else. `accepted` is written in two of Go's
 three places — own profile (`engine/mod.rs:261`) and add-user adoption (`:1063`,
 copied at `:1050`) — and read in none. `auto_join_groups` is stored, validated,
@@ -1127,7 +1127,7 @@ devices (`:135`), rejects revoked signers (`:126-133`) and reconciles by timesta
 (`:157`). Drafts are catch-up-eligible (`chat/catch_up.go:29`) and served in the
 reference flow (`chat/reference_offer.go:1265-1276`).
 
-`Engine::save_draft` (`rust/bounce-core/src/engine/mod.rs:2084-2103`) builds a
+`Engine::save_draft` (`rust/libbounce/src/engine/mod.rs:2084-2103`) builds a
 `SignedContainer`, saves and calls `self.broadcast(&draft)`, and `Draft`'s
 `Broadcastable` returns `Scope::Sync` with destination self
 (`frames/message.rs:432-452`, scope unit-tested at `:593-608`). A Go sibling would
@@ -1175,7 +1175,7 @@ checks (`:1529`, `:1706`, `:1740`), recipient appending (`:793`, `:866`, `:954`,
 `chat/encrypted_file_storage.go` (737 lines) complete it, and
 `chat/protocol.go:167-189` registers nineteen handlers for the encrypted role.
 
-`rust/bounce-core/src/frames/encrypted.rs` is 529 lines that stop at data
+`rust/libbounce/src/frames/encrypted.rs` is 529 lines that stop at data
 structures plus unit tests: `Recipient` (`:37`), `DeviceRecipient` (`:61`),
 `EncryptedFrame` (`:83`), `seal_for_recipients` (`:187`), the reference-offer
 challenge and response (`:220`, `:235`), the management request and response

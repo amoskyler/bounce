@@ -10,13 +10,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use bounce_core::crypto::DeviceKey;
-use bounce_core::engine::files::OutgoingAttachment;
-use bounce_core::engine::{Engine, Event};
-use bounce_core::frames::identity::User;
-use bounce_core::frames::message::{DirectMessage, ImageAttachment};
-use bounce_core::net::{StaticDirectory, TcpNetwork};
-use bounce_core::store::Store;
+use libbounce::crypto::DeviceKey;
+use libbounce::engine::files::OutgoingAttachment;
+use libbounce::engine::{Engine, Event};
+use libbounce::frames::identity::User;
+use libbounce::frames::message::{DirectMessage, ImageAttachment};
+use libbounce::net::{StaticDirectory, TcpNetwork};
+use libbounce::store::Store;
 use tokio::sync::mpsc::UnboundedReceiver;
 use uuid::Uuid;
 
@@ -83,6 +83,7 @@ fn photo() -> (Vec<u8>, OutgoingAttachment) {
             width: 32,
             height: 32,
             blur_hash: String::new(),
+            ..Default::default()
         },
     )
 }
@@ -95,7 +96,7 @@ async fn a_message_past_its_expiry_is_deleted_and_the_client_is_told() {
     let mut alice = start("Alice", directory).await;
     let bob = contact(&alice, "Bob");
 
-    let now = bounce_core::now();
+    let now = libbounce::now();
     let expired = store_message(&alice, bob, "this was meant to vanish", now - 120, now - 60);
     let kept = store_message(&alice, bob, "this one is not on a timer", now - 120, 0);
     let later = store_message(&alice, bob, "this one expires tomorrow", now - 120, now + 86_400);
@@ -125,7 +126,7 @@ async fn the_sweep_runs_on_its_own_for_as_long_as_the_engine_does() {
     let alice = start("Alice", directory).await;
     let bob = contact(&alice, "Bob");
 
-    let now = bounce_core::now();
+    let now = libbounce::now();
     let expired = store_message(&alice, bob, "gone by now", now - 120, now - 60);
 
     tokio::spawn(Arc::clone(&alice.engine).run_retention());
@@ -150,7 +151,7 @@ async fn the_sweep_enforces_a_cutoff_that_arrived_from_somewhere_else() {
     let alice = start("Alice", directory).await;
     let bob = contact(&alice, "Bob");
 
-    let now = bounce_core::now();
+    let now = libbounce::now();
     let before = store_message(&alice, bob, "from before the clear", now - 600, 0);
     let after = store_message(&alice, bob, "from after it", now - 60, 0);
 

@@ -906,13 +906,20 @@ impl Store {
 
     pub fn group_message(&self, id: Uuid) -> Result<Option<GroupMessage>> {
         self.with(|connection| {
-            Ok(connection
+            let message = connection
                 .query_row(
                     "SELECT * FROM group_messages WHERE id = ?1",
                     params![uuid_bytes(id)],
                     row_to_group_message,
                 )
-                .optional()?)
+                .optional()?;
+            match message {
+                Some(mut message) => {
+                    load_attachments(connection, &mut message)?;
+                    Ok(Some(message))
+                }
+                None => Ok(None),
+            }
         })
     }
 
@@ -926,6 +933,9 @@ impl Store {
                 .query_map(params![uuid_bytes(group), limit], row_to_group_message)?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             messages.reverse();
+            for message in &mut messages {
+                load_attachments(connection, message)?;
+            }
             Ok(messages)
         })
     }
@@ -2784,10 +2794,43 @@ fn save_attachments(
     Ok(())
 }
 
-fn load_attachments(connection: &Connection, message: &mut DirectMessage) -> Result<()> {
+/// A message that can carry attachments, so one loader serves both kinds.
+///
+/// The attachments were always saved for both, but only direct messages were
+/// ever read back — so a group's pictures survived a restart in the database
+/// and vanished from the screen. A trait rather than two near-identical
+/// functions, because two of them is how they drifted apart in the first
+/// place.
+trait Attachable {
+    fn id(&self) -> Uuid;
+    fn attachment_lists(&mut self) -> (&mut Vec<FileAttachment>, &mut Vec<ImageAttachment>);
+}
+
+impl Attachable for DirectMessage {
+    fn id(&self) -> Uuid {
+        self.id
+    }
+    fn attachment_lists(&mut self) -> (&mut Vec<FileAttachment>, &mut Vec<ImageAttachment>) {
+        (&mut self.file_attachments, &mut self.image_attachments)
+    }
+}
+
+impl Attachable for GroupMessage {
+    fn id(&self) -> Uuid {
+        self.id
+    }
+    fn attachment_lists(&mut self) -> (&mut Vec<FileAttachment>, &mut Vec<ImageAttachment>) {
+        (&mut self.file_attachments, &mut self.image_attachments)
+    }
+}
+
+fn load_attachments<M: Attachable>(connection: &Connection, message: &mut M) -> Result<()> {
+    let message_id = message.id();
+    let (file_list, image_list) = message.attachment_lists();
+
     let mut files = connection.prepare("SELECT * FROM file_attachments WHERE message_id = ?1")?;
-    message.file_attachments = files
-        .query_map(params![uuid_bytes(message.id)], |row| {
+    *file_list = files
+        .query_map(params![uuid_bytes(message_id)], |row| {
             Ok(FileAttachment {
                 id: row_uuid(row, "id")?,
                 file_id: row_uuid(row, "file_id")?,
@@ -2799,8 +2842,8 @@ fn load_attachments(connection: &Connection, message: &mut DirectMessage) -> Res
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     let mut images = connection.prepare("SELECT * FROM image_attachments WHERE message_id = ?1")?;
-    message.image_attachments = images
-        .query_map(params![uuid_bytes(message.id)], |row| {
+    *image_list = images
+        .query_map(params![uuid_bytes(message_id)], |row| {
             Ok(ImageAttachment {
                 id: row_uuid(row, "id")?,
                 file_id: row_uuid(row, "file_id")?,
@@ -2975,6 +3018,52 @@ mod tests {
         // be relayed to another device and verify there.
         assert_eq!(loaded.signed, message.signed);
         assert!(loaded.signed.to_container().is_valid());
+    }
+
+    #[test]
+    fn a_group_message_keeps_its_attachments_across_a_reload() {
+        // They were always written; only direct messages were ever read back,
+        // so a group's pictures survived in the database and disappeared from
+        // the screen the moment the app was restarted.
+        let store = store();
+        let group = Uuid::new_v4();
+
+        let mut message = GroupMessage::new(Uuid::new_v4(), group, "look".into(), 100);
+        message.image_attachments.push(ImageAttachment {
+            id: Uuid::new_v4(),
+            file_id: Uuid::new_v4(),
+            message_id: message.id,
+            name: "photo.png".into(),
+            size: 2048,
+            width: 800,
+            height: 600,
+            blur_hash: "LEHV6nWB2yk8pyo0adR*".into(),
+        });
+        message.file_attachments.push(FileAttachment {
+            id: Uuid::new_v4(),
+            file_id: Uuid::new_v4(),
+            message_id: message.id,
+            name: "notes.pdf".into(),
+            size: 4096,
+        });
+
+        store.save_group_message(&message).expect("saves");
+
+        // By id...
+        let one = store.group_message(message.id).expect("reads").expect("exists");
+        assert_eq!(one.image_attachments.len(), 1, "the picture was lost");
+        assert_eq!(one.image_attachments[0].name, "photo.png");
+        assert_eq!(one.image_attachments[0].width, 800);
+        assert_eq!(one.image_attachments[0].blur_hash, "LEHV6nWB2yk8pyo0adR*");
+        assert_eq!(one.file_attachments.len(), 1);
+        assert_eq!(one.file_attachments[0].name, "notes.pdf");
+
+        // ...and the way the timeline actually loads a thread, which is the
+        // path the reader sees.
+        let thread = store.group_messages_for_thread(group, 50).expect("reads the thread");
+        assert_eq!(thread.len(), 1);
+        assert_eq!(thread[0].image_attachments.len(), 1, "the picture was lost on reload");
+        assert_eq!(thread[0].file_attachments.len(), 1);
     }
 
     #[test]

@@ -38,7 +38,7 @@
   --green: #2c9c4a;
 
   /* Geometry. */
-  --left-pane-width: 380px;
+  --left-pane-width: 300px;
   --header-height: 52px;
 
   /*
@@ -274,15 +274,64 @@ textarea {
  * Left pane
  * -------------------------------------------------------------------------- */
 
+/*
+ * The width is set inline from `preferences.ts`; the variable below is only
+ * the pre-hydration fallback. `min-width` and `max-width` repeat the limits
+ * that module clamps to — keep the three in step.
+ */
 .left-pane {
+  position: relative;
   width: var(--left-pane-width);
-  min-width: 280px;
-  max-width: 540px;
+  min-width: 240px;
+  max-width: 520px;
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
   background: var(--left-pane-background);
   border-right: 1px solid var(--divider);
+}
+
+/*
+ * The drag handle, straddling the divider.
+ *
+ * Wider than the 1px border it sits on, because a 1px hit target is a target
+ * you have to aim at. It stays invisible until the pointer is near it — the
+ * divider itself is the visual, and thickening it on hover is enough of a cue
+ * without adding a permanent second line to the layout.
+ */
+.left-pane__resizer {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  right: -3px;
+  width: 7px;
+  z-index: 5;
+  cursor: col-resize;
+  /* Keeps a drag started here from being treated as a window drag on macOS. */
+  -webkit-app-region: no-drag;
+}
+
+.left-pane__resizer::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 3px;
+  width: 1px;
+  background: var(--ultramarine);
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+
+.left-pane__resizer:hover::after,
+.left-pane__resizer:focus-visible::after,
+.left-pane__resizer--dragging::after {
+  opacity: 1;
+}
+
+/* The ring belongs on the divider line, which `::after` already draws. */
+.left-pane__resizer:focus-visible {
+  outline: none;
 }
 
 .left-pane__header {
@@ -321,13 +370,24 @@ textarea {
   align-items: center;
   gap: 4px;
   margin-left: auto;
+  /* The buttons are a fixed size; it is the search box that gives way. */
+  flex-shrink: 0;
 }
 
+/*
+ * `min-width: 0` is what lets this shrink at all.
+ *
+ * A flex item's automatic minimum size is its content, and the content here is
+ * an `<input>`, whose intrinsic width is around 170px whatever you put in it.
+ * Without the override the header simply overflows once the pane is dragged
+ * narrow — the buttons keep their size and slide out past the divider.
+ */
 .left-pane__search {
   display: flex;
   align-items: center;
   gap: 8px;
   flex: 1;
+  min-width: 0;
   height: 32px;
   padding: 0 10px;
   border-radius: 16px;
@@ -735,63 +795,64 @@ textarea {
   background: var(--background);
 }
 
+/*
+ * Holds a popover above the button it belongs to.
+ *
+ * The emoji picker and the attachment menu both open upwards out of the
+ * composer, and both need an ancestor to position against that is not the
+ * composer row itself — anchoring to the row would put them in the middle of
+ * it rather than over their own button.
+ */
+.composer__anchor {
+  position: relative;
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
 .composer__input-wrapper {
+  position: relative;
   flex: 1;
   display: flex;
   align-items: flex-end;
-  gap: 6px;
   min-height: 36px;
-  padding: 6px 10px 6px 12px;
+  padding: 7px 14px;
+  /*
+   * Half the minimum height, so a single line is a true pill. A multi-line
+   * draft grows past it into a generously rounded rectangle, which is what
+   * Signal does too.
+   */
   border-radius: 18px;
   background: var(--input-background);
-}
-
-.composer__input-wrapper:focus-within {
-  box-shadow: inset 0 0 0 2px var(--ultramarine);
 }
 
 .composer__input {
   flex: 1;
   min-width: 0;
   max-height: 180px;
-  padding: 2px 0;
+  padding: 0;
   font-size: 14px;
-  line-height: 19px;
+  line-height: 20px;
   resize: none;
   overflow-y: auto;
 }
 
+/*
+ * No focus ring on a text box that already has a caret in it.
+ *
+ * The global `:focus-visible` rule draws a rectangle with a 4px radius. Around
+ * a bare `<textarea>` sitting inside a pill that reads as a second, wrongly
+ * shaped box — and for a text input the blinking caret already says where
+ * typing will go, which is the whole point of the ring.
+ */
+.composer__input:focus-visible,
+.left-pane__search input:focus-visible,
+.emoji-picker__search input:focus-visible {
+  outline: none;
+}
+
 .composer__input::placeholder {
   color: var(--text-tertiary);
-}
-
-.composer__send {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 32px;
-  height: 32px;
-  flex-shrink: 0;
-  border-radius: 50%;
-  background: var(--ultramarine);
-  color: #ffffff;
-  transition:
-    background 0.1s ease,
-    transform 0.08s ease,
-    opacity 0.1s ease;
-}
-
-.composer__send:hover {
-  background: var(--ultramarine-hover);
-}
-
-.composer__send:active {
-  transform: scale(0.94);
-}
-
-.composer__send:disabled {
-  opacity: 0;
-  pointer-events: none;
 }
 
 /* --------------------------------------------------------------------------
@@ -818,6 +879,13 @@ textarea {
 
 .icon-button:active {
   background: var(--row-selected);
+}
+
+/* The button holds its pressed look while the popover it opened is up. */
+.icon-button--active,
+.icon-button--active:hover {
+  background: var(--row-selected);
+  color: var(--icon-hover);
 }
 
 /* --------------------------------------------------------------------------
@@ -1077,6 +1145,28 @@ textarea {
   font-size: 14px;
   color: var(--text-primary);
   white-space: nowrap;
+}
+
+/* Opens upwards, for anchors that sit at the bottom of the window. */
+.menu--above {
+  top: auto;
+  bottom: calc(100% + 8px);
+}
+
+/*
+ * An item with a leading icon has to become a flex row; `.menu__item` is a
+ * block, which would drop the label onto the line below the glyph.
+ */
+.menu__item--icon {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 12px;
+}
+
+.menu__item--icon svg {
+  flex-shrink: 0;
+  color: var(--icon);
 }
 
 .menu__item:hover {

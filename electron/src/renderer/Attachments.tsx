@@ -30,12 +30,21 @@ import type { Attachment } from '../preload';
 /**
  * The largest file that may ride along inside a message.
  *
- * Mirrors `EMBEDDED_FILE_LIMIT` in `rust/bounce-core/src/lib.rs`. Anything
- * larger has to go through the chunked file transfer, which the engine does not
- * drive yet, so refusing it by name here is more honest than accepting it and
- * failing somewhere the user cannot see.
+ * Mirrors `EMBEDDED_FILE_LIMIT` in `rust/libbounce/src/lib.rs`. This is not a
+ * cap on what may be sent — anything larger is streamed from disk instead of
+ * being embedded — it is the point at which reading the whole thing into
+ * memory stops being reasonable.
  */
 export const EMBEDDED_FILE_LIMIT = 20 * 1024 * 1024;
+
+/**
+ * What the "Photos & Videos" menu item narrows the picker to.
+ *
+ * Wildcards rather than a list of types, because the point is to hide the rest
+ * of the filesystem while browsing, not to police what may be sent — anything
+ * that gets past the dialog is still just bytes to the engine.
+ */
+export const MEDIA_ACCEPT = 'image/*,video/*';
 
 /** The widest an image is drawn inside a bubble, in CSS pixels. */
 const MAX_IMAGE_WIDTH = 300;
@@ -61,7 +70,15 @@ export interface PendingAttachment {
   name: string;
   mimeType: string;
   size: number;
+  /**
+   * The whole file, for anything small enough to embed.
+   *
+   * Empty when {@link path} is set: a file streamed from disk is never read
+   * into the renderer at all, which is the entire point of streaming it.
+   */
   bytes: Uint8Array;
+  /** Where the file is on disk, for one too large to embed. */
+  path?: string;
   /** An object URL for images only, and only until the attachment goes away. */
   previewUrl?: string;
 }
@@ -99,12 +116,78 @@ export interface AttachmentIntake {
   onDrop: (event: React.DragEvent<HTMLElement>) => void;
   /** The hidden file input. It has to be rendered for the picker to open. */
   fileInput: React.ReactElement;
-  /** Open the system file picker. */
-  openFilePicker: () => void;
+  /**
+   * Open the system file picker.
+   *
+   * `accept` is an `<input accept>` list, narrowing what the dialog offers —
+   * "Photos & Videos" and "File" are the same picker with and without one.
+   * Omitting it accepts anything.
+   */
+  openFilePicker: (accept?: string) => void;
   /** Drop one staged attachment, revoking its preview. */
   remove: (id: string) => void;
   /** Drop all of them, revoking every preview. Call this after sending. */
   clear: () => void;
+}
+
+/**
+ * Turn one chosen file into something the composer can hold, or a refusal.
+ *
+ * Exported for tests, and separate from the hook because the interesting part
+ * is a decision rather than any state: whether this file is small enough to
+ * carry inside the message, or has to be streamed from where it already is.
+ *
+ * `pathFor` is how a `File` is resolved to a path on disk. It is injected
+ * rather than reached for, because only the preload can answer it — Electron
+ * removed `File.path` — and a test has no preload.
+ */
+export async function stageFile(
+  file: File,
+  pathFor: (file: File) => string,
+): Promise<PendingAttachment | { error: string }> {
+  const mimeType = file.type || 'application/octet-stream';
+  const name = file.name || defaultName(mimeType);
+
+  /*
+   * Past the embedding limit the file is sent from where it is.
+   *
+   * Reading it would mean holding all of it in the renderer, which is the very
+   * thing streaming exists to avoid — so nothing is read, no preview is built,
+   * and the engine hashes it a chunk at a time straight off the disk.
+   *
+   * A file with no path cannot take this route. That is a pasted screenshot or
+   * a dropped blob: it only ever existed in memory, so there is nothing to
+   * stream from and the limit genuinely applies.
+   */
+  if (file.size > EMBEDDED_FILE_LIMIT) {
+    // An older bridge has no way to answer this. Staging by path anyway would
+    // hand the engine an attachment with neither bytes nor a path, which it
+    // rejects with a message about an empty file — true, and no help at all.
+    const path = typeof pathFor === 'function' ? pathFor(file) : '';
+    if (!path) {
+      return {
+        error: `${file.name || 'That item'} is ${fileSize(file.size)} and has no file on disk. Save it first, then attach it.`,
+      };
+    }
+
+    return { id: crypto.randomUUID(), name, mimeType, size: file.size, bytes: new Uint8Array(0), path };
+  }
+
+  const bytes = new Uint8Array(await file.arrayBuffer());
+
+  return {
+    id: crypto.randomUUID(),
+    name,
+    mimeType,
+    size: file.size,
+    bytes,
+    // The preview is built from the copy we already hold rather than from the
+    // File, so it keeps working if the original is moved or deleted between
+    // staging and sending.
+    ...(isImageType(mimeType)
+      ? { previewUrl: URL.createObjectURL(new Blob([bytes], { type: mimeType })) }
+      : {}),
+  };
 }
 
 /**
@@ -163,28 +246,13 @@ export function useAttachmentIntake(
     let rejection: string | null = null;
 
     for (const file of files) {
-      if (file.size > EMBEDDED_FILE_LIMIT) {
-        rejection = `${file.name || 'That file'} is ${fileSize(file.size)}. Attachments are limited to ${fileSize(EMBEDDED_FILE_LIMIT)}.`;
-        continue;
-      }
-
-      const bytes = new Uint8Array(await file.arrayBuffer());
-      const mimeType = file.type || 'application/octet-stream';
-
-      accepted.push({
-        id: crypto.randomUUID(),
-        // A pasted screenshot often arrives as an unnamed blob.
-        name: file.name || defaultName(mimeType),
-        mimeType,
-        size: file.size,
-        bytes,
-        // The preview is built from the copy we already hold rather than from
-        // the File, so it keeps working if the original is moved or deleted
-        // between staging and sending.
-        ...(isImageType(mimeType)
-          ? { previewUrl: URL.createObjectURL(new Blob([bytes], { type: mimeType })) }
-          : {}),
-      });
+      const staged = await stageFile(file, (target) =>
+        // Optional chaining, not a bare call: a renderer newer than the
+        // preload it is running against should refuse the file, not throw.
+        window.bounce.pathForFile?.(target) ?? '',
+      );
+      if ('error' in staged) rejection = staged.error;
+      else accepted.push(staged);
     }
 
     if (accepted.length > 0) {
@@ -255,8 +323,14 @@ export function useAttachmentIntake(
     [addFiles],
   );
 
-  const openFilePicker = React.useCallback(() => {
-    inputRef.current?.click();
+  const openFilePicker = React.useCallback((accept?: string) => {
+    const input = inputRef.current;
+    if (!input) return;
+    // Written straight onto the node rather than held in state: the click has
+    // to happen in the same turn as the user's, or macOS treats the dialog as
+    // unsolicited, and a state update would not have rendered by then.
+    input.accept = accept ?? '';
+    input.click();
   }, []);
 
   const remove = React.useCallback((id: string) => {

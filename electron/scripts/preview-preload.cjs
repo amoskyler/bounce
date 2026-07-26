@@ -8,6 +8,7 @@
  */
 
 const { contextBridge } = require('electron');
+const { deflateSync } = require('node:zlib');
 
 const HOUR = 3600;
 const now = Math.floor(Date.now() / 1000);
@@ -32,6 +33,69 @@ function user(id, name, overrides = {}) {
     online: false,
     ...overrides,
   };
+}
+
+/**
+ * A 400×300 PNG, built here rather than checked in.
+ *
+ * Image rows are the ones that break windowing arithmetic, so a preview that
+ * cannot render one is a preview that cannot show the bug. Generating it costs
+ * a few lines and keeps a binary blob out of the repository.
+ */
+let cachedPng = null;
+function previewPng() {
+  if (cachedPng) return cachedPng;
+
+  const width = 400;
+  const height = 300;
+
+  const table = [];
+  for (let index = 0; index < 256; index += 1) {
+    let value = index;
+    for (let bit = 0; bit < 8; bit += 1) value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+    table[index] = value >>> 0;
+  }
+  const crc = (buffer) => {
+    let value = ~0;
+    for (const byte of buffer) value = table[(value ^ byte) & 0xff] ^ (value >>> 8);
+    return ~value >>> 0;
+  };
+
+  const chunk = (type, data) => {
+    const length = Buffer.alloc(4);
+    length.writeUInt32BE(data.length);
+    const body = Buffer.concat([Buffer.from(type), data]);
+    const check = Buffer.alloc(4);
+    check.writeUInt32BE(crc(body));
+    return Buffer.concat([length, body, check]);
+  };
+
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0);
+  header.writeUInt32BE(height, 4);
+  header[8] = 8; // bit depth
+  header[9] = 2; // truecolour
+
+  // A gradient, so the row is visibly an image rather than a flat block.
+  const raw = Buffer.alloc(height * (1 + width * 3));
+  for (let y = 0; y < height; y += 1) {
+    const offset = y * (1 + width * 3);
+    for (let x = 0; x < width; x += 1) {
+      raw[offset + 1 + x * 3] = Math.floor((x * 255) / width);
+      raw[offset + 2 + x * 3] = Math.floor((y * 255) / height);
+      raw[offset + 3 + x * 3] = 140;
+    }
+  }
+
+  cachedPng = new Uint8Array(
+    Buffer.concat([
+      Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+      chunk('IHDR', header),
+      chunk('IDAT', deflateSync(raw)),
+      chunk('IEND', Buffer.alloc(0)),
+    ]),
+  );
+  return cachedPng;
 }
 
 function message(id, thread, author, text, writtenAt, overrides = {}) {
@@ -130,6 +194,86 @@ const state = {
   drafts: [{ thread: grace, text: 'Sounds good, I will take a look at' }],
 };
 
+/*
+ * A long thread of wildly uneven rows, for exercising the windowing.
+ *
+ * `BOUNCE_PREVIEW_BULK=400` prepends that many messages to the group thread.
+ * The mix is the point: one-liners, paragraphs several times taller, and image
+ * rows taller again. A list whose rows were all the same height would never
+ * show a windowing bug, because the estimate would always be right.
+ */
+const bulk = Number(process.env.BOUNCE_PREVIEW_BULK || '0');
+if (bulk > 0) {
+  const authors = [grace, alan, ada, me];
+  const extra = [];
+
+  for (let index = 0; index < bulk; index += 1) {
+    const author = authors[index % authors.length];
+    const at = now - 3 * HOUR - (bulk - index) * 60;
+
+    if (index % 11 === 5) {
+      // An image row: several hundred pixels where the estimate says sixty.
+      extra.push(
+        message(`bulk${index}`, bookClub, author, '', at, {
+          attachments: [
+            {
+              id: `att${index}`,
+              fileId: `file${index}`,
+              name: 'photo.png',
+              size: 240_000,
+              width: 1200,
+              height: 900,
+              blurHash: 'LEHV6nWB2yk8pyo0adR*.7kCMdnj',
+              progress: 1,
+            },
+          ],
+        }),
+      );
+    } else if (index % 7 === 3) {
+      extra.push(
+        message(
+          `bulk${index}`,
+          bookClub,
+          author,
+          `A longer thought, number ${index}. `.repeat(14),
+          at,
+        ),
+      );
+    } else {
+      // A block of unread messages a long way up the thread, which is what
+      // puts the timeline into its "reveal the first unread row" mode.
+      const unread = process.env.BOUNCE_PREVIEW_UNREAD === '1' && index >= 40 && index < 60;
+      extra.push(
+        message(`bulk${index}`, bookClub, author, `Message ${index}.`, at, {
+          seen: !unread,
+          outgoing: unread ? false : author === me,
+          author: unread ? grace : author,
+        }),
+      );
+    }
+  }
+
+  state.messages = [...extra, ...state.messages];
+}
+
+const listeners = [];
+const slowCalls = new Map();
+let lastSend = null;
+
+/** What an outgoing attachment looks like, without dumping the bytes. */
+function describe(attachment) {
+  return {
+    name: attachment.name,
+    dataLength: attachment.data ? attachment.data.length : null,
+    dataType: attachment.data ? attachment.data.constructor.name : null,
+    isImage: attachment.isImage,
+    width: attachment.width,
+    height: attachment.height,
+    blurHashLength: (attachment.blurHash || '').length,
+    path: attachment.path,
+  };
+}
+
 const api = {
   address: async () => 'df7wwi7bnsctfrvlza4pvtk6u6e34ddwwkjagnadtp5iwpjwrvq5bpad',
   transport: async () => ({
@@ -140,12 +284,40 @@ const api = {
     'bounce:df7wwi7bnsctfrvlza4pvtk6u6e34ddwwkjagnadtp5iwpjwrvq5bpad:0f8a1c3d5e7b9a2c4d6e8f0a1b2c3d4e',
   requestToAddUser: async () => undefined,
   markAsRead: async () => undefined,
+  /*
+   * A 4:3 PNG, so an image row is drawn at its real height rather than
+   * collapsing to a broken frame.
+   *
+   * `BOUNCE_PREVIEW_SLOW_FILES=n` withholds it for the first n calls per file,
+   * which is what the engine does between reporting a file complete and having
+   * the bytes ready to serve. A client that asks once and gives up shows a
+   * blurhash for the rest of the session.
+   */
+  fileData: async (fileId) => {
+    const withhold = Number(process.env.BOUNCE_PREVIEW_SLOW_FILES || '0');
+    if (withhold > 0) {
+      const seen = (slowCalls.get(fileId) || 0) + 1;
+      slowCalls.set(fileId, seen);
+      if (seen <= withhold) return null;
+    }
+    return previewPng();
+  },
   typingIn: async () => undefined,
   hasProfile: async () => true,
   initialState: async () => state,
   createProfile: async () => me,
   sendDirectMessage: async () => state.messages[0],
   sendGroupMessage: async () => state.messages[0],
+  // Records the shape the composer hands over, which is the only way to see
+  // what the engine would have been given.
+  sendDirectMessageWithAttachments: async (_to, text, attachments) => {
+    lastSend = { text, attachments: attachments.map(describe) };
+    return state.messages[0];
+  },
+  sendGroupMessageWithAttachments: async (_group, text, attachments) => {
+    lastSend = { text, attachments: attachments.map(describe) };
+    return state.messages[0];
+  },
   createGroup: async () => state.groups[0],
   inviteToGroup: async () => undefined,
   respondToInvite: async () => undefined,
@@ -154,6 +326,11 @@ const api = {
   saveDraft: async () => undefined,
   connectToPeer: async () => undefined,
   onEvent: (listener) => {
+    // Held so the harness can push engine events into the renderer — a burst
+    // of file progress, a message arriving — which is the only way to exercise
+    // what the interface does while something is streaming in.
+    listeners.push(listener);
+
     // Optionally inject a typing indicator so the rendered state can be
     // inspected without a second device.
     if (process.env.BOUNCE_PREVIEW_TYPING === '1') {
@@ -162,7 +339,10 @@ const api = {
         50,
       );
     }
-    return () => undefined;
+    return () => {
+      const at = listeners.indexOf(listener);
+      if (at >= 0) listeners.splice(at, 1);
+    };
   },
   onThemeChange: () => () => undefined,
   platform: process.platform,
@@ -176,4 +356,10 @@ contextBridge.exposeInMainWorld('bouncePreview', {
   select: process.env.BOUNCE_PREVIEW_SELECT || bookClub,
   theme: process.env.BOUNCE_PREVIEW_THEME || 'light',
   conversationIds: { me, ada, grace, alan, bookClub },
+  /** What the composer last tried to send. */
+  lastSend: () => lastSend,
+  /** Push an engine event at the renderer, as the real bridge would. */
+  emit: (event) => {
+    for (const listener of listeners) listener(event);
+  },
 });

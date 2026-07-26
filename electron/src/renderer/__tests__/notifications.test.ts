@@ -28,9 +28,12 @@ import {
 } from '../notifications';
 import {
   computeVisibleRange,
-  measuredRowHeight,
-  type RangeInputs,
-  type VisibleRange,
+  createMetrics,
+  offsetOf,
+  resizeMetrics,
+  totalHeight,
+  withMeasurements,
+  type RowMetrics,
 } from '../useVisibleRange';
 
 const NOW = 1_700_000_000;
@@ -183,61 +186,75 @@ test('a message with nothing in it falls back rather than showing a blank body',
 
 /* -------------------------------------------------------------------------
  * Windowing
+ *
+ * The rows in a timeline are not one height: a date separator is around 30px,
+ * a one-line bubble 56, a photograph over four hundred. Every test below that
+ * mixes heights is there because a single global average got it wrong — the
+ * estimate followed whatever was on screen, and revising it resized the
+ * spacers and slid the conversation under the reader.
  * ---------------------------------------------------------------------- */
 
-const THREAD: RangeInputs = {
-  scrollTop: 0,
-  viewportHeight: 600,
-  count: 10_000,
-  rowHeight: 56,
-  overscanRows: 10,
-};
+const ROW = 56;
+const VIEWPORT = 600;
 
-/** The scroll height the caller's container will report for a range. */
-function totalHeight(range: VisibleRange, rowHeight: number): number {
-  return range.topSpacer + (range.end - range.start) * rowHeight + range.bottomSpacer;
+/** A table of `count` rows, none of them measured yet. */
+function fresh(count = 10_000): RowMetrics {
+  return createMetrics(count, ROW);
+}
+
+/** Measure every row in a range at one height, as a screenful would. */
+function measureAll(metrics: RowMetrics, from: number, to: number, height: number): RowMetrics {
+  const measurements: [number, number][] = [];
+  for (let index = from; index < to; index += 1) measurements.push([index, height]);
+  return withMeasurements(metrics, measurements, ROW);
+}
+
+function window(metrics: RowMetrics, scrollTop: number, viewportHeight = VIEWPORT) {
+  return computeVisibleRange({ scrollTop, viewportHeight, metrics, overscanRows: 10 });
 }
 
 test('a ten thousand message thread windows down to a screenful of rows', () => {
   // The whole point: mounting ten thousand rows is what this replaces.
-  const range = computeVisibleRange({ ...THREAD, scrollTop: 280_000 });
+  const range = window(fresh(), 280_000);
   assert.ok(range.end - range.start < 100, `windowed ${range.end - range.start} rows`);
 });
 
 test('the spacers and the rendered rows always add up to the full list height', () => {
   // If they did not, the scrollbar would misreport the length of the thread and
   // the position would jump as the window moved.
+  const metrics = fresh();
   for (const scrollTop of [0, 1_000, 280_000, 559_400]) {
-    const range = computeVisibleRange({ ...THREAD, scrollTop });
-    assert.equal(totalHeight(range, THREAD.rowHeight), THREAD.count * THREAD.rowHeight);
+    const range = window(metrics, scrollTop);
+    const rendered = offsetOf(metrics, range.end) - offsetOf(metrics, range.start);
+    assert.equal(range.topSpacer + rendered + range.bottomSpacer, totalHeight(metrics));
   }
 });
 
 test('the window covers the viewport even when every row is twice its estimate', () => {
-  // Rows are variable: a wrapped bubble is taller than the estimate. The
-  // overscan has to absorb that, or the reader sees blank space below the fold.
-  const range = computeVisibleRange({ ...THREAD, scrollTop: 280_000 });
-  const realHeight = (range.end - range.start) * THREAD.rowHeight * 2;
-  assert.ok(realHeight > THREAD.viewportHeight * 2, `covered only ${realHeight}px`);
+  // The overscan has to absorb rows taller than expected, or the reader sees
+  // blank space below the fold before the next window is computed.
+  const metrics = fresh();
+  const range = window(metrics, 280_000);
+  const realHeight = (range.end - range.start) * ROW * 2;
+  assert.ok(realHeight > VIEWPORT * 2, `covered only ${realHeight}px`);
 });
 
 test('a container that has not been laid out yet still renders rows', () => {
   // A zero height is a container mid-mount or hidden. Believing it would mount
   // nothing, and the list would come up blank and stay that way.
-  const range = computeVisibleRange({ ...THREAD, viewportHeight: 0 });
-  assert.ok(range.end - range.start > 0);
+  assert.ok(window(fresh(), 0, 0).end > 0);
 });
 
 test('a scroll position past the end of the list still renders the tail', () => {
   // Happens when the thread shrinks under the reader — a retention sweep, or a
   // conversation switched while scrolled far down.
-  const range = computeVisibleRange({ ...THREAD, scrollTop: 99_000_000 });
-  assert.equal(range.end, THREAD.count);
+  const range = window(fresh(), 99_000_000);
+  assert.equal(range.end, 10_000);
   assert.ok(range.start < range.end);
 });
 
 test('an empty list has no window and no spacers', () => {
-  assert.deepEqual(computeVisibleRange({ ...THREAD, count: 0 }), {
+  assert.deepEqual(window(fresh(0), 0), {
     start: 0,
     end: 0,
     topSpacer: 0,
@@ -246,49 +263,177 @@ test('an empty list has no window and no spacers', () => {
 });
 
 test('a list shorter than the window renders every row', () => {
-  const range = computeVisibleRange({ ...THREAD, count: 4 });
-  assert.deepEqual(range, { start: 0, end: 4, topSpacer: 0, bottomSpacer: 0 });
+  assert.deepEqual(window(fresh(4), 0), { start: 0, end: 4, topSpacer: 0, bottomSpacer: 0 });
 });
 
-test('a nonsense row height cannot produce an empty window', () => {
+test('a nonsense estimate cannot produce an empty window', () => {
   // Division by a zero or negative height is how a windowing bug turns into a
   // blank conversation.
-  for (const rowHeight of [0, -20]) {
-    const range = computeVisibleRange({ ...THREAD, rowHeight });
-    assert.ok(range.end > range.start, `empty window at row height ${rowHeight}`);
+  for (const estimate of [0, -20]) {
+    const range = window(createMetrics(10_000, estimate), 0);
+    assert.ok(range.end > range.start, `empty window at estimate ${estimate}`);
   }
 });
 
+test('the window brackets the viewport rather than starting inside it', () => {
+  // An off-by-one at either edge shows as a sliver of blank space at the top or
+  // bottom of the scroller, which is exactly where it is least visible in a
+  // screenshot and most obvious in use.
+  const metrics = measureAll(fresh(500), 0, 500, ROW);
+  const range = window(metrics, 10_000);
+  assert.ok(offsetOf(metrics, range.start) <= 10_000, 'window starts below the viewport top');
+  assert.ok(
+    offsetOf(metrics, range.end) >= 10_000 + VIEWPORT,
+    'window ends above the viewport bottom',
+  );
+});
+
 /* -------------------------------------------------------------------------
- * Measurement
+ * Per-row heights
  * ---------------------------------------------------------------------- */
 
-const RENDERED: VisibleRange = { start: 100, end: 140, topSpacer: 5_600, bottomSpacer: 5_600 };
+test('a measured row keeps its own height instead of an average', () => {
+  // The failure this prevents: one 450px photograph among 56px bubbles used to
+  // drag the estimate for every other row up with it.
+  let metrics = fresh(100);
+  metrics = withMeasurements(metrics, [[10, 450]], ROW);
 
-test('a measurement close to the working estimate is ignored', () => {
-  // Adopting every measurement moves both spacers, which moves the content
-  // under a fixed scroll position — the list would twitch as it scrolled.
-  const scrollHeight = RENDERED.topSpacer + 40 * 58 + RENDERED.bottomSpacer;
-  assert.equal(measuredRowHeight(scrollHeight, RENDERED, 56), null);
+  assert.equal(metrics.known[10], 450);
+  // Row 11 sits after the tall one, not after an average of it.
+  assert.equal(offsetOf(metrics, 11) - offsetOf(metrics, 10), 450);
 });
 
-test('a measurement far from the working estimate is adopted', () => {
-  // Rows twice the estimate mean the spacers are half the height they should
-  // be, and the scrollbar is lying about the length of the thread.
-  const scrollHeight = RENDERED.topSpacer + 40 * 112 + RENDERED.bottomSpacer;
-  assert.equal(measuredRowHeight(scrollHeight, RENDERED, 56), 112);
+test('unmeasured rows are priced at the mean of the measured ones', () => {
+  let metrics = fresh(100);
+  metrics = measureAll(metrics, 0, 10, 80);
+
+  assert.equal(metrics.average, 80);
+  assert.equal(offsetOf(metrics, 10), 800);
+  assert.equal(totalHeight(metrics), 800 + 90 * 80);
 });
 
-test('a handful of rows is not a large enough sample to measure', () => {
-  // The measured block also holds the container's padding and whatever else
-  // the caller renders in the scroller; over a few rows that overhead is most
-  // of what is being measured.
-  const few: VisibleRange = { start: 0, end: 3, topSpacer: 0, bottomSpacer: 0 };
-  assert.equal(measuredRowHeight(900, few, 56), null);
+test('a tall row moves the average by its share and no more', () => {
+  let metrics = fresh(100);
+  metrics = measureAll(metrics, 0, 9, 50);
+  metrics = withMeasurements(metrics, [[9, 500]], ROW);
+
+  // Nine rows at 50 and one at 500: the mean is 95, not 500.
+  assert.equal(metrics.average, 95);
+  // And the nine measured rows are still exactly 50 each.
+  assert.equal(offsetOf(metrics, 9), 450);
 });
 
-test('a container reporting nothing rendered is not a measurement', () => {
-  // Mid-layout the spacers can add up to more than the scroll height, and a
-  // negative row height would poison every window after it.
-  assert.equal(measuredRowHeight(RENDERED.topSpacer, RENDERED, 56), null);
+test('re-measuring a row at the same height changes nothing', () => {
+  // Identity is what the hook uses to decide whether a scroll correction is
+  // owed, so a no-op measurement must not look like a change.
+  const metrics = measureAll(fresh(100), 0, 20, 60);
+  assert.equal(withMeasurements(metrics, [[5, 60]], ROW), metrics);
+  assert.equal(withMeasurements(metrics, [[5, 60.2]], ROW), metrics);
+  assert.notEqual(withMeasurements(metrics, [[5, 90]], ROW), metrics);
+});
+
+test('a row measured at zero is ignored', () => {
+  // A hidden or mid-layout row reports zero, and believing it would collapse
+  // the offsets of everything below.
+  const metrics = measureAll(fresh(100), 0, 20, 60);
+  assert.equal(withMeasurements(metrics, [[5, 0]], ROW), metrics);
+});
+
+test('measurements outside the list are dropped rather than growing it', () => {
+  const metrics = fresh(10);
+  assert.equal(withMeasurements(metrics, [[-1, 90], [999, 90]], ROW), metrics);
+  assert.equal(metrics.known.length, 10);
+});
+
+test('offsets are clamped to the ends of the list', () => {
+  const metrics = measureAll(fresh(10), 0, 10, 40);
+  assert.equal(offsetOf(metrics, -5), 0);
+  assert.equal(offsetOf(metrics, 999), 400);
+});
+
+test('growing the list keeps the heights already measured', () => {
+  // New messages arrive at the end of a thread constantly. Forgetting what the
+  // rows above them measured would re-introduce the jump on every arrival.
+  const metrics = measureAll(fresh(100), 0, 100, 70);
+  const grown = resizeMetrics(metrics, 101, ROW);
+
+  assert.equal(grown.known.length, 101);
+  assert.equal(grown.known[0], 70);
+  assert.equal(grown.known[100], 0, 'the new row has not been measured');
+  assert.equal(offsetOf(grown, 100), 7_000);
+});
+
+test('shrinking the list drops the heights past its new end', () => {
+  const metrics = measureAll(fresh(100), 0, 100, 70);
+  const shrunk = resizeMetrics(metrics, 10, ROW);
+
+  assert.equal(shrunk.known.length, 10);
+  assert.equal(totalHeight(shrunk), 700);
+});
+
+test('a shift moves measured heights to their new indices', () => {
+  // History loaded at the front of a thread renumbers every row below it.
+  let metrics = fresh(10);
+  metrics = withMeasurements(metrics, [[0, 400]], ROW);
+
+  const shifted = resizeMetrics(metrics, 13, ROW, 3);
+  assert.equal(shifted.known[3], 400, 'the tall row moved down by three');
+  assert.equal(shifted.known[0], 0, 'the rows in front of it are unmeasured');
+});
+
+/* -------------------------------------------------------------------------
+ * Stability
+ * ---------------------------------------------------------------------- */
+
+test('scrolling through a run of tall rows does not move the rows above them', () => {
+  // The reported bug, reduced: scrolling down past images kept throwing the
+  // reader back up. Every row above the window has a known height, so its
+  // offset must not move however tall the rows below turn out to be.
+  let metrics = fresh(400);
+  metrics = measureAll(metrics, 0, 100, 56);
+
+  const anchor = offsetOf(metrics, 50);
+
+  // Now a run of photographs is scrolled into view and measured.
+  metrics = measureAll(metrics, 100, 120, 450);
+
+  assert.equal(offsetOf(metrics, 50), anchor, 'a measured row above the window moved');
+});
+
+test('the top spacer only changes when a row above the window is re-measured', () => {
+  // This is what the hook keys its scroll correction off. If the spacer moved
+  // for any other reason the correction would fire when nothing had shifted.
+  let metrics = measureAll(fresh(400), 0, 400, 56);
+  const before = window(metrics, 10_000);
+
+  // Something far below is re-measured much taller.
+  metrics = withMeasurements(metrics, [[380, 450]], ROW);
+  const after = window(metrics, 10_000);
+
+  assert.equal(after.start, before.start);
+  assert.equal(after.topSpacer, before.topSpacer, 'the spacer above the reader moved');
+  assert.ok(after.bottomSpacer > before.bottomSpacer, 'the list did not get taller');
+});
+
+test('a mixed thread settles: measuring twice changes nothing the second time', () => {
+  // The oscillation was a loop — measure, revise the estimate, resize the
+  // spacers, land somewhere else, measure again. Once heights are per-row, a
+  // second pass over the same rows is a no-op.
+  let metrics = fresh(300);
+  const heights = (index: number) => (index % 11 === 5 ? 450 : index % 7 === 3 ? 140 : 56);
+
+  const pass = (from: number, to: number) => {
+    const measurements: [number, number][] = [];
+    for (let index = from; index < to; index += 1) measurements.push([index, heights(index)]);
+    return withMeasurements(metrics, measurements, ROW);
+  };
+
+  metrics = pass(0, 60);
+  const settled = window(metrics, 2_000);
+  const total = totalHeight(metrics);
+
+  const again = pass(0, 60);
+  assert.equal(again, metrics, 'a second measurement of the same rows changed the table');
+  assert.equal(totalHeight(again), total);
+  assert.deepEqual(window(again, 2_000), settled);
 });

@@ -8,12 +8,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use bounce_core::crypto::DeviceKey;
-use bounce_core::engine::files::OutgoingAttachment;
-use bounce_core::engine::{Engine, Event};
-use bounce_core::frames::identity::User;
-use bounce_core::net::{Network, StaticDirectory, TcpNetwork};
-use bounce_core::store::Store;
+use libbounce::crypto::DeviceKey;
+use libbounce::engine::files::OutgoingAttachment;
+use libbounce::engine::{Engine, Event};
+use libbounce::frames::identity::User;
+use libbounce::net::{Network, StaticDirectory, TcpNetwork};
+use libbounce::store::Store;
 use tokio::sync::mpsc::UnboundedReceiver;
 use uuid::Uuid;
 
@@ -142,7 +142,7 @@ async fn a_direct_message_travels_between_two_instances() {
     // And it is durable, not just an event.
     let stored = bob
         .store
-        .direct_messages_for_thread(bounce_core::xor(alice.user.id, bob.user.id), 10)
+        .direct_messages_for_thread(libbounce::xor(alice.user.id, bob.user.id), 10)
         .expect("reads the thread");
     assert_eq!(stored.len(), 1);
     assert_eq!(stored[0].text, "hello from Alice");
@@ -188,7 +188,7 @@ async fn delivery_is_confirmed_by_an_acknowledgement() {
         .is_delivered_to(
             &bob.address,
             sent.id,
-            bounce_core::types::FrameType::DirectMessage
+            libbounce::types::FrameType::DirectMessage
         )
         .unwrap());
 }
@@ -211,7 +211,7 @@ async fn messages_written_while_offline_arrive_through_the_reference_flow() {
             .unwrap();
     }
 
-    let thread = bounce_core::xor(alice.user.id, bob.user.id);
+    let thread = libbounce::xor(alice.user.id, bob.user.id);
     assert!(bob
         .store
         .direct_messages_for_thread(thread, 10)
@@ -253,7 +253,7 @@ async fn a_group_message_reaches_every_member() {
     // and nothing more actually exists: the default policy joins a group whose
     // members are all people he has already accepted, and Alice is one.
     bob.engine
-        .set_auto_join_groups(bounce_core::engine::auto_join::NEVER)
+        .set_auto_join_groups(libbounce::engine::auto_join::NEVER)
         .await
         .expect("sets the policy");
 
@@ -416,21 +416,21 @@ async fn a_message_from_an_unknown_device_is_refused() {
         .expect("the handshake itself succeeds");
 
     // Forge a message claiming to be from a user Bob does know about.
-    let mut message = bounce_core::frames::message::DirectMessage::new(
+    let mut message = libbounce::frames::message::DirectMessage::new(
         Uuid::new_v4(),
         bob.user.id,
         "trust me".into(),
-        bounce_core::now(),
+        libbounce::now(),
     );
-    let body = bounce_core::msgpack::to_vec(&message).unwrap();
-    let container = bounce_core::signed::SignedContainer::create(&stranger_key, body);
-    message.signed = bounce_core::frames::SignedFrame::from_container(&container);
+    let body = libbounce::msgpack::to_vec(&message).unwrap();
+    let container = libbounce::signed::SignedContainer::create(&stranger_key, body);
+    message.signed = libbounce::frames::SignedFrame::from_container(&container);
 
-    let payload = bounce_core::msgpack::to_vec(&container).unwrap();
-    bounce_core::wire::write_frame(
+    let payload = libbounce::msgpack::to_vec(&container).unwrap();
+    libbounce::wire::write_frame(
         &mut connection.stream,
-        &bounce_core::wire::RawFrame::new(
-            bounce_core::types::FrameType::DirectMessage.as_u16(),
+        &libbounce::wire::RawFrame::new(
+            libbounce::types::FrameType::DirectMessage.as_u16(),
             payload,
         ),
     )
@@ -441,7 +441,7 @@ async fn a_message_from_an_unknown_device_is_refused() {
 
     // The signature is valid, but the signing device is not one Bob has been
     // introduced to, so it speaks for nobody and the message is dropped.
-    let thread = bounce_core::xor(message.author, bob.user.id);
+    let thread = libbounce::xor(message.author, bob.user.id);
     assert!(
         bob.store
             .direct_messages_for_thread(thread, 10)
@@ -460,18 +460,18 @@ async fn a_forged_signature_is_refused() {
     introduce(&alice, &bob);
 
     // Alice's real address, but a message body that was never signed with it.
-    let mut message = bounce_core::frames::message::DirectMessage::new(
+    let mut message = libbounce::frames::message::DirectMessage::new(
         alice.user.id,
         bob.user.id,
         "I did not write this".into(),
-        bounce_core::now(),
+        libbounce::now(),
     );
-    let body = bounce_core::msgpack::to_vec(&message).unwrap();
+    let body = libbounce::msgpack::to_vec(&message).unwrap();
 
     let impostor = DeviceKey::generate();
-    let mut container = bounce_core::signed::SignedContainer::create(&impostor, body);
+    let mut container = libbounce::signed::SignedContainer::create(&impostor, body);
     container.signer = alice.address.clone();
-    message.signed = bounce_core::frames::SignedFrame::from_container(&container);
+    message.signed = libbounce::frames::SignedFrame::from_container(&container);
 
     let impostor_network = Arc::new(
         TcpNetwork::bind(impostor, Arc::clone(&directory))
@@ -480,11 +480,11 @@ async fn a_forged_signature_is_refused() {
     );
     let mut connection = impostor_network.dial(&bob.address).await.unwrap();
 
-    let payload = bounce_core::msgpack::to_vec(&container).unwrap();
-    bounce_core::wire::write_frame(
+    let payload = libbounce::msgpack::to_vec(&container).unwrap();
+    libbounce::wire::write_frame(
         &mut connection.stream,
-        &bounce_core::wire::RawFrame::new(
-            bounce_core::types::FrameType::DirectMessage.as_u16(),
+        &libbounce::wire::RawFrame::new(
+            libbounce::types::FrameType::DirectMessage.as_u16(),
             payload,
         ),
     )
@@ -493,7 +493,7 @@ async fn a_forged_signature_is_refused() {
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let thread = bounce_core::xor(alice.user.id, bob.user.id);
+    let thread = libbounce::xor(alice.user.id, bob.user.id);
     assert!(
         bob.store
             .direct_messages_for_thread(thread, 10)
@@ -705,7 +705,7 @@ async fn an_unsolicited_acceptance_is_refused() {
         record.public_ecdsa_key = Vec::new();
         record
     };
-    let offer_user = bounce_core::msgpack::to_vec(&mallory_record).unwrap();
+    let offer_user = libbounce::msgpack::to_vec(&mallory_record).unwrap();
 
     // Mallory signs Bob's record, as though answering a request Bob never made.
     let bob_record = {
@@ -716,13 +716,13 @@ async fn an_unsolicited_acceptance_is_refused() {
         record.public_ecdsa_key = Vec::new();
         record
     };
-    let requester_user = bounce_core::msgpack::to_vec(&bob_record).unwrap();
+    let requester_user = libbounce::msgpack::to_vec(&bob_record).unwrap();
 
-    let accepted = bounce_core::frames::pairing::AddUserRequestAccepted {
+    let accepted = libbounce::frames::pairing::AddUserRequestAccepted {
         offer_user,
         offer_signature: mallory
             .key
-            .sign(&bounce_core::crypto::hash(&requester_user))
+            .sign(&libbounce::crypto::hash(&requester_user))
             .to_vec(),
         // Absent, matching the Go frame: the signer is the connected peer.
         offer_device: None,
@@ -732,8 +732,8 @@ async fn an_unsolicited_acceptance_is_refused() {
         .engine
         .handle_frame(
             &mallory.address,
-            bounce_core::wire::RawFrame::new(
-                bounce_core::types::FrameType::AddUserRequestAccepted.as_u16(),
+            libbounce::wire::RawFrame::new(
+                libbounce::types::FrameType::AddUserRequestAccepted.as_u16(),
                 accepted.encode().unwrap(),
             ),
         )
@@ -773,22 +773,22 @@ async fn a_forged_add_user_record_cannot_manufacture_our_consent() {
         device.user_id = fake_bob.id;
     }
 
-    let offer_user = bounce_core::msgpack::to_vec(&strip(&mallory.user)).unwrap();
-    let requester_user = bounce_core::msgpack::to_vec(&fake_bob).unwrap();
+    let offer_user = libbounce::msgpack::to_vec(&strip(&mallory.user)).unwrap();
+    let requester_user = libbounce::msgpack::to_vec(&fake_bob).unwrap();
 
-    let record = bounce_core::frames::pairing::AddUser {
+    let record = libbounce::frames::pairing::AddUser {
         id: Uuid::new_v4(),
-        xor: bounce_core::xor(mallory.user.id, bob.user.id),
-        timestamp: bounce_core::now(),
+        xor: libbounce::xor(mallory.user.id, bob.user.id),
+        timestamp: libbounce::now(),
         saved_at: 0,
         offer_signature: mallory
             .key
-            .sign(&bounce_core::crypto::hash(&requester_user))
+            .sign(&libbounce::crypto::hash(&requester_user))
             .to_vec(),
         // Mallory signs "Bob's" half too, because the device list says it is hers.
         requester_signature: mallory
             .key
-            .sign(&bounce_core::crypto::hash(&offer_user))
+            .sign(&libbounce::crypto::hash(&offer_user))
             .to_vec(),
         offer_device: mallory.address.clone(),
         requester_device: mallory.address.clone(),
@@ -805,9 +805,9 @@ async fn a_forged_add_user_record_cannot_manufacture_our_consent() {
         .engine
         .handle_frame(
             &mallory.address,
-            bounce_core::wire::RawFrame::new(
-                bounce_core::types::FrameType::AddUser.as_u16(),
-                bounce_core::msgpack::to_vec(&record).unwrap(),
+            libbounce::wire::RawFrame::new(
+                libbounce::types::FrameType::AddUser.as_u16(),
+                libbounce::msgpack::to_vec(&record).unwrap(),
             ),
         )
         .await;
@@ -839,28 +839,28 @@ async fn a_receipt_from_outside_the_conversation_is_refused() {
         .unwrap();
 
     // Mallory claims to have read a message in a conversation she is not in.
-    let mut receipt = bounce_core::frames::message::ReadReceipt {
-        signed: bounce_core::frames::SignedFrame::default(),
+    let mut receipt = libbounce::frames::message::ReadReceipt {
+        signed: libbounce::frames::SignedFrame::default(),
         id: Uuid::new_v4(),
         actor: mallory.user.id,
         destination: Uuid::nil(),
         scope: 0,
         target: sent.id,
-        target_type: bounce_core::types::FrameType::DirectMessage.as_u16(),
-        timestamp: bounce_core::now(),
+        target_type: libbounce::types::FrameType::DirectMessage.as_u16(),
+        timestamp: libbounce::now(),
         saved_at: 0,
     };
-    let body = bounce_core::msgpack::to_vec(&receipt).unwrap();
-    let container = bounce_core::signed::SignedContainer::create(&mallory.key, body);
-    receipt.signed = bounce_core::frames::SignedFrame::from_container(&container);
+    let body = libbounce::msgpack::to_vec(&receipt).unwrap();
+    let container = libbounce::signed::SignedContainer::create(&mallory.key, body);
+    receipt.signed = libbounce::frames::SignedFrame::from_container(&container);
 
     let result = alice
         .engine
         .handle_frame(
             &mallory.address,
-            bounce_core::wire::RawFrame::new(
-                bounce_core::types::FrameType::ReadReceipt.as_u16(),
-                bounce_core::msgpack::to_vec(&container).unwrap(),
+            libbounce::wire::RawFrame::new(
+                libbounce::types::FrameType::ReadReceipt.as_u16(),
+                libbounce::msgpack::to_vec(&container).unwrap(),
             ),
         )
         .await;
@@ -897,7 +897,7 @@ async fn marking_a_message_read_twice_sends_one_receipt() {
 
     for _ in 0..5 {
         bob.engine
-            .mark_as_read(received.id, bounce_core::types::FrameType::DirectMessage)
+            .mark_as_read(received.id, libbounce::types::FrameType::DirectMessage)
             .await
             .unwrap();
     }
@@ -963,7 +963,7 @@ async fn reading_a_message_tells_its_author() {
     .await;
 
     bob.engine
-        .mark_as_read(received.id, bounce_core::types::FrameType::DirectMessage)
+        .mark_as_read(received.id, libbounce::types::FrameType::DirectMessage)
         .await
         .expect("marks the message read");
 
@@ -1006,28 +1006,28 @@ async fn a_receipt_that_arrives_before_its_message_is_resolved_later() {
 
     // Hand Bob the receipt without the message, by having him handle the frame
     // directly — the situation a reordered catch up produces.
-    let mut receipt_only = bounce_core::frames::message::ReadReceipt {
-        signed: bounce_core::frames::SignedFrame::default(),
+    let mut receipt_only = libbounce::frames::message::ReadReceipt {
+        signed: libbounce::frames::SignedFrame::default(),
         id: Uuid::new_v4(),
         actor: bob.user.id,
         destination: Uuid::nil(),
         scope: 0,
         target: sent.id,
-        target_type: bounce_core::types::FrameType::DirectMessage.as_u16(),
-        timestamp: bounce_core::now(),
+        target_type: libbounce::types::FrameType::DirectMessage.as_u16(),
+        timestamp: libbounce::now(),
         saved_at: 0,
     };
-    let body = bounce_core::msgpack::to_vec(&receipt_only).unwrap();
-    let container = bounce_core::signed::SignedContainer::create(&bob.key, body);
-    receipt_only.signed = bounce_core::frames::SignedFrame::from_container(&container);
+    let body = libbounce::msgpack::to_vec(&receipt_only).unwrap();
+    let container = libbounce::signed::SignedContainer::create(&bob.key, body);
+    receipt_only.signed = libbounce::frames::SignedFrame::from_container(&container);
 
     alice
         .engine
         .handle_frame(
             &bob.address,
-            bounce_core::wire::RawFrame::new(
-                bounce_core::types::FrameType::ReadReceipt.as_u16(),
-                bounce_core::msgpack::to_vec(&container).unwrap(),
+            libbounce::wire::RawFrame::new(
+                libbounce::types::FrameType::ReadReceipt.as_u16(),
+                libbounce::msgpack::to_vec(&container).unwrap(),
             ),
         )
         .await
@@ -1055,7 +1055,7 @@ async fn typing_indicators_reach_the_other_side_and_expire() {
 
     alice
         .engine
-        .typing_in(bob.user.id, bounce_core::types::FrameType::DirectMessage)
+        .typing_in(bob.user.id, libbounce::types::FrameType::DirectMessage)
         .await
         .expect("sends a typing indicator");
 
@@ -1072,7 +1072,7 @@ async fn typing_indicators_reach_the_other_side_and_expire() {
     // Indicators are ephemeral: nothing is stored, and it withdraws on its own.
     assert!(!bob
         .store
-        .has_frame(Uuid::nil(), bounce_core::types::FrameType::TypingIndicator)
+        .has_frame(Uuid::nil(), libbounce::types::FrameType::TypingIndicator)
         .unwrap());
 
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1103,7 +1103,7 @@ async fn a_message_withdraws_the_senders_typing_indicator() {
 
     alice
         .engine
-        .typing_in(bob.user.id, bounce_core::types::FrameType::DirectMessage)
+        .typing_in(bob.user.id, libbounce::types::FrameType::DirectMessage)
         .await
         .unwrap();
 
@@ -1142,7 +1142,7 @@ async fn typing_indicators_are_throttled() {
     for _ in 0..20 {
         alice
             .engine
-            .typing_in(bob.user.id, bounce_core::types::FrameType::DirectMessage)
+            .typing_in(bob.user.id, libbounce::types::FrameType::DirectMessage)
             .await
             .unwrap();
     }
@@ -1177,25 +1177,25 @@ async fn a_typing_indicator_for_someone_elses_conversation_is_refused() {
 
     // Mallory claims to be typing into Alice's conversation, which is neither
     // addressed to Bob nor authored by him.
-    let mut indicator = bounce_core::frames::message::TypingIndicator {
-        signed: bounce_core::frames::SignedFrame::default(),
+    let mut indicator = libbounce::frames::message::TypingIndicator {
+        signed: libbounce::frames::SignedFrame::default(),
         id: Uuid::new_v4(),
         thread: alice.user.id,
-        message_type: bounce_core::types::FrameType::DirectMessage.as_u16(),
+        message_type: libbounce::types::FrameType::DirectMessage.as_u16(),
         author: mallory.user.id,
         received_at: 0,
     };
-    let body = bounce_core::msgpack::to_vec(&indicator).unwrap();
-    let container = bounce_core::signed::SignedContainer::create(&mallory.key, body);
-    indicator.signed = bounce_core::frames::SignedFrame::from_container(&container);
+    let body = libbounce::msgpack::to_vec(&indicator).unwrap();
+    let container = libbounce::signed::SignedContainer::create(&mallory.key, body);
+    indicator.signed = libbounce::frames::SignedFrame::from_container(&container);
 
     let result = bob
         .engine
         .handle_frame(
             &mallory.address,
-            bounce_core::wire::RawFrame::new(
-                bounce_core::types::FrameType::TypingIndicator.as_u16(),
-                bounce_core::msgpack::to_vec(&container).unwrap(),
+            libbounce::wire::RawFrame::new(
+                libbounce::types::FrameType::TypingIndicator.as_u16(),
+                libbounce::msgpack::to_vec(&container).unwrap(),
             ),
         )
         .await;
@@ -1262,6 +1262,7 @@ fn image(name: &str, data: Vec<u8>) -> OutgoingAttachment {
         width: 64,
         height: 48,
         blur_hash: String::new(),
+        ..Default::default()
     }
 }
 
@@ -1276,7 +1277,7 @@ async fn an_image_reaches_the_other_side_byte_for_byte() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Two and a bit chunks, so reassembly order actually matters.
-    let payload: Vec<u8> = (0..bounce_core::CHUNK_SIZE * 2 + 4096)
+    let payload: Vec<u8> = (0..libbounce::CHUNK_SIZE * 2 + 4096)
         .map(|index| (index % 251) as u8)
         .collect();
 
@@ -1397,7 +1398,7 @@ async fn a_peer_that_lies_about_a_chunk_is_ignored() {
     // Now Alice sends different bytes under the same conversation. They hash
     // to something Bob is not expecting, so nothing about the stored file
     // moves — a chunk is identified by its content, not by who sent it.
-    let forged = bounce_core::frames::file::Chunk {
+    let forged = libbounce::frames::file::Chunk {
         id: Uuid::nil(),
         file_id,
         hash: String::new(),
@@ -1409,9 +1410,9 @@ async fn a_peer_that_lies_about_a_chunk_is_ignored() {
     bob.engine
         .handle_frame(
             &alice.address,
-            bounce_core::wire::RawFrame::new(
-                bounce_core::types::FrameType::Chunk.as_u16(),
-                bounce_core::msgpack::to_vec(&forged).unwrap(),
+            libbounce::wire::RawFrame::new(
+                libbounce::types::FrameType::Chunk.as_u16(),
+                libbounce::msgpack::to_vec(&forged).unwrap(),
             ),
         )
         .await
@@ -1431,7 +1432,7 @@ async fn an_attachment_larger_than_the_limit_is_refused() {
     let bob = start("Bob", Arc::clone(&directory)).await;
     introduce(&alice, &bob);
 
-    let oversized = vec![0u8; (bounce_core::EMBEDDED_FILE_LIMIT + 1) as usize];
+    let oversized = vec![0u8; (libbounce::EMBEDDED_FILE_LIMIT + 1) as usize];
     let result = alice
         .engine
         .send_direct_message_with_attachments(bob.user.id, "", vec![image("huge.bin", oversized)])
@@ -1542,25 +1543,25 @@ async fn a_private_conversation_setting_cannot_be_set_from_outside() {
     // Alice signs a frame telling Bob's device to mute her. Mute state is one
     // device owner's own view, so it must not be settable by the person on the
     // other end of the conversation.
-    let update = bounce_core::frames::update::UpdateDm::new(
+    let update = libbounce::frames::update::UpdateDm::new(
         alice.user.id,
-        bounce_core::xor(alice.user.id, bob.user.id),
-        bounce_core::frames::UpdateDmType::ChangeMutedUntil,
+        libbounce::xor(alice.user.id, bob.user.id),
+        libbounce::frames::UpdateDmType::ChangeMutedUntil,
         i64::MAX.to_le_bytes().to_vec(),
-        bounce_core::now(),
+        libbounce::now(),
     );
-    let container = bounce_core::signed::SignedContainer::create(
+    let container = libbounce::signed::SignedContainer::create(
         &alice.key,
-        bounce_core::msgpack::to_vec(&update).unwrap(),
+        libbounce::msgpack::to_vec(&update).unwrap(),
     );
 
     let result = bob
         .engine
         .handle_frame(
             &alice.address,
-            bounce_core::wire::RawFrame::new(
-                bounce_core::types::FrameType::UpdateDm.as_u16(),
-                bounce_core::msgpack::to_vec(&container).unwrap(),
+            libbounce::wire::RawFrame::new(
+                libbounce::types::FrameType::UpdateDm.as_u16(),
+                libbounce::msgpack::to_vec(&container).unwrap(),
             ),
         )
         .await;
@@ -1578,19 +1579,19 @@ async fn deliver<T: serde::Serialize>(
     to: &Instance,
     from: &str,
     key: &DeviceKey,
-    frame_type: bounce_core::types::FrameType,
+    frame_type: libbounce::types::FrameType,
     body: &T,
-) -> Result<(), bounce_core::Error> {
-    let container = bounce_core::signed::SignedContainer::create(
+) -> Result<(), libbounce::Error> {
+    let container = libbounce::signed::SignedContainer::create(
         key,
-        bounce_core::msgpack::to_vec(body).unwrap(),
+        libbounce::msgpack::to_vec(body).unwrap(),
     );
     to.engine
         .handle_frame(
             from,
-            bounce_core::wire::RawFrame::new(
+            libbounce::wire::RawFrame::new(
                 frame_type.as_u16(),
-                bounce_core::msgpack::to_vec(&container).unwrap(),
+                libbounce::msgpack::to_vec(&container).unwrap(),
             ),
         )
         .await
@@ -1818,7 +1819,7 @@ async fn a_contacts_new_name_reaches_the_people_who_know_them() {
     assert_eq!(updates[0].data, b"Alice Cooper".to_vec());
     assert!(bob
         .store
-        .has_frame(updates[0].id, bounce_core::types::FrameType::UpdateUser)
+        .has_frame(updates[0].id, libbounce::types::FrameType::UpdateUser)
         .unwrap());
     assert_eq!(
         updates[0].previous_data,
@@ -1847,19 +1848,19 @@ async fn nobody_can_rename_somebody_else() {
     introduce(&alice, &bob);
     introduce(&bob, &mallory);
 
-    let mut update = bounce_core::frames::update::UpdateUser::new(
+    let mut update = libbounce::frames::update::UpdateUser::new(
         alice.user.id,
-        bounce_core::frames::update::UpdateUserType::UpdateName,
+        libbounce::frames::update::UpdateUserType::UpdateName,
         b"Mallory's Puppet".to_vec(),
-        bounce_core::now(),
+        libbounce::now(),
     );
-    update.saved_at = bounce_core::now();
+    update.saved_at = libbounce::now();
 
     let result = deliver(
         &bob,
         &mallory.address,
         &mallory.key,
-        bounce_core::types::FrameType::UpdateUser,
+        libbounce::types::FrameType::UpdateUser,
         &update,
     )
     .await;
@@ -1882,14 +1883,14 @@ fn add_own_device(instance: &Instance, name: &str) -> (DeviceKey, String) {
     let key = DeviceKey::generate();
     let address = key.address();
 
-    let mut device = bounce_core::frames::identity::Device::new(
+    let mut device = libbounce::frames::identity::Device::new(
         Uuid::new_v4(),
         instance.user.id,
         address.clone(),
-        bounce_core::now(),
+        libbounce::now(),
     );
     device.name = name.to_string();
-    device.saved_at = bounce_core::now();
+    device.saved_at = libbounce::now();
     instance.store.save_device(&device).expect("saves the device");
 
     (key, address)
@@ -1904,12 +1905,12 @@ async fn a_draft_typed_on_another_device_arrives_here() {
 
     let (laptop, laptop_address) = add_own_device(&alice, "Alice's laptop");
 
-    let draft = bounce_core::frames::message::Draft {
-        signed: bounce_core::frames::SignedFrame::default(),
+    let draft = libbounce::frames::message::Draft {
+        signed: libbounce::frames::SignedFrame::default(),
         id: Uuid::new_v4(),
         thread: bob.user.id,
         text: "started on the laptop".into(),
-        timestamp: bounce_core::now(),
+        timestamp: libbounce::now(),
         saved: false,
         saved_at: 0,
     };
@@ -1918,7 +1919,7 @@ async fn a_draft_typed_on_another_device_arrives_here() {
         &alice,
         &laptop_address,
         &laptop,
-        bounce_core::types::FrameType::Draft,
+        libbounce::types::FrameType::Draft,
         &draft,
     )
     .await
@@ -1943,7 +1944,7 @@ async fn a_draft_typed_on_another_device_arrives_here() {
     assert!(stored.signed.to_container().is_valid());
     assert!(alice
         .store
-        .has_frame(draft.id, bounce_core::types::FrameType::Draft)
+        .has_frame(draft.id, libbounce::types::FrameType::Draft)
         .unwrap());
 
     // An older draft for the same thread does not undo the newer one.
@@ -1955,7 +1956,7 @@ async fn a_draft_typed_on_another_device_arrives_here() {
         &alice,
         &laptop_address,
         &laptop,
-        bounce_core::types::FrameType::Draft,
+        libbounce::types::FrameType::Draft,
         &stale,
     )
     .await
@@ -1974,7 +1975,7 @@ async fn a_draft_typed_on_another_device_arrives_here() {
         &alice,
         &laptop_address,
         &laptop,
-        bounce_core::types::FrameType::Draft,
+        libbounce::types::FrameType::Draft,
         &cleared,
     )
     .await
@@ -1992,12 +1993,12 @@ async fn a_draft_from_somebody_elses_device_is_refused() {
     let bob = start("Bob", Arc::clone(&directory)).await;
     introduce(&alice, &bob);
 
-    let draft = bounce_core::frames::message::Draft {
-        signed: bounce_core::frames::SignedFrame::default(),
+    let draft = libbounce::frames::message::Draft {
+        signed: libbounce::frames::SignedFrame::default(),
         id: Uuid::new_v4(),
         thread: bob.user.id,
         text: "not yours to write".into(),
-        timestamp: bounce_core::now(),
+        timestamp: libbounce::now(),
         saved: false,
         saved_at: 0,
     };
@@ -2006,7 +2007,7 @@ async fn a_draft_from_somebody_elses_device_is_refused() {
         &alice,
         &bob.address,
         &bob.key,
-        bounce_core::types::FrameType::Draft,
+        libbounce::types::FrameType::Draft,
         &draft,
     )
     .await;
@@ -2028,17 +2029,17 @@ async fn a_message_nobody_ever_took_is_marked_undeliverable() {
 
     // Written four weeks ago and never acknowledged by anybody: the recipient's
     // device is gone and is not coming back.
-    let mut message = bounce_core::frames::message::DirectMessage::new(
+    let mut message = libbounce::frames::message::DirectMessage::new(
         alice.user.id,
         bob.user.id,
         "is anyone there".into(),
-        bounce_core::now() - bounce_core::UNDELIVERABLE_AFTER_SECONDS - 1,
+        libbounce::now() - libbounce::UNDELIVERABLE_AFTER_SECONDS - 1,
     );
-    let container = bounce_core::signed::SignedContainer::create(
+    let container = libbounce::signed::SignedContainer::create(
         &alice.key,
-        bounce_core::msgpack::to_vec(&message).unwrap(),
+        libbounce::msgpack::to_vec(&message).unwrap(),
     );
-    message.signed = bounce_core::frames::SignedFrame::from_container(&container);
+    message.signed = libbounce::frames::SignedFrame::from_container(&container);
     message.saved_at = message.written_at;
     alice.store.save_direct_message(&message).unwrap();
 

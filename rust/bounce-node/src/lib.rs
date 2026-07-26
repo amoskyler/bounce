@@ -30,12 +30,12 @@ use napi::threadsafe_function::{ErrorStrategy, ThreadsafeFunction, ThreadsafeFun
 use napi_derive::napi;
 use tokio::sync::Mutex;
 
-use bounce_core::crypto::DeviceKey;
-use bounce_core::engine::files::OutgoingAttachment;
-use bounce_core::engine::{Engine, Event, GroupPermission};
-use bounce_core::net::{HandshakeMode, StaticDirectory, TcpNetwork, TorNetwork, Transport};
-use bounce_core::store::Store;
-use bounce_core::types::FrameType;
+use libbounce::crypto::DeviceKey;
+use libbounce::engine::files::OutgoingAttachment;
+use libbounce::engine::{Engine, Event, GroupPermission};
+use libbounce::net::{HandshakeMode, StaticDirectory, TcpNetwork, TorNetwork, Transport};
+use libbounce::store::Store;
+use libbounce::types::FrameType;
 
 type BounceEngine = Engine<Transport>;
 
@@ -60,6 +60,18 @@ pub struct Attachment {
     /// client passing an explicit `null` — which is what "no blur hash" looks
     /// like in JavaScript — fails conversion rather than defaulting.
     pub blur_hash: String,
+    /// Where the file is on disk, for one too large to read into memory.
+    ///
+    /// Set this and leave `data` empty and the engine streams it: hashed a
+    /// chunk at a time and served by seeking, never held whole. The renderer
+    /// gets a path from the file picker without reading anything, which is why
+    /// a multi-gigabyte file can be attached at all.
+    ///
+    /// Optional, unlike the fields around it. A required field is one every
+    /// caller must set from the day it is added, and a caller that does not
+    /// fails object conversion — which is to say every attachment stops
+    /// sending, not just the large ones.
+    pub path: Option<String>,
 }
 
 fn convert(attachments: Vec<Attachment>) -> Vec<OutgoingAttachment> {
@@ -72,6 +84,7 @@ fn convert(attachments: Vec<Attachment>) -> Vec<OutgoingAttachment> {
             width: attachment.width,
             height: attachment.height,
             blur_hash: attachment.blur_hash,
+            path: attachment.path.unwrap_or_default(),
         })
         .collect()
 }
@@ -104,7 +117,7 @@ impl BounceNode {
     /// `go_compatible` makes outbound handshakes match the Go implementation.
     ///
     /// Required to dial a Go peer, and **it lets every address you dial obtain
-    /// a signature from this device** — see `bounce_core::net`. Inbound
+    /// a signature from this device** — see `libbounce::net`. Inbound
     /// connections from Go peers work either way.
     #[napi(factory)]
     pub fn open(data_directory: String, use_tor: bool, go_compatible: bool) -> Result<Self> {

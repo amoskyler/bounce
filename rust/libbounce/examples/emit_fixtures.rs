@@ -3,19 +3,19 @@
 //! This is the outbound half of the interop check in `tests/go_interop.rs`:
 //!
 //! ```text
-//! cargo run -p bounce-core --example emit_fixtures | go run . verify
+//! cargo run -p libbounce --example emit_fixtures | go run . verify
 //! ```
 
-use bounce_core::crypto::DeviceKey;
-use bounce_core::frames::file::{self, ChunkOffer, File};
-use bounce_core::frames::group::{Group, GroupCreation};
-use bounce_core::frames::identity::{Device, User};
-use bounce_core::frames::message::{DirectMessage, FileAttachment};
-use bounce_core::frames::transport::{Ack, FrameReference};
-use bounce_core::frames::SignedFrame;
-use bounce_core::signed::SignedContainer;
-use bounce_core::types::Scope;
-use bounce_core::{msgpack, types::FrameType};
+use libbounce::crypto::DeviceKey;
+use libbounce::frames::file::{self, ChunkOffer, File};
+use libbounce::frames::group::{Group, GroupCreation};
+use libbounce::frames::identity::{Device, User};
+use libbounce::frames::message::{DirectMessage, FileAttachment};
+use libbounce::frames::transport::{Ack, FrameReference};
+use libbounce::frames::SignedFrame;
+use libbounce::signed::SignedContainer;
+use libbounce::types::Scope;
+use libbounce::{msgpack, types::FrameType};
 use uuid::Uuid;
 
 fn main() {
@@ -71,9 +71,9 @@ fn main() {
         name: "photo.png".into(),
         file_type: 2,
         attached_to: message.id,
-        hash: hex::encode(bounce_core::crypto::hash(b"a short attachment")),
+        hash: hex::encode(libbounce::crypto::hash(b"a short attachment")),
         size: 18,
-        chunk_size: bounce_core::CHUNK_SIZE as i64,
+        chunk_size: libbounce::CHUNK_SIZE as i64,
         hash_list: file::hash_list(&chunks),
         encrypted_hash_list: String::new(),
         key: Vec::new(),

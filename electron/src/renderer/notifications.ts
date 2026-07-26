@@ -20,7 +20,7 @@ import { snippet } from './format';
 /**
  * The `mutedUntil` value meaning "muted with no end date".
  *
- * Mirrors `bounce_core::MUTED_FOREVER`. It is negative rather than large, so a
+ * Mirrors `libbounce::MUTED_FOREVER`. It is negative rather than large, so a
  * plain comparison against the clock is not enough to detect it.
  */
 export const MUTED_FOREVER = -1;

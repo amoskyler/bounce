@@ -160,9 +160,9 @@ if (existsSync(logFile)) {
     'Engine log',
     `No log at ${logFile}.\n\n` +
       'Restart the app with logging on, reproduce the failure, then run this again:\n' +
-      '    BOUNCE_LOG=bounce_core=debug npm run dev\n' +
+      '    BOUNCE_LOG=libbounce=debug npm run dev\n' +
       'or, for a packaged build:\n' +
-      '    BOUNCE_LOG=bounce_core=debug /Applications/Bounce.app/Contents/MacOS/Bounce',
+      '    BOUNCE_LOG=libbounce=debug /Applications/Bounce.app/Contents/MacOS/Bounce',
   );
 }
 

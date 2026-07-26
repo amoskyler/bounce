@@ -1,5 +1,5 @@
 [package]
-name = "bounce-core"
+name = "libbounce"
 description = "Bounce protocol and cryptography core"
 version.workspace = true
 edition.workspace = true

@@ -9,7 +9,7 @@
 
 use std::collections::BTreeSet;
 
-use bounce_core::store::{schema, Store};
+use libbounce::store::{schema, Store};
 use rusqlite::Connection;
 
 /// The schema as it stood at version 2, for the tables these tests touch.
@@ -327,7 +327,7 @@ fn contacts_with_history_are_opened_once_when_the_flag_starts_being_honoured() {
 
         // History with `chatty` and with `blocked`, but not with `silent`.
         for other in [chatty, blocked] {
-            let thread = bounce_core::xor(me, other);
+            let thread = libbounce::xor(me, other);
             connection
                 .execute(
                     "INSERT INTO direct_messages (id, author, xor, text, original_payload, signature)

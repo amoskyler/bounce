@@ -7,11 +7,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use bounce_core::crypto::DeviceKey;
-use bounce_core::engine::{Engine, Event};
-use bounce_core::frames::Broadcastable;
-use bounce_core::net::{StaticDirectory, TcpNetwork};
-use bounce_core::store::Store;
+use libbounce::crypto::DeviceKey;
+use libbounce::engine::{Engine, Event};
+use libbounce::frames::Broadcastable;
+use libbounce::net::{StaticDirectory, TcpNetwork};
+use libbounce::store::Store;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 struct Instance {
@@ -89,8 +89,8 @@ async fn a_second_device_joins_a_profile_and_receives_its_keys() {
     let on_laptop = laptop.store.profile().unwrap().unwrap();
     assert_eq!(on_phone.devices.len(), 2, "the phone should see both devices");
     assert_eq!(on_laptop.devices.len(), 2, "the laptop should see both devices");
-    assert!(bounce_core::device_group::user_has_valid_device_group(&on_phone));
-    assert!(bounce_core::device_group::user_has_valid_device_group(&on_laptop));
+    assert!(libbounce::device_group::user_has_valid_device_group(&on_phone));
+    assert!(libbounce::device_group::user_has_valid_device_group(&on_laptop));
 }
 
 #[tokio::test]
@@ -186,7 +186,7 @@ async fn an_unsolicited_acceptance_cannot_replace_a_profile() {
     let theirs = laptop.engine.create_profile("Ada", "laptop").unwrap();
     let mine = phone.engine.create_profile("Bo", "phone").unwrap();
 
-    let accepted = bounce_core::frames::pairing::SyncDeviceRequestAccepted {
+    let accepted = libbounce::frames::pairing::SyncDeviceRequestAccepted {
         profile: laptop.store.profile().unwrap().unwrap(),
         private_ecdh_key: vec![1; 32],
         public_ecdh_key: vec![2; 32],
@@ -200,8 +200,8 @@ async fn an_unsolicited_acceptance_cannot_replace_a_profile() {
         .engine
         .handle_frame(
             &laptop.address,
-            bounce_core::wire::RawFrame::new(
-                bounce_core::types::FrameType::SyncDeviceRequestAccepted.as_u16(),
+            libbounce::wire::RawFrame::new(
+                libbounce::types::FrameType::SyncDeviceRequestAccepted.as_u16(),
                 accepted.encode().unwrap(),
             ),
         )
@@ -458,21 +458,21 @@ async fn a_contact_cannot_change_our_settings() {
     let before = bo.engine.settings().unwrap().default_read_receipts;
 
     // Ada signs a settings change and aims it at Bo.
-    let mut update = bounce_core::frames::update::UpdateSettings::new(
-        bounce_core::frames::update::UpdateSettingsType::DefaultReadReceipts,
+    let mut update = libbounce::frames::update::UpdateSettings::new(
+        libbounce::frames::update::UpdateSettingsType::DefaultReadReceipts,
         vec![0],
-        bounce_core::now(),
+        libbounce::now(),
     );
-    let body = bounce_core::msgpack::to_vec(&update).unwrap();
-    let container = bounce_core::signed::SignedContainer::create(&ada.key, body);
-    update.signed = bounce_core::frames::SignedFrame::from_container(&container);
+    let body = libbounce::msgpack::to_vec(&update).unwrap();
+    let container = libbounce::signed::SignedContainer::create(&ada.key, body);
+    update.signed = libbounce::frames::SignedFrame::from_container(&container);
 
     let result = bo
         .engine
         .handle_frame(
             &ada.address,
-            bounce_core::wire::RawFrame::new(
-                bounce_core::types::FrameType::UpdateSettings.as_u16(),
+            libbounce::wire::RawFrame::new(
+                libbounce::types::FrameType::UpdateSettings.as_u16(),
                 update.payload().unwrap(),
             ),
         )

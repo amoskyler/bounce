@@ -7,7 +7,7 @@
  * reach an IPC channel that was not deliberately exposed.
  */
 
-import { contextBridge, ipcRenderer } from 'electron';
+import { contextBridge, ipcRenderer, webUtils } from 'electron';
 
 /** A message as the interface renders it. */
 export interface Message {
@@ -157,6 +157,15 @@ export interface OutgoingAttachment {
   width: number;
   height: number;
   blurHash?: string;
+  /**
+   * Where the file is on disk, for one too large to hold in memory.
+   *
+   * Set this and leave `data` empty and the engine streams it instead of
+   * embedding it: hashed a chunk at a time, left where it is, and read back by
+   * seeking when a peer asks. Get it from {@link BounceBridge.pathForFile};
+   * a file with no path on disk — a pasted screenshot — cannot use this.
+   */
+  path?: string;
 }
 
 export interface InitialState {
@@ -174,7 +183,7 @@ export interface InitialState {
 /**
  * An engine event.
  *
- * Mirrors the `Event` enum in `bounce-core`, which serialises with a `type`
+ * Mirrors the `Event` enum in `libbounce`, which serialises with a `type`
  * discriminator. Writing it as a union rather than a bag of unknowns means the
  * reducer's switch is checked against the real payloads, and a variant renamed
  * on the Rust side fails to compile here rather than silently doing nothing.
@@ -281,6 +290,21 @@ const api = {
     attachments: OutgoingAttachment[],
   ): Promise<Message> =>
     ipcRenderer.invoke('bounce:sendGroupMessageWithAttachments', groupId, text, attachments),
+
+  /**
+   * Where a chosen file lives on disk, or '' if it has no path.
+   *
+   * Electron removed `File.path` in version 32, and `webUtils` exists only in
+   * the preload, so this is the one place that can answer. A file from the
+   * clipboard — a pasted screenshot — is a blob with no path, and gets ''.
+   */
+  pathForFile: (file: File): string => {
+    try {
+      return webUtils.getPathForFile(file);
+    } catch {
+      return '';
+    }
+  },
 
   /** An attachment's bytes, or null while it is still downloading. */
   fileData: (fileId: string): Promise<Uint8Array | null> =>

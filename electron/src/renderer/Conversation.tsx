@@ -13,19 +13,34 @@
 
 import * as React from 'react';
 
-import { AttachmentList, AttachmentTray, ImageViewer, useAttachmentIntake } from './Attachments';
+import {
+  AttachmentList,
+  AttachmentTray,
+  ImageViewer,
+  MEDIA_ACCEPT,
+  useAttachmentIntake,
+} from './Attachments';
 import type { BubbleAttachment, PendingAttachment } from './Attachments';
 import { cachedFileUrl, fileUrl } from './attachment-data';
 import { Avatar } from './Avatar';
 import {
-  AttachIcon,
+  completeShortcodeAtCaret,
+  findShortcodeQuery,
+  insertEmoji,
+  type Emoji,
+  type ShortcodeQuery,
+} from './emoji';
+import { EmojiPicker, EmojiSuggestions, useEmojiSuggestions } from './EmojiPicker';
+import {
   BounceLogo,
   DeliveredIcon,
+  DocumentIcon,
   EmojiIcon,
   InfoIcon,
   JumpToBottomIcon,
+  MediaIcon,
   MoreIcon,
-  SendIcon,
+  PlusIcon,
   SendingIcon,
   SentIcon,
   TimerIcon,
@@ -50,6 +65,21 @@ import type { Conversation as ConversationSummary, State } from './state';
  * one line of text in a bubble plus the gap below its run.
  */
 const ESTIMATED_ROW_HEIGHT = 56;
+
+/** How soon to ask again for bytes the engine says are there but cannot serve yet. */
+const FIRST_RETRY_DELAY = 150;
+
+/** The ceiling on that backoff. */
+const MAX_RETRY_DELAY = 4_000;
+
+/**
+ * How many times to ask before giving up.
+ *
+ * With the backoff below this covers about half a minute, which is far longer
+ * than assembling a file takes and short enough that a file that genuinely is
+ * not there stops being asked for.
+ */
+const MAX_FETCH_ATTEMPTS = 10;
 
 /**
  * How far above the end the reader has to be before the jump control appears.
@@ -636,16 +666,44 @@ function useAttachmentUrls(attachments: readonly BubbleAttachment[]): BubbleAtta
 
   React.useEffect(() => {
     if (!complete) return;
-    let cancelled = false;
 
-    void Promise.all(complete.split(',').map((fileId) => fileUrl(fileId))).then((results) => {
-      // Re-render only if something actually landed, so an attachment that is
-      // still assembling does not spin.
-      if (!cancelled && results.some((url) => url !== null)) forceRender();
-    });
+    let cancelled = false;
+    let timer = 0;
+    let delay = FIRST_RETRY_DELAY;
+    let attempts = 0;
+
+    const attempt = () => {
+      attempts += 1;
+
+      void Promise.all(complete.split(',').map((fileId) => fileUrl(fileId))).then((results) => {
+        if (cancelled) return;
+
+        // Re-render only if something actually landed, so an attachment that
+        // is still assembling does not spin.
+        if (results.some((url) => url !== null)) forceRender();
+
+        /*
+         * "Complete" and "readable" are not the same instant.
+         *
+         * The engine reports a file complete when the last chunk arrives;
+         * writing it out and making the bytes fetchable takes a moment longer,
+         * and a large file is renamed off its `.bouncedownload` name only once
+         * every chunk is present. Asking once and giving up is why a picture
+         * could sit as a blur for the rest of the session — nothing else was
+         * ever going to change `complete` and try again.
+         */
+        if (results.some((url) => url === null) && attempts < MAX_FETCH_ATTEMPTS) {
+          timer = window.setTimeout(attempt, delay);
+          delay = Math.min(delay * 2, MAX_RETRY_DELAY);
+        }
+      });
+    };
+
+    attempt();
 
     return () => {
       cancelled = true;
+      if (timer) window.clearTimeout(timer);
     };
   }, [complete]);
 
@@ -783,7 +841,73 @@ function InvitationActions({
   );
 }
 
-function Composer({
+/**
+ * The menu behind the composer's `+`.
+ *
+ * Two entries onto the same dialog. Narrowing it to media is not a restriction
+ * — anything can still be sent through "File" — it is just the difference
+ * between browsing a photo library and browsing a home directory.
+ */
+function AttachMenu({
+  onChoose,
+  onDismiss,
+  anchorRef,
+}: {
+  onChoose: (accept?: string) => void;
+  onDismiss: () => void;
+  anchorRef: React.RefObject<HTMLElement>;
+}) {
+  const menuRef = React.useRef<HTMLDivElement>(null);
+
+  React.useEffect(() => {
+    const onMouseDown = (event: MouseEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      if (menuRef.current?.contains(target)) return;
+      // The button itself toggles, so a click there must not also dismiss —
+      // the two would cancel out and the menu would never open.
+      if (anchorRef.current?.contains(target)) return;
+      onDismiss();
+    };
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onDismiss();
+    };
+
+    document.addEventListener('mousedown', onMouseDown);
+    document.addEventListener('keydown', onKeyDown, true);
+    return () => {
+      document.removeEventListener('mousedown', onMouseDown);
+      document.removeEventListener('keydown', onKeyDown, true);
+    };
+  }, [anchorRef, onDismiss]);
+
+  return (
+    <div className="menu menu--above" ref={menuRef} role="menu" aria-label="Attach">
+      <button
+        className="menu__item menu__item--icon"
+        onClick={() => onChoose(MEDIA_ACCEPT)}
+        role="menuitem"
+        type="button"
+      >
+        <MediaIcon />
+        Photos &amp; Videos
+      </button>
+      <button
+        className="menu__item menu__item--icon"
+        onClick={() => onChoose(undefined)}
+        role="menuitem"
+        type="button"
+      >
+        <DocumentIcon />
+        File
+      </button>
+    </div>
+  );
+}
+
+/** Exported for tests; rendered only by {@link ConversationView}. */
+export function Composer({
   draft,
   onSend,
   onChange,
@@ -795,8 +919,24 @@ function Composer({
   onError: (message: string) => void;
 }) {
   const [text, setText] = React.useState(draft);
+  const [pickerOpen, setPickerOpen] = React.useState(false);
+  const [attachOpen, setAttachOpen] = React.useState(false);
+
+  // The `:shortcode` under the caret, and which suggestion Enter would take.
+  const [shortcode, setShortcode] = React.useState<ShortcodeQuery | null>(null);
+  const [selected, setSelected] = React.useState(0);
+
   const textareaRef = React.useRef<HTMLTextAreaElement>(null);
+  const emojiButtonRef = React.useRef<HTMLButtonElement>(null);
+  const attachButtonRef = React.useRef<HTMLButtonElement>(null);
+
+  // Where the caret should go after we rewrite the text ourselves. React
+  // restores it to the end of a controlled value otherwise, which would throw
+  // it to the bottom of the box every time a shortcode expanded mid-message.
+  const pendingCaret = React.useRef<number | null>(null);
+
   const intake = useAttachmentIntake({ onError });
+  const suggestions = useEmojiSuggestions(shortcode?.query ?? '');
 
   // Grow with the content up to the CSS max height, then scroll.
   const resize = React.useCallback(() => {
@@ -806,7 +946,98 @@ function Composer({
     element.style.height = `${element.scrollHeight}px`;
   }, []);
 
-  React.useLayoutEffect(resize, [text, resize]);
+  React.useLayoutEffect(() => {
+    resize();
+
+    const caret = pendingCaret.current;
+    if (caret !== null && textareaRef.current) {
+      textareaRef.current.setSelectionRange(caret, caret);
+      pendingCaret.current = null;
+    }
+  }, [text, resize]);
+
+  // A list that shrank under the selection would otherwise leave Enter
+  // pointing past the end of it, which inserts nothing at all.
+  React.useEffect(() => {
+    if (selected >= suggestions.length) setSelected(0);
+  }, [suggestions.length, selected]);
+
+  /*
+   * Put the caret back in the box once a file has been staged.
+   *
+   * Enter is the only way to send, and choosing a file leaves focus on the
+   * attach button or wherever the dialog returned it — so a picture on its own,
+   * with nothing typed, had no way to go anywhere. Only a *new* attachment
+   * pulls focus, so removing one does not yank it back.
+   */
+  const stagedCount = React.useRef(intake.attachments.length);
+  React.useEffect(() => {
+    if (intake.attachments.length > stagedCount.current) textareaRef.current?.focus();
+    stagedCount.current = intake.attachments.length;
+  }, [intake.attachments.length]);
+
+  /** Apply an edit to the text, keeping the draft and the caret in step. */
+  const applyEdit = (next: string, caret: number) => {
+    pendingCaret.current = caret;
+    setText(next);
+    onChange(next);
+    setShortcode(null);
+  };
+
+  const handleChange = (event: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const next = event.target.value;
+    const caret = event.target.selectionStart ?? next.length;
+
+    // A finished `:name:` wins outright: the closing colon is a commitment, so
+    // there is nothing left to suggest.
+    const completed = completeShortcodeAtCaret(next, caret);
+    if (completed) {
+      applyEdit(completed.text, completed.caret);
+      return;
+    }
+
+    setText(next);
+    onChange(next);
+
+    const query = findShortcodeQuery(next, caret);
+    setShortcode(query);
+    if (query?.query !== shortcode?.query) setSelected(0);
+  };
+
+  /**
+   * Keep the suggestion list attached to wherever the caret actually is.
+   *
+   * Clicking back into the middle of a sentence, or arrowing left out of the
+   * name, leaves the list showing matches for text the caret has left behind —
+   * and Enter would then insert an emoji several words away from the cursor.
+   *
+   * Bound to `keyup` and `click` rather than React's `onSelect`, which is a
+   * synthetic event reconstructed from a set of native ones and does not fire
+   * for every way a caret moves.
+   */
+  const trackCaret = (element: HTMLTextAreaElement) => {
+    // An edit of our own is still on its way to the DOM, so the value here is
+    // the one we are about to replace. Recomputing from it would resurrect the
+    // list a fraction of a second after an emoji was chosen from it.
+    if (pendingCaret.current !== null) return;
+
+    if (element.selectionStart !== element.selectionEnd) {
+      setShortcode(null);
+      return;
+    }
+
+    const query = findShortcodeQuery(element.value, element.selectionStart);
+    setShortcode(query);
+    if (query?.query !== shortcode?.query) setSelected(0);
+  };
+
+  const chooseEmoji = (emoji: Emoji, replacing: ShortcodeQuery | null) => {
+    const element = textareaRef.current;
+    const caret = element?.selectionStart ?? text.length;
+    const edit = insertEmoji(text, caret, emoji, { replace: replacing ?? undefined });
+    applyEdit(edit.text, edit.caret);
+    element?.focus();
+  };
 
   const submit = () => {
     const trimmed = text.trim();
@@ -818,9 +1049,35 @@ function Composer({
     intake.clear();
     setText('');
     onChange('');
+    setShortcode(null);
   };
 
   const handleKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    // While suggestions are up they own the keys that would otherwise send,
+    // exactly as they do in Signal: Enter and Tab take the highlighted emoji.
+    if (shortcode && suggestions.length > 0) {
+      if (event.key === 'ArrowDown') {
+        event.preventDefault();
+        setSelected((current) => (current + 1) % suggestions.length);
+        return;
+      }
+      if (event.key === 'ArrowUp') {
+        event.preventDefault();
+        setSelected((current) => (current - 1 + suggestions.length) % suggestions.length);
+        return;
+      }
+      if (event.key === 'Enter' || event.key === 'Tab') {
+        event.preventDefault();
+        chooseEmoji(suggestions[selected], shortcode);
+        return;
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        setShortcode(null);
+        return;
+      }
+    }
+
     // Enter sends; Shift+Enter inserts a newline.
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault();
@@ -849,38 +1106,76 @@ function Composer({
       {intake.fileInput}
 
       <div className="composer">
-        <button className="icon-button" onClick={intake.openFilePicker} title="Attach a file">
-          <AttachIcon />
-        </button>
+        <div className="composer__anchor">
+          {pickerOpen && (
+            <EmojiPicker
+              anchorRef={emojiButtonRef}
+              onDismiss={() => setPickerOpen(false)}
+              onChoose={(emoji) => {
+                chooseEmoji(emoji, null);
+                setPickerOpen(false);
+              }}
+            />
+          )}
+          <button
+            ref={emojiButtonRef}
+            className={`icon-button${pickerOpen ? ' icon-button--active' : ''}`}
+            onClick={() => setPickerOpen((open) => !open)}
+            title="Emoji"
+            aria-label="Emoji"
+            aria-expanded={pickerOpen}
+            type="button"
+          >
+            <EmojiIcon />
+          </button>
+        </div>
 
         <div className="composer__input-wrapper">
+          {shortcode && suggestions.length > 0 && (
+            <EmojiSuggestions
+              query={shortcode.query}
+              selected={selected}
+              onChoose={(emoji) => chooseEmoji(emoji, shortcode)}
+              onDismiss={() => setShortcode(null)}
+            />
+          )}
           <textarea
             ref={textareaRef}
             className="composer__input"
             rows={1}
             placeholder="Message"
             value={text}
-            onChange={(event) => {
-              setText(event.target.value);
-              onChange(event.target.value);
-            }}
+            onChange={handleChange}
             onKeyDown={handleKeyDown}
+            onKeyUp={(event) => trackCaret(event.currentTarget)}
+            onClick={(event) => trackCaret(event.currentTarget)}
             aria-label="Message"
           />
-          <button className="icon-button" title="Emoji" style={{ width: 24, height: 24 }}>
-            <EmojiIcon size={18} />
-          </button>
         </div>
 
-        <button
-          className="composer__send"
-          onClick={submit}
-          disabled={text.trim().length === 0 && intake.attachments.length === 0}
-          title="Send"
-          aria-label="Send"
-        >
-          <SendIcon />
-        </button>
+        <div className="composer__anchor">
+          {attachOpen && (
+            <AttachMenu
+              anchorRef={attachButtonRef}
+              onDismiss={() => setAttachOpen(false)}
+              onChoose={(accept) => {
+                setAttachOpen(false);
+                intake.openFilePicker(accept);
+              }}
+            />
+          )}
+          <button
+            ref={attachButtonRef}
+            className={`icon-button${attachOpen ? ' icon-button--active' : ''}`}
+            onClick={() => setAttachOpen((open) => !open)}
+            title="Attach"
+            aria-label="Attach"
+            aria-expanded={attachOpen}
+            type="button"
+          >
+            <PlusIcon />
+          </button>
+        </div>
       </div>
     </div>
   );

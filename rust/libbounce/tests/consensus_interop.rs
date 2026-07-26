@@ -18,17 +18,17 @@
 //! backdated to sort ahead of hers. Five users means three confirmations are a
 //! majority.
 
-use bounce_core::consensus::{self, confirmation, CanonicalStack};
-use bounce_core::crypto::DeviceKey;
-use bounce_core::error::Result;
-use bounce_core::frames::group::{Confirmation, Group, GroupCreation, UpdateGroup};
-use bounce_core::frames::identity::{join_uuid_list, Device, User};
-use bounce_core::frames::{Broadcastable, SignedFrame};
-use bounce_core::msgpack;
-use bounce_core::signed::SignedContainer;
-use bounce_core::store::Store;
-use bounce_core::types::UpdateGroupType;
-use bounce_core::Error;
+use libbounce::consensus::{self, confirmation, CanonicalStack};
+use libbounce::crypto::DeviceKey;
+use libbounce::error::Result;
+use libbounce::frames::group::{Confirmation, Group, GroupCreation, UpdateGroup};
+use libbounce::frames::identity::{join_uuid_list, Device, User};
+use libbounce::frames::{Broadcastable, SignedFrame};
+use libbounce::msgpack;
+use libbounce::signed::SignedContainer;
+use libbounce::store::Store;
+use libbounce::types::UpdateGroupType;
+use libbounce::Error;
 use uuid::Uuid;
 
 /// A person and the single device they act through.

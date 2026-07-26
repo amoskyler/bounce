@@ -24,6 +24,17 @@ const rowIndex = Number(process.env.BOUNCE_PREVIEW_ROW || '0');
 // rather than read from `process` inside the page.
 const showDetails = process.env.BOUNCE_PREVIEW_DETAILS === '1';
 
+/**
+ * A CSS selector to click once the conversation is open, for capturing
+ * something that is only on screen while a popover is up.
+ *
+ *     BOUNCE_PREVIEW_CLICK='[aria-label="Emoji"]' npx electron scripts/preview.cjs out.png
+ */
+const clickSelector = process.env.BOUNCE_PREVIEW_CLICK || '';
+
+/** Text to type into the composer before capturing, e.g. to open a typeahead. */
+const typeText = process.env.BOUNCE_PREVIEW_TYPE || '';
+
 /** Never leave a stuck Electron process behind. */
 const failsafe = setTimeout(() => {
   console.error('preview timed out');
@@ -80,6 +91,53 @@ app.whenReady().then(async () => {
   `);
 
   console.log(`rendered ${opened} conversation rows`);
+
+  // Typing goes through the native setter so React's onChange actually fires;
+  // assigning `.value` on a controlled input is swallowed.
+  if (typeText) {
+    await window.webContents.executeJavaScript(`
+      (async () => {
+        const input = document.querySelector('.composer__input');
+        if (!input) return 'no composer';
+        input.focus();
+        const setter = Object.getOwnPropertyDescriptor(
+          window.HTMLTextAreaElement.prototype, 'value').set;
+        setter.call(input, ${JSON.stringify(typeText)});
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        await new Promise((r) => setTimeout(r, 300));
+        return 'typed';
+      })()
+    `);
+  }
+
+  if (clickSelector) {
+    const clicked = await window.webContents.executeJavaScript(`
+      (async () => {
+        const target = document.querySelector(${JSON.stringify(clickSelector)});
+        if (!target) return 'not found';
+        target.click();
+        await new Promise((r) => setTimeout(r, 400));
+        return 'clicked';
+      })()
+    `);
+    console.log(`${clickSelector}: ${clicked}`);
+  }
+
+  /*
+   * An expression evaluated in the page and logged, for the times a
+   * screenshot shows that something is wrong but not by how much:
+   *
+   *     BOUNCE_PREVIEW_PROBE='document.querySelector(".left-pane").clientWidth'
+   */
+  if (process.env.BOUNCE_PREVIEW_PROBE) {
+    const probed = await window.webContents.executeJavaScript(
+      // Awaited, so a probe that has to drive the interface — click, wait for
+      // a re-render, read the result — can be written as an async expression.
+      `(async () => { try { return String(await (${process.env.BOUNCE_PREVIEW_PROBE})); }
+                      catch (error) { return 'probe failed: ' + error.message; } })()`,
+    );
+    console.log(`probe: ${probed}`);
+  }
 
   const image = await window.webContents.capturePage();
   writeFileSync(output, image.toPNG());

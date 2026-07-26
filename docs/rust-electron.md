@@ -32,7 +32,7 @@ process ever holds a private key or parses a frame off the wire.
 ┌───────────────────────────┴──────────────────────────────────┐
 │  bounce-node   thin binding: lifetimes, threading, JSON      │
 ├──────────────────────────────────────────────────────────────┤
-│  bounce-core   the protocol                                  │
+│  libbounce   the protocol                                  │
 │    engine ── consensus ── scope ── device_group              │
 │    frames ── signed ── msgpack ── wire                       │
 │    crypto ── onion ── store ── net                           │
@@ -67,16 +67,16 @@ address.
 
 ### Interop is tested against real Go output
 
-`rust/bounce-core/tests/fixtures/` contains a Go harness that links the same
+`rust/libbounce/tests/fixtures/` contains a Go harness that links the same
 libraries `chat/` depends on. It runs in both directions:
 
 ```bash
 # Go → Rust: decode and verify Go-encoded frames
-cd rust && cargo test -p bounce-core --test go_interop
+cd rust && cargo test -p libbounce --test go_interop
 
 # Rust → Go: have Go decode and verify Rust-encoded frames
-cargo run -q -p bounce-core --example emit_fixtures \
-  | (cd bounce-core/tests/fixtures && go run . verify)
+cargo run -q -p libbounce --example emit_fixtures \
+  | (cd libbounce/tests/fixtures && go run . verify)
 ```
 
 The reverse direction confirms Go accepts Rust's signed containers, derives the
@@ -326,7 +326,7 @@ turned up a weakness. These are deliberate:
 
 ### Working end to end
 
-Verified by `rust/bounce-core/tests/engine_e2e.rs`, which runs two engines over
+Verified by `rust/libbounce/tests/engine_e2e.rs`, which runs two engines over
 real sockets with real signatures:
 
 - **contact introduction** — two strangers become contacts by one scanning the
@@ -351,7 +351,7 @@ real sockets with real signatures:
 - **status rows** — a rename or an invitation reaches the other side and is
   replayed in the opening snapshot
 - interop in both directions: the Go harness in
-  `bounce-core/tests/fixtures/` decodes Rust-encoded messages, groups, acks,
+  `libbounce/tests/fixtures/` decodes Rust-encoded messages, groups, acks,
   files and chunk offers, and `tests/go_interop.rs` decodes Go-encoded ones
 
 ### Implemented but not yet wired into the engine
@@ -383,15 +383,15 @@ The Go implementation's Fyne UI and Android service have no counterpart here;
 the Electron client replaces the former, and Android is out of scope for a
 desktop port.
 
-[`wire`]: ../rust/bounce-core/src/wire.rs
-[`msgpack`]: ../rust/bounce-core/src/msgpack.rs
-[`crypto`]: ../rust/bounce-core/src/crypto.rs
-[`onion`]: ../rust/bounce-core/src/onion.rs
-[`signed`]: ../rust/bounce-core/src/signed.rs
-[`frames`]: ../rust/bounce-core/src/frames/
-[`device_group`]: ../rust/bounce-core/src/device_group.rs
-[`scope`]: ../rust/bounce-core/src/scope.rs
-[`consensus`]: ../rust/bounce-core/src/consensus/
-[`store`]: ../rust/bounce-core/src/store/
-[`net`]: ../rust/bounce-core/src/net/
-[`engine`]: ../rust/bounce-core/src/engine/
+[`wire`]: ../rust/libbounce/src/wire.rs
+[`msgpack`]: ../rust/libbounce/src/msgpack.rs
+[`crypto`]: ../rust/libbounce/src/crypto.rs
+[`onion`]: ../rust/libbounce/src/onion.rs
+[`signed`]: ../rust/libbounce/src/signed.rs
+[`frames`]: ../rust/libbounce/src/frames/
+[`device_group`]: ../rust/libbounce/src/device_group.rs
+[`scope`]: ../rust/libbounce/src/scope.rs
+[`consensus`]: ../rust/libbounce/src/consensus/
+[`store`]: ../rust/libbounce/src/store/
+[`net`]: ../rust/libbounce/src/net/
+[`engine`]: ../rust/libbounce/src/engine/

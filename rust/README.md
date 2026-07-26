@@ -1,8 +1,8 @@
-# bounce-core
+# libbounce
 
 The Bounce protocol and cryptography, in Rust.
 
-- **`bounce-core`** — the protocol: wire format, cryptography, frames, device
+- **`libbounce`** — the protocol: wire format, cryptography, frames, device
   groups, scopes, group consensus, storage, transport, and the chat engine.
 - **`bounce-node`** — N-API bindings that expose the engine to the Electron
   client in `../electron`.
@@ -25,9 +25,9 @@ The `tor` feature is off by default so the suite does not pay arti's build cost;
 Cross-language interop, which needs a Go toolchain:
 
 ```bash
-cargo test -p bounce-core --test go_interop          # Go → Rust
-cargo run -q -p bounce-core --example emit_fixtures \
-  | (cd bounce-core/tests/fixtures && go run . verify) # Rust → Go
+cargo test -p libbounce --test go_interop          # Go → Rust
+cargo run -q -p libbounce --example emit_fixtures \
+  | (cd libbounce/tests/fixtures && go run . verify) # Rust → Go
 ```
 
 ## Where to start reading

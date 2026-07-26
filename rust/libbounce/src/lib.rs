@@ -1,4 +1,4 @@
-//! # bounce-core
+//! # libbounce
 //!
 //! The Bounce protocol and cryptography core, ported from the reference Go
 //! implementation in `chat/`.

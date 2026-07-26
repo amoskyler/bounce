@@ -10,7 +10,7 @@ license.workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
-bounce-core = { path = "../bounce-core", features = ["tor"] }
+libbounce = { path = "../libbounce", features = ["tor"] }
 napi = { version = "2", default-features = false, features = ["napi6", "async", "tokio_rt", "serde-json"] }
 napi-derive = "2"
 serde = { workspace = true }

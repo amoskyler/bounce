@@ -15,13 +15,13 @@
 //! The reverse direction — Go decoding Rust output — is driven by
 //! `examples/emit_fixtures.rs`.
 
-use bounce_core::crypto;
-use bounce_core::frames::group::GroupCreation;
-use bounce_core::frames::message::{DirectMessage, TypingIndicator};
-use bounce_core::frames::transport::Ack;
-use bounce_core::onion;
-use bounce_core::signed::SignedContainer;
-use bounce_core::{msgpack, types::FrameType};
+use libbounce::crypto;
+use libbounce::frames::group::GroupCreation;
+use libbounce::frames::message::{DirectMessage, TypingIndicator};
+use libbounce::frames::transport::Ack;
+use libbounce::onion;
+use libbounce::signed::SignedContainer;
+use libbounce::{msgpack, types::FrameType};
 use uuid::Uuid;
 
 /// Load the Go-produced fixture set.
@@ -171,7 +171,7 @@ fn decodes_a_group_creation_encoded_by_go() {
     assert_eq!(group.admin_ids(), vec![group.created_by]);
 
     // The founding state that consensus starts from is recovered intact.
-    let state = bounce_core::consensus::GroupState::from_group(&group);
+    let state = libbounce::consensus::GroupState::from_group(&group);
     assert!(state.is_member(group.created_by));
     assert!(state.is_admin(group.created_by));
 }
@@ -182,7 +182,7 @@ fn a_go_typing_indicator_threads_by_xor() {
     // same convention a direct message uses. Reading it as the raw recipient ID
     // makes the indicator unroutable in both directions — it is silently
     // dropped rather than failing loudly, which is how it went unnoticed.
-    use bounce_core::frames::Broadcastable;
+    use libbounce::frames::Broadcastable;
 
     let indicator: TypingIndicator =
         msgpack::from_slice(&bytes("typing_indicator")).expect("Go's indicator decodes");
@@ -194,7 +194,7 @@ fn a_go_typing_indicator_threads_by_xor() {
     assert_eq!(indicator.author, sender);
     assert_eq!(
         indicator.thread,
-        bounce_core::xor(sender, recipient),
+        libbounce::xor(sender, recipient),
         "Thread must be the XOR pair, not either participant's ID"
     );
 
@@ -238,8 +238,8 @@ fn a_file_with_no_key_encodes_its_empty_fields_as_bin() {
     // `Nonce` came out as `0x90` and Go refused the entire frame with
     // "invalid code=90 decoding string/bytes length". Every attachment sent in
     // the clear has this shape, so it is the common case rather than a corner.
-    use bounce_core::frames::file::File;
-    use bounce_core::frames::SignedFrame;
+    use libbounce::frames::file::File;
+    use libbounce::frames::SignedFrame;
 
     let file = File {
         signed: SignedFrame::default(),
@@ -293,8 +293,8 @@ fn a_chunk_frame_is_the_bare_bytes_with_no_wrapper() {
     // Rust clients and never reached a Go one. That is a failure mode no
     // amount of Rust-to-Rust testing can see, which is why this test compares
     // against the Go rule rather than against ourselves.
-    use bounce_core::crypto;
-    use bounce_core::frames::file::split_into_chunks;
+    use libbounce::crypto;
+    use libbounce::frames::file::split_into_chunks;
 
     let data: Vec<u8> = (0..5000u32).map(|index| (index % 251) as u8).collect();
     let chunks = split_into_chunks(Uuid::new_v4(), &data);

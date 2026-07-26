@@ -4,14 +4,14 @@
 //! one:
 //!
 //! ```text
-//! cargo run -p bounce-core --example opendb -- /path/to/bounce.db
-//! cargo run -p bounce-core --example opendb -- /path/to/new.db --fresh
+//! cargo run -p libbounce --example opendb -- /path/to/bounce.db
+//! cargo run -p libbounce --example opendb -- /path/to/new.db --fresh
 //! ```
 //!
 //! `--fresh` deletes the file first. It is opt-in because the whole point of
 //! pointing this at a real database is that the data survives.
 
-use bounce_core::store::{schema, Store};
+use libbounce::store::{schema, Store};
 
 fn main() {
     let mut arguments = std::env::args().skip(1);

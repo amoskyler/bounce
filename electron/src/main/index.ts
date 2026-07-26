@@ -109,7 +109,7 @@ function startEngine(): void {
   const useTor = process.env.BOUNCE_NO_TOR !== '1';
 
   // Needed to dial a Go client, which expects the older handshake. See
-  // bounce_core::net for what accepting it costs.
+  // libbounce::net for what accepting it costs.
   const goCompatible = process.env.BOUNCE_GO_COMPAT === '1';
 
   engine = BounceEngine.open(

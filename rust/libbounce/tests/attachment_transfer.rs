@@ -8,11 +8,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use bounce_core::crypto::DeviceKey;
-use bounce_core::engine::files::OutgoingAttachment;
-use bounce_core::engine::{Engine, Event};
-use bounce_core::net::{StaticDirectory, TcpNetwork};
-use bounce_core::store::Store;
+use libbounce::crypto::DeviceKey;
+use libbounce::engine::files::OutgoingAttachment;
+use libbounce::engine::{Engine, Event};
+use libbounce::net::{StaticDirectory, TcpNetwork};
+use libbounce::store::Store;
 use tokio::sync::mpsc::UnboundedReceiver;
 use uuid::Uuid;
 
@@ -103,7 +103,7 @@ async fn an_image_survives_the_flow_the_client_actually_uses() {
     .expect("bob adds alice");
 
     // Three chunks, so offers, requests and reassembly all have to work.
-    let payload: Vec<u8> = (0..bounce_core::CHUNK_SIZE * 2 + 5000)
+    let payload: Vec<u8> = (0..libbounce::CHUNK_SIZE * 2 + 5000)
         .map(|index| (index % 251) as u8)
         .collect();
 
@@ -119,6 +119,7 @@ async fn an_image_survives_the_flow_the_client_actually_uses() {
                 width: 800,
                 height: 600,
                 blur_hash: String::new(),
+                ..Default::default()
             }],
         )
         .await
@@ -193,6 +194,7 @@ async fn an_attachment_sent_while_offline_arrives_on_reconnection() {
                 width: 32,
                 height: 32,
                 blur_hash: String::new(),
+                ..Default::default()
             }],
         )
         .await
@@ -254,6 +256,7 @@ async fn a_profile_picture_reaches_a_contact() {
             width: 96,
             height: 96,
             blur_hash: String::new(),
+            ..Default::default()
         })
         .await
         .expect("sets the picture");
@@ -288,7 +291,7 @@ async fn a_profile_picture_reaches_a_contact() {
     // And it is filed as a picture rather than as a message attachment, which
     // is what keeps it out of the timeline.
     let stored = bob.engine.file(image_id).unwrap().expect("stored");
-    assert_eq!(stored.file_type, bounce_core::types::FileType::UserImage as i64);
+    assert_eq!(stored.file_type, libbounce::types::FileType::UserImage as i64);
 }
 
 #[tokio::test]
@@ -319,7 +322,7 @@ async fn a_file_too_large_to_embed_is_seeded_from_disk() {
     .expect("bob adds alice");
 
     // Just over the limit, so it takes the disk path and still runs quickly.
-    let size = bounce_core::EMBEDDED_FILE_LIMIT as usize + 3000;
+    let size = libbounce::EMBEDDED_FILE_LIMIT as usize + 3000;
     let payload: Vec<u8> = (0..size).map(|index| (index % 251) as u8).collect();
 
     let source = std::env::temp_dir().join(format!("bounce-big-{}.bin", std::process::id()));
@@ -331,8 +334,8 @@ async fn a_file_too_large_to_embed_is_seeded_from_disk() {
         .stage_large_file(
             &source,
             Uuid::new_v4(),
-            bounce_core::types::Scope::User,
-            bounce_core::xor(my_id, bob.id),
+            libbounce::types::Scope::User,
+            libbounce::xor(my_id, bob.id),
         )
         .expect("stages from disk");
 
@@ -344,7 +347,7 @@ async fn a_file_too_large_to_embed_is_seeded_from_disk() {
     let stored_bytes: i64 = {
         let file_id = record.id;
         let hashes = record.chunk_hashes();
-        assert_eq!(hashes.len(), size.div_ceil(bounce_core::CHUNK_SIZE));
+        assert_eq!(hashes.len(), size.div_ceil(libbounce::CHUNK_SIZE));
         let _ = file_id;
         0
     };
@@ -380,6 +383,102 @@ async fn a_file_too_large_to_embed_is_seeded_from_disk() {
     assert!(
         !std::path::Path::new(&format!("{}.bouncedownload", landed.path)).exists(),
         "the partial file must be renamed, not left beside the finished one",
+    );
+
+    let _ = std::fs::remove_file(&source);
+}
+
+#[tokio::test]
+async fn a_large_file_can_be_attached_to_a_message_by_path() {
+    // The client should not have to choose between two send APIs by size. An
+    // attachment carrying a path is streamed however big it is; one carrying
+    // bytes is embedded. Before this, anything over the limit was refused
+    // outright and the interface had nothing to offer but an error.
+    logging();
+
+    let directory = Arc::new(StaticDirectory::new());
+    let alice = start("Alice", Arc::clone(&directory)).await;
+    let mut bob = start("Bob", Arc::clone(&directory)).await;
+
+    let code = bob.engine.create_pairing_code().expect("code");
+    Arc::clone(&alice.engine).request_to_add_user(&code).await.expect("pairs");
+
+    let mut alice_events = alice.events;
+    wait_for(&mut alice_events, "alice to add bob", 10, |event| {
+        matches!(event, Event::UserAdded { .. }).then_some(())
+    })
+    .await
+    .expect("alice adds bob");
+    wait_for(&mut bob.events, "bob to add alice", 10, |event| {
+        matches!(event, Event::UserAdded { .. }).then_some(())
+    })
+    .await
+    .expect("bob adds alice");
+
+    let size = libbounce::EMBEDDED_FILE_LIMIT as usize + 4096;
+    let payload: Vec<u8> = (0..size).map(|index| (index % 241) as u8).collect();
+
+    let source = std::env::temp_dir().join(format!("bounce-attached-{}.bin", std::process::id()));
+    std::fs::write(&source, &payload).expect("writes the source file");
+
+    let sent = alice
+        .engine
+        .send_direct_message_with_attachments(
+            bob.id,
+            "the recording from last night",
+            vec![libbounce::engine::files::OutgoingAttachment {
+                name: "recording.bin".into(),
+                data: Vec::new(),
+                is_image: false,
+                width: 0,
+                height: 0,
+                blur_hash: String::new(),
+                path: source.to_string_lossy().into_owned(),
+            }],
+        )
+        .await
+        .expect("a file this size is sent, not refused");
+
+    assert_eq!(sent.attachments.len(), 1, "the message should carry it");
+    let file_id = sent.attachments[0].file_id;
+
+    // Nothing was copied: the record still points at the original.
+    let staged = alice.engine.file(file_id).unwrap().expect("staged");
+    assert!(!staged.is_embedded(), "a file this size must not be embedded");
+    assert_eq!(staged.path, source.to_string_lossy());
+    assert_eq!(staged.size, size as i64);
+    // The name came from the attachment, not from the path on disk.
+    assert_eq!(staged.name, "recording.bin");
+
+    // Bob gets the message and the metadata, and fetches on request.
+    wait_for(&mut bob.events, "bob to receive the message", 10, |event| match event {
+        Event::MessageReceived { message } if message.id == sent.id => Some(()),
+        _ => None,
+    })
+    .await
+    .expect("the message arrives");
+
+    wait_for(&mut bob.events, "bob to learn of the file", 10, |event| match event {
+        Event::FileProgress { file_id: id, .. } if *id == file_id => Some(()),
+        _ => None,
+    })
+    .await
+    .expect("the file record arrives");
+
+    bob.engine.request_file(file_id).await.expect("asks for it");
+
+    let complete = wait_for(&mut bob.events, "the download to finish", 30, |event| match event {
+        Event::FileComplete { file_id: id } if *id == file_id => Some(*id),
+        _ => None,
+    })
+    .await;
+    assert_eq!(complete, Some(file_id), "the file never finished");
+
+    let landed = bob.engine.file(file_id).unwrap().expect("stored");
+    assert_eq!(
+        std::fs::read(&landed.path).expect("the file exists"),
+        payload,
+        "the bytes must survive the round trip",
     );
 
     let _ = std::fs::remove_file(&source);

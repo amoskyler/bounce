@@ -7,6 +7,14 @@ import * as React from 'react';
 import { Avatar } from './Avatar';
 import { ComposeIcon, NewGroupIcon, SearchIcon, SettingsIcon } from './icons';
 import { conversationTimestamp, snippet } from './format';
+import {
+  clampLeftPaneWidth,
+  DEFAULT_LEFT_PANE_WIDTH,
+  loadLeftPaneWidth,
+  MAX_LEFT_PANE_WIDTH,
+  MIN_LEFT_PANE_WIDTH,
+  saveLeftPaneWidth,
+} from './preferences';
 import { contacts as deriveContacts, type Conversation, type State } from './state';
 
 type LeftPaneProps = {
@@ -31,9 +39,10 @@ export function LeftPane({
   // The list holds open conversations only, so an empty one does not mean an
   // empty address book — it matters which of the two is missing.
   const contactCount = React.useMemo(() => deriveContacts(state).length, [state]);
+  const resize = useResizableWidth();
 
   return (
-    <div className="left-pane">
+    <div className="left-pane" style={{ width: resize.width }}>
       <div className="left-pane__header">
         {/* The avatar opens settings, the way the profile button does in
             Signal — it is the one thing in the header that is about you. */}
@@ -100,8 +109,86 @@ export function LeftPane({
           ))
         )}
       </div>
+
+      <div
+        className={`left-pane__resizer${resize.dragging ? ' left-pane__resizer--dragging' : ''}`}
+        onPointerDown={resize.onPointerDown}
+        onPointerMove={resize.onPointerMove}
+        onPointerUp={resize.onPointerUp}
+        onPointerCancel={resize.onPointerUp}
+        onDoubleClick={resize.reset}
+        onKeyDown={resize.onKeyDown}
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize sidebar"
+        aria-valuenow={resize.width}
+        aria-valuemin={MIN_LEFT_PANE_WIDTH}
+        aria-valuemax={MAX_LEFT_PANE_WIDTH}
+        tabIndex={0}
+      />
     </div>
   );
+}
+
+/**
+ * Drag the divider between the sidebar and the conversation.
+ *
+ * The width is held here rather than in the app state because nothing else
+ * depends on it, and putting it in the shared reducer would re-render every
+ * message bubble on every pixel of the drag.
+ *
+ * Pointer capture is what makes it survive a fast drag: without it the
+ * pointer outruns the 7px handle, the element stops receiving moves, and the
+ * divider is left behind halfway.
+ */
+function useResizableWidth() {
+  const [width, setWidth] = React.useState(loadLeftPaneWidth);
+  const [dragging, setDragging] = React.useState(false);
+  const origin = React.useRef<{ x: number; width: number } | null>(null);
+
+  const onPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    // Suppresses the text selection that a drag across the list would
+    // otherwise start in whatever it passes over.
+    event.preventDefault();
+    origin.current = { x: event.clientX, width };
+    setDragging(true);
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+
+  const onPointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    const start = origin.current;
+    if (!start) return;
+    setWidth(clampLeftPaneWidth(start.width + event.clientX - start.x));
+  };
+
+  const onPointerUp = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!origin.current) return;
+    origin.current = null;
+    setDragging(false);
+    event.currentTarget.releasePointerCapture(event.pointerId);
+    // Written once at the end of the drag, not on every move: this is a
+    // synchronous write to disk-backed storage.
+    saveLeftPaneWidth(width);
+  };
+
+  const onKeyDown = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    const step = event.shiftKey ? 40 : 8;
+    const delta =
+      event.key === 'ArrowLeft' ? -step : event.key === 'ArrowRight' ? step : 0;
+    if (delta === 0) return;
+
+    event.preventDefault();
+    const next = clampLeftPaneWidth(width + delta);
+    setWidth(next);
+    saveLeftPaneWidth(next);
+  };
+
+  const reset = () => {
+    setWidth(DEFAULT_LEFT_PANE_WIDTH);
+    saveLeftPaneWidth(DEFAULT_LEFT_PANE_WIDTH);
+  };
+
+  return { width, dragging, onPointerDown, onPointerMove, onPointerUp, onKeyDown, reset };
 }
 
 function EmptyList({

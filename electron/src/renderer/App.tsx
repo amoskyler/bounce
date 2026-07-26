@@ -30,7 +30,7 @@ import {
   type Contact,
   type State,
 } from './state';
-import type { BounceApi, Message, TransportInfo } from '../preload';
+import type { BounceApi, Message, OutgoingAttachment, TransportInfo } from '../preload';
 
 declare global {
   interface Window {
@@ -748,23 +748,22 @@ function AddContactDialog({ onClose }: { onClose: () => void }) {
  * than being rejected — the mime type came from the operating system, and being
  * wrong about it is not a reason to lose the file.
  */
-async function measure(attachment: PendingAttachment): Promise<{
-  name: string;
-  data: Uint8Array;
-  isImage: boolean;
-  width: number;
-  height: number;
-  blurHash: string;
-}> {
-  const base = {
+async function measure(attachment: PendingAttachment): Promise<OutgoingAttachment> {
+  const base: OutgoingAttachment = {
     name: attachment.name,
     data: attachment.bytes,
     isImage: false,
     width: 0,
     height: 0,
     blurHash: '',
+    // Set for a file too large to embed, and empty otherwise. The engine sends
+    // by path when it is there and by value when it is not, so this is the
+    // whole of what the client has to decide.
+    path: attachment.path ?? '',
   };
 
+  // Nothing to measure: a file staged by path was never read, and anything
+  // without a preview is not an image.
   if (!attachment.previewUrl) return base;
 
   try {

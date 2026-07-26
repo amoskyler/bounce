@@ -377,46 +377,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "bounce-core"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "arti-client",
- "blake3",
- "data-encoding",
- "ed25519-dalek",
- "futures",
- "hex",
- "rand 0.8.7",
- "rmp-serde",
- "rusqlite",
- "rustls",
- "safelog",
- "serde",
- "serde_bytes",
- "serde_json",
- "sha2",
- "sha3",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tor-cell",
- "tor-hscrypto",
- "tor-hsservice",
- "tor-llcrypto",
- "tor-proto",
- "tor-rtcompat",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "x25519-dalek",
-]
-
-[[package]]
 name = "bounce-node"
 version = "0.1.0"
 dependencies = [
- "bounce-core",
+ "libbounce",
  "napi",
  "napi-build",
  "napi-derive",
@@ -1926,6 +1890,42 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 dependencies = [
  "spin",
+]
+
+[[package]]
+name = "libbounce"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "arti-client",
+ "blake3",
+ "data-encoding",
+ "ed25519-dalek",
+ "futures",
+ "hex",
+ "rand 0.8.7",
+ "rmp-serde",
+ "rusqlite",
+ "rustls",
+ "safelog",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "sha2",
+ "sha3",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tor-cell",
+ "tor-hscrypto",
+ "tor-hsservice",
+ "tor-llcrypto",
+ "tor-proto",
+ "tor-rtcompat",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "x25519-dalek",
 ]
 
 [[package]]

@@ -67,7 +67,7 @@ use super::{Engine, Event};
 ///
 /// The dimensions come from the client, which has already decoded the image to
 /// show a preview; the engine does not decode images itself.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct OutgoingAttachment {
     pub name: String,
     pub data: Vec<u8>,
@@ -77,6 +77,14 @@ pub struct OutgoingAttachment {
     pub height: i64,
     /// A BlurHash placeholder, if the client computed one.
     pub blur_hash: String,
+    /// Where the file is on disk, for anything too large to hold in memory.
+    ///
+    /// Set this instead of `data` and the file is streamed: hashed a chunk at
+    /// a time, left where it is, and read back by seeking when a peer asks for
+    /// a chunk. The caller does not have to decide which path to take — a
+    /// attachment carrying a path is streamed however big it is, and one
+    /// carrying bytes is embedded if it fits.
+    pub path: String,
 }
 
 impl<N: Network + 'static> Engine<N> {
@@ -364,6 +372,22 @@ impl<N: Network + 'static> Engine<N> {
         destination: Uuid,
         written_at: i64,
     ) -> Result<File> {
+        // A path means the caller never read the file into memory, which is
+        // the only way to send something bigger than memory. Deciding here
+        // rather than at the call site is what keeps one send API for both.
+        if !attachment.path.is_empty() {
+            return self.stage_from_path(
+                std::path::Path::new(&attachment.path),
+                // The name the reader chose, not whatever the file is called
+                // on this machine's disk.
+                Some(attachment.name.as_str()).filter(|name| !name.is_empty()),
+                message_id,
+                scope,
+                destination,
+                written_at,
+            );
+        }
+
         self.stage_file(
             attachment,
             message_id,
@@ -391,7 +415,14 @@ impl<N: Network + 'static> Engine<N> {
         kind: FileType,
     ) -> Result<File> {
         if attachment.data.is_empty() {
-            return Err(Error::InvalidFrame("refusing to send an empty file".into()));
+            // Naming the file and both ways out of it, because the client that
+            // hits this has usually lost the path off a large attachment, and
+            // "empty file" on its own sends you looking at the wrong thing.
+            return Err(Error::InvalidFrame(format!(
+                "{}: no bytes to send. An attachment needs either its contents \
+                 or a path on disk to stream from.",
+                if attachment.name.is_empty() { "attachment" } else { &attachment.name },
+            )));
         }
         if attachment.data.len() as i64 > crate::EMBEDDED_FILE_LIMIT {
             // Buffering it was the caller's choice, and at this size it is the
@@ -900,6 +931,24 @@ impl<N: Network + 'static> Engine<N> {
         scope: Scope,
         destination: Uuid,
     ) -> Result<File> {
+        self.stage_from_path(path, None, attached_to, scope, destination, crate::now())
+    }
+
+    /// The body of {@link stage_large_file}, with the fields a message supplies.
+    ///
+    /// `name` and `written_at` cannot be corrected afterwards: they are inside
+    /// the signature, and `save_file` refuses to update identity columns on
+    /// conflict — deliberately, so a relayed record cannot rewrite a file we
+    /// already hold. So they are settled before the record is ever sealed.
+    fn stage_from_path(
+        &self,
+        path: &std::path::Path,
+        name: Option<&str>,
+        attached_to: Uuid,
+        scope: Scope,
+        destination: Uuid,
+        written_at: i64,
+    ) -> Result<File> {
         use std::io::Read;
 
         let author = self.store.my_user_id()?;
@@ -932,10 +981,11 @@ impl<N: Network + 'static> Engine<N> {
         let mut record = File {
             signed: SignedFrame::default(),
             id: file_id,
-            name: path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "file".into()),
+            name: name.map(str::to_owned).unwrap_or_else(|| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "file".into())
+            }),
             file_type: FileType::MessageAttachment as i64,
             attached_to,
             hash: hex::encode(whole.finalize().as_bytes()),
@@ -951,7 +1001,7 @@ impl<N: Network + 'static> Engine<N> {
             scope: scope.as_i64(),
             destination,
             author,
-            timestamp: crate::now(),
+            timestamp: written_at,
             saved_at: crate::now(),
         };
 

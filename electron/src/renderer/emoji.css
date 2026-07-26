@@ -1,0 +1,207 @@
+/*
+ * The emoji picker and the `:shortcode` suggestion list.
+ *
+ * Both are popovers hung off a composer button, and both open upwards — the
+ * composer sits at the bottom of the window, so there is nowhere else to go.
+ * They borrow `--panel-background` and `--shadow` from the overflow menu so
+ * that every floating surface in the app is made of the same material.
+ */
+
+:root {
+  /*
+   * The picker measures its own sections to decide what to render, so this
+   * has to agree with `CELL_SIZE` in EmojiPicker.tsx.
+   */
+  --emoji-cell: 36px;
+}
+
+/* --------------------------------------------------------------------------
+ * Emoji picker
+ * -------------------------------------------------------------------------- */
+
+.emoji-picker {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 0;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  /* Eight cells, plus the scroller's asymmetric padding. */
+  width: calc(var(--emoji-cell) * 8 + 11px);
+  border-radius: 12px;
+  background: var(--panel-background);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+.emoji-picker__search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 8px 4px;
+  padding: 0 10px;
+  height: 32px;
+  border-radius: 16px;
+  background: var(--input-background);
+  color: var(--text-secondary);
+}
+
+.emoji-picker__search input {
+  flex: 1;
+  min-width: 0;
+  font-size: 14px;
+  color: var(--text-primary);
+}
+
+.emoji-picker__scroller {
+  height: 280px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 0 3px 4px 8px;
+}
+
+/*
+ * Sections are absolutely positioned inside a spacer of the full height. That
+ * way the ones scrolled well out of view can go unrendered — there are nearly
+ * two thousand cells — without the scrollbar jumping each time the set of
+ * mounted sections changes.
+ */
+.emoji-picker__sections {
+  position: relative;
+}
+
+.emoji-picker__section {
+  position: absolute;
+  left: 0;
+  right: 0;
+}
+
+.emoji-picker__heading {
+  display: flex;
+  align-items: center;
+  /* Agrees with `HEADING_HEIGHT` in EmojiPicker.tsx. */
+  height: 26px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+.emoji-picker__grid {
+  display: grid;
+  grid-template-columns: repeat(8, var(--emoji-cell));
+}
+
+.emoji-picker__empty {
+  padding: 24px 8px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--text-tertiary);
+}
+
+.emoji-cell {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--emoji-cell);
+  height: var(--emoji-cell);
+  border-radius: 6px;
+  /*
+   * Deliberately smaller than the cell. Colour emoji carry their own side
+   * bearings, and a glyph sized to the cell leaves the grid looking cramped.
+   */
+  font-size: 22px;
+  line-height: 1;
+}
+
+.emoji-cell:hover,
+.emoji-cell--selected {
+  background: var(--row-hover);
+}
+
+.emoji-picker__tabs {
+  display: flex;
+  gap: 2px;
+  padding: 4px 6px 6px;
+  border-top: 1px solid var(--divider);
+}
+
+.emoji-picker__tab {
+  flex: 1;
+  height: 28px;
+  border-radius: 6px;
+  font-size: 16px;
+  line-height: 1;
+  /*
+   * The tabs are landmarks, not choices. Left in full colour they read as
+   * eight more emoji to pick from, sitting directly under the ones that are.
+   */
+  filter: grayscale(1);
+  opacity: 0.55;
+}
+
+.emoji-picker__tab:hover {
+  background: var(--row-hover);
+  opacity: 0.9;
+}
+
+.emoji-picker__tab--active {
+  background: var(--row-selected);
+  filter: none;
+  opacity: 1;
+}
+
+/* --------------------------------------------------------------------------
+ * Shortcode suggestions
+ * -------------------------------------------------------------------------- */
+
+.emoji-suggestions {
+  position: absolute;
+  bottom: calc(100% + 10px);
+  left: 0;
+  z-index: 20;
+  min-width: 230px;
+  /* Eight 30px rows plus the padding, so the ninth is not sliced in half. */
+  max-height: 248px;
+  padding: 4px;
+  border-radius: 10px;
+  background: var(--panel-background);
+  box-shadow: var(--shadow);
+  overflow-y: auto;
+}
+
+.emoji-suggestion {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 5px 8px;
+  border-radius: 6px;
+  text-align: left;
+}
+
+.emoji-suggestion:hover {
+  background: var(--row-hover);
+}
+
+.emoji-suggestion--selected {
+  background: var(--row-selected);
+}
+
+.emoji-suggestion__char {
+  font-size: 20px;
+  line-height: 1;
+}
+
+.emoji-suggestion__name {
+  font-size: 13px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.emoji-suggestion--selected .emoji-suggestion__name {
+  color: var(--text-primary);
+}

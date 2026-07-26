@@ -90,11 +90,19 @@ export function InfoIcon({ size = 20, className }: IconProps) {
   );
 }
 
+/**
+ * A cog, not a sun.
+ *
+ * The obvious way to draw settings is a circle with spokes radiating from it,
+ * which is also exactly how you draw a sun — and at 20px, with the spokes
+ * detached from the body, the sun is what people see. The teeth here are
+ * joined to the rim as one closed path so the shape reads as machinery.
+ */
 export function SettingsIcon({ size = 20, className }: IconProps) {
   return (
     <svg {...svgProps(size)} className={className}>
-      <circle cx="10" cy="10" r="2.6" />
-      <path d="M10 2.4v1.9M10 15.7v1.9M17.6 10h-1.9M4.3 10H2.4M15.4 4.6l-1.4 1.4M6 14l-1.4 1.4M15.4 15.4 14 14M6 6 4.6 4.6" />
+      <path d="M8.5 2.6h3l.35 2.03a5.6 5.6 0 0 1 1.4.81l1.93-.73 1.5 2.6-1.58 1.3a5.6 5.6 0 0 1 0 1.62l1.58 1.3-1.5 2.6-1.93-.73a5.6 5.6 0 0 1-1.4.81L11.5 17.4h-3l-.35-2.03a5.6 5.6 0 0 1-1.4-.81l-1.93.73-1.5-2.6 1.58-1.3a5.6 5.6 0 0 1 0-1.62l-1.58-1.3 1.5-2.6 1.93.73a5.6 5.6 0 0 1 1.4-.81z" />
+      <circle cx="10" cy="10" r="2.4" />
     </svg>
   );
 }
@@ -107,6 +115,36 @@ export function AttachIcon({ size = 20, className }: IconProps) {
   );
 }
 
+/** The composer's attachment button. */
+export function PlusIcon({ size = 20, className }: IconProps) {
+  return (
+    <svg {...svgProps(size)} className={className} strokeWidth={1.9}>
+      <path d="M10 4.6v10.8M4.6 10h10.8" />
+    </svg>
+  );
+}
+
+/** "Photos & Videos": a picture frame with a horizon and a sun. */
+export function MediaIcon({ size = 20, className }: IconProps) {
+  return (
+    <svg {...svgProps(size)} className={className}>
+      <rect x="2.6" y="3.8" width="14.8" height="12.4" rx="2.2" />
+      <circle cx="7.2" cy="8.1" r="1.35" />
+      <path d="M3 13.9 6.9 10.6a1.4 1.4 0 0 1 1.85 0l2.9 2.6 1.6-1.35a1.4 1.4 0 0 1 1.85 0L17.4 13.6" />
+    </svg>
+  );
+}
+
+/** "File": a document with a folded corner. */
+export function DocumentIcon({ size = 20, className }: IconProps) {
+  return (
+    <svg {...svgProps(size)} className={className}>
+      <path d="M11.4 2.8H6.4a1.8 1.8 0 0 0-1.8 1.8v10.8a1.8 1.8 0 0 0 1.8 1.8h7.2a1.8 1.8 0 0 0 1.8-1.8V6.8z" />
+      <path d="M11.4 2.8v3.2a.8.8 0 0 0 .8.8h3.2" />
+    </svg>
+  );
+}
+
 export function EmojiIcon({ size = 20, className }: IconProps) {
   return (
     <svg {...svgProps(size)} className={className}>
@@ -114,14 +152,6 @@ export function EmojiIcon({ size = 20, className }: IconProps) {
       <path d="M7 11.6a3.6 3.6 0 0 0 6 0" />
       <circle cx="7.5" cy="8.1" r="0.9" fill="currentColor" strokeWidth={0} />
       <circle cx="12.5" cy="8.1" r="0.9" fill="currentColor" strokeWidth={0} />
-    </svg>
-  );
-}
-
-export function SendIcon({ size = 18, className }: IconProps) {
-  return (
-    <svg {...svgProps(size)} className={className} strokeWidth={0} fill="currentColor">
-      <path d="M3.2 16.5 17 10 3.2 3.5l1.9 5.2 7 1.3-7 1.3z" />
     </svg>
   );
 }

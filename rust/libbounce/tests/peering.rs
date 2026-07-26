@@ -9,11 +9,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use bounce_core::crypto::DeviceKey;
-use bounce_core::engine::{Engine, Event};
-use bounce_core::frames::identity::User;
-use bounce_core::net::{StaticDirectory, TcpNetwork};
-use bounce_core::store::Store;
+use libbounce::crypto::DeviceKey;
+use libbounce::engine::{Engine, Event};
+use libbounce::frames::identity::User;
+use libbounce::net::{StaticDirectory, TcpNetwork};
+use libbounce::store::Store;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 struct Instance {
@@ -218,7 +218,7 @@ async fn a_dormant_contact_is_still_dialled_when_we_owe_them_a_message() {
     // Age the conversation past the four week horizon, as a restart weeks
     // later would leave it.
     let mut stale = alice.store.user(bob.user.id).unwrap().unwrap();
-    stale.last_activity = bounce_core::now() - (5 * 7 * 24 * 60 * 60);
+    stale.last_activity = libbounce::now() - (5 * 7 * 24 * 60 * 60);
     alice.store.update_user_local_state(&stale).unwrap();
 
     tokio::spawn(Arc::clone(&alice.engine).run_peering());
