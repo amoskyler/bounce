@@ -1,0 +1,39 @@
+/*
+ * Message bodies.
+ *
+ * Links and the "Read more" toggle both inherit their colour from the bubble
+ * they sit in, because the outgoing bubble is ultramarine and the incoming one
+ * is a neutral gray: a fixed accent would be unreadable on one of them.
+ */
+
+.message-text__link {
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.message-text__link:hover {
+  text-decoration-thickness: 2px;
+}
+
+/*
+ * The toggle is a button rather than a link so that keyboard focus and the
+ * Enter key behave the way a control is expected to, without any of the
+ * default button chrome.
+ */
+.message-text__read-more {
+  display: block;
+  margin-top: 4px;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-weight: 600;
+  color: inherit;
+  opacity: 0.8;
+  cursor: pointer;
+}
+
+.message-text__read-more:hover {
+  opacity: 1;
+}

@@ -1,0 +1,301 @@
+/*
+ * Attachments — the composer tray, the bubble contents, and the image viewer.
+ *
+ * Kept out of styles.css because it is one feature rather than part of the
+ * shared visual system, but it borrows that system's tokens throughout: the
+ * same input background, the same bubble radii, the same gray ramp. Nothing
+ * here defines a colour of its own.
+ */
+
+/* --------------------------------------------------------------------------
+ * The composer's drop zone
+ *
+ * A wrapper around the composer row, so the tray can sit above it and the drag
+ * highlight can cover both.
+ * -------------------------------------------------------------------------- */
+
+.composer-area {
+  position: relative;
+  flex-shrink: 0;
+  background: var(--background);
+}
+
+/*
+ * The highlight is a pseudo-element rather than a rendered overlay so that it
+ * cannot become a drag target itself — a real element would take the pointer
+ * and fire dragleave against the zone underneath it, flickering the state.
+ */
+.composer-area--dropping::after {
+  content: 'Drop to attach';
+  position: absolute;
+  inset: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 2px dashed var(--ultramarine);
+  border-radius: 12px;
+  background: var(--input-background);
+  color: var(--ultramarine);
+  font-size: 14px;
+  font-weight: 500;
+  pointer-events: none;
+}
+
+.composer-area__error {
+  padding: 6px 16px 0;
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--red);
+}
+
+/* --------------------------------------------------------------------------
+ * The staging tray
+ * -------------------------------------------------------------------------- */
+
+.attachment-tray {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 10px 16px 0;
+}
+
+.attachment-tray__item {
+  position: relative;
+  display: flex;
+}
+
+.attachment-tray__thumb {
+  width: 72px;
+  height: 72px;
+  border-radius: 8px;
+  /* Crop rather than letterbox: a uniform grid of squares reads as one row. */
+  object-fit: cover;
+  background: var(--input-background);
+  user-select: none;
+}
+
+.attachment-tray__chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 72px;
+  max-width: 220px;
+  padding: 0 14px 0 12px;
+  border-radius: 8px;
+  background: var(--input-background);
+  color: var(--text-secondary);
+}
+
+.attachment-tray__chip-text {
+  min-width: 0;
+}
+
+.attachment-tray__name {
+  font-size: 13px;
+  color: var(--text-primary);
+  /* A long filename has to truncate, or the tray grows a row per file. */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attachment-tray__size {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.attachment-tray__remove {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--gray-65);
+  color: #ffffff;
+  box-shadow: 0 0 0 2px var(--background);
+  transition: background 0.08s ease;
+}
+
+.attachment-tray__remove:hover {
+  background: var(--gray-90);
+}
+
+/* --------------------------------------------------------------------------
+ * Attachments inside a bubble
+ * -------------------------------------------------------------------------- */
+
+.attachment-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 4px;
+}
+
+.attachment-image {
+  display: block;
+  max-width: 300px;
+  overflow: hidden;
+  border-radius: 12px;
+  background: var(--input-background);
+  cursor: pointer;
+}
+
+.attachment-image img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  /* The element is already sized to the image's own ratio, so this only
+     matters when the sender's dimensions and the file disagree. */
+  object-fit: cover;
+  user-select: none;
+}
+
+/* Space held for an image whose bytes have not arrived. */
+.attachment-image--pending {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 120px;
+  min-height: 80px;
+  cursor: default;
+}
+
+.attachment-image__progress {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.attachment-file {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 220px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: var(--background);
+}
+
+.attachment-file__icon {
+  display: flex;
+  flex-shrink: 0;
+  color: var(--text-secondary);
+}
+
+.attachment-file__text {
+  flex: 1;
+  min-width: 0;
+}
+
+.attachment-file__name {
+  font-size: 13px;
+  line-height: 17px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attachment-file__size,
+.attachment-file__progress {
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--text-secondary);
+}
+
+.attachment-file__download {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  color: var(--icon);
+  transition:
+    background 0.08s ease,
+    color 0.08s ease;
+}
+
+.attachment-file__download:hover {
+  background: var(--row-hover);
+  color: var(--icon-hover);
+}
+
+/*
+ * On an outgoing bubble the background is ultramarine, so the file row tints
+ * the bubble rather than sitting on a surface colour, and its text inherits
+ * white instead of the theme's.
+ */
+.bubble--outgoing .attachment-file {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.bubble--outgoing .attachment-file__icon,
+.bubble--outgoing .attachment-file__size,
+.bubble--outgoing .attachment-file__progress,
+.bubble--outgoing .attachment-file__download {
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.bubble--outgoing .attachment-file__download:hover {
+  background: rgba(255, 255, 255, 0.2);
+  color: #ffffff;
+}
+
+/* --------------------------------------------------------------------------
+ * Full-screen image viewer
+ * -------------------------------------------------------------------------- */
+
+.image-viewer {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 48px;
+  /* Darker than --overlay: a photo is the only thing meant to be legible. */
+  background: rgba(0, 0, 0, 0.85);
+  z-index: 200;
+}
+
+.image-viewer__image {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  cursor: default;
+}
+
+.image-viewer__close {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  color: #ffffff;
+  transition: background 0.08s ease;
+}
+
+.image-viewer__close:hover {
+  background: rgba(255, 255, 255, 0.15);
+}
+
+/*
+ * The transfer label sits on top of the decoded blur, which can be any colour
+ * at all, so it carries its own contrast rather than relying on the surface
+ * beneath it.
+ */
+.attachment-image__progress--over-blur {
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  backdrop-filter: blur(2px);
+}

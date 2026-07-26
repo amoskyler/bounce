@@ -23,3 +23,12 @@ android/activity/unzippedAPK
 *.jar
 *.aar
 *.apk
+
+# Rust core
+rust/target/
+
+# Electron client
+electron/node_modules/
+electron/dist/
+electron/native/
+electron/release/

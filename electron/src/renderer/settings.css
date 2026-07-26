@@ -1,0 +1,286 @@
+/* --------------------------------------------------------------------------
+ * The settings panel
+ *
+ * A sibling of the details panel in `styles.css` and framed the same way: the
+ * same width, the same header, the same section rhythm, so moving between them
+ * does not feel like moving between two applications.
+ *
+ * The rules are written out rather than sharing the `.details__*` selectors
+ * because the two panels are separate blocks that happen to agree today. A
+ * settings row that needs to grow — a device list is a different shape from a
+ * member list — should not have to be talked out of it because a conversation
+ * panel would inherit the change.
+ *
+ * Every colour comes from the variables `styles.css` defines, so both themes
+ * follow with nothing declared twice here.
+ * -------------------------------------------------------------------------- */
+
+.settings {
+  width: 340px;
+  display: flex;
+  flex-direction: column;
+  background: var(--background);
+  border-left: 1px solid var(--divider);
+  overflow: hidden;
+}
+
+.settings__header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: var(--header-height);
+  padding: 0 12px;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--divider);
+  -webkit-app-region: drag;
+}
+
+.settings__header > * {
+  -webkit-app-region: no-drag;
+}
+
+.settings__header-title {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.settings__body {
+  flex: 1;
+  overflow-y: auto;
+  padding-bottom: 24px;
+}
+
+.settings__identity {
+  display: flex;
+  justify-content: center;
+  padding: 24px 16px 20px;
+}
+
+.settings__section {
+  padding: 14px 16px;
+  border-top: 1px solid var(--divider);
+}
+
+.settings__section-title {
+  margin-bottom: 10px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+.settings__field {
+  display: block;
+  margin-bottom: 10px;
+}
+
+.settings__field-label {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.settings__input {
+  width: 100%;
+  height: 34px;
+  padding: 0 10px;
+  border-radius: 6px;
+  background: var(--input-background);
+  font-size: 14px;
+  color: var(--text-primary);
+}
+
+.settings__input:focus {
+  box-shadow: inset 0 0 0 2px var(--ultramarine);
+}
+
+.settings__input:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* The address is meant to be compared character by character, so it wraps in
+ * full rather than being truncated, and stays selectable. */
+.settings__address-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.settings__address {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--input-background);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  user-select: text;
+  word-break: break-all;
+}
+
+.settings__copy {
+  flex-shrink: 0;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: var(--input-background);
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--ultramarine);
+}
+
+.settings__copy:hover {
+  background: var(--row-selected);
+}
+
+.settings__copy:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  color: var(--text-tertiary);
+}
+
+.settings__hint {
+  margin: 0 0 10px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-tertiary);
+}
+
+.settings__device {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 7px 0;
+}
+
+.settings__dot {
+  flex-shrink: 0;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-tertiary);
+}
+
+.settings__dot--online {
+  background: var(--green);
+}
+
+.settings__device-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.settings__device-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 14px;
+}
+
+.settings__device-label {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Wraps as whole items rather than mid-phrase: a narrow panel should break
+ * between the address and the presence, never inside "Last seen Yesterday". */
+.settings__device-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 12px;
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+
+/* A gap rather than a middle dot separates the two, because a dot left at the
+ * start of a wrapped line reads as a bullet. */
+.settings__device-meta > * {
+  white-space: nowrap;
+}
+
+.settings__device-meta code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  user-select: text;
+}
+
+.settings__badge {
+  flex-shrink: 0;
+  padding: 1px 7px;
+  border-radius: 9px;
+  background: var(--row-selected);
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.settings__link {
+  flex-shrink: 0;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--ultramarine);
+  text-decoration: none;
+}
+
+.settings__link:hover {
+  text-decoration: underline;
+}
+
+/* Disabled because the flow behind it does not exist yet; the title says so,
+ * and the cursor makes it obvious before anyone waits for a tooltip. */
+.settings__link:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  color: var(--text-tertiary);
+  text-decoration: none;
+}
+
+.settings__toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 0;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.settings__action {
+  display: block;
+  width: 100%;
+  padding: 9px 10px;
+  margin: 4px 0;
+  border-radius: 6px;
+  text-align: left;
+  font-size: 14px;
+  color: var(--text-primary);
+}
+
+.settings__action:hover:not(:disabled) {
+  background: var(--row-hover);
+}
+
+.settings__action:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.settings__about-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 5px 0;
+  font-size: 14px;
+}
+
+.settings__about-value {
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}

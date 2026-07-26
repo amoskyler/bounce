@@ -1,0 +1,81 @@
+{
+  "name": "bounce-desktop",
+  "productName": "Bounce",
+  "version": "0.1.0",
+  "description": "Bounce desktop client \u2014 distributed group chat that protects metadata",
+  "license": "MIT",
+  "author": "Hayden Parker",
+  "main": "dist/main/index.js",
+  "scripts": {
+    "build:native": "node scripts/copy-native.mjs",
+    "build:main": "esbuild src/main/index.ts src/preload/index.ts --bundle --platform=node --format=cjs --target=node20 --external:electron --outdir=dist --out-extension:.js=.js --outbase=src",
+    "build:renderer": "esbuild src/renderer/index.tsx --bundle --format=iife --target=chrome120 --loader:.svg=dataurl --outfile=dist/renderer/index.js && node scripts/copy-static.mjs",
+    "build": "npm run build:native && npm run build:main && npm run build:renderer",
+    "dev": "npm run build && electron .",
+    "start": "electron .",
+    "fresh": "node scripts/fresh.mjs",
+    "fresh:a": "node scripts/fresh.mjs a",
+    "fresh:b": "node scripts/fresh.mjs b",
+    "typecheck": "tsc --noEmit",
+    "package": "node scripts/package.mjs",
+    "package:dir": "node scripts/package.mjs --dir",
+    "package:universal": "node scripts/package.mjs --universal",
+    "test": "esbuild src/renderer/__tests__/*.test.ts --bundle --platform=node --format=cjs --target=node20 --loader:.css=empty --outdir=dist/tests --out-extension:.js=.cjs && node --test dist/tests"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8",
+    "esbuild": "^0.24.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "typescript": "^5.6.3"
+  },
+  "build": {
+    "appId": "chat.bounce.desktop",
+    "productName": "Bounce",
+    "files": [
+      "dist/**/*",
+      "package.json",
+      "!node_modules/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "native",
+        "to": "native",
+        "filter": [
+          "bounce.node"
+        ]
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.social-networking",
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
+    },
+    "linux": {
+      "category": "Network",
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
+    },
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "asar": true
+  }
+}

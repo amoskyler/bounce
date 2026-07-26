@@ -1,0 +1,33 @@
+/*
+ * System rows.
+ *
+ * Signal sets status changes apart from the conversation by centring them and
+ * dropping them to the secondary text colour, with no bubble at all. The row
+ * is narrower than the timeline so a long sentence wraps into a block that
+ * still reads as an aside.
+ */
+
+.system-message {
+  align-self: center;
+  max-width: min(480px, 80%);
+  margin: 10px 0 6px;
+  padding: 4px 12px;
+  text-align: center;
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--text-secondary);
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+/*
+ * The time trails the sentence rather than sitting on its own line, so a run
+ * of membership changes stays compact.
+ */
+.system-message__timestamp {
+  margin-left: 6px;
+  font-size: 11px;
+  color: var(--text-tertiary);
+  white-space: nowrap;
+}

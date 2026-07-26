@@ -1,0 +1,24 @@
+[package]
+name = "bounce-node"
+description = "N-API bindings exposing the Bounce engine to Electron"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+bounce-core = { path = "../bounce-core", features = ["tor"] }
+napi = { version = "2", default-features = false, features = ["napi6", "async", "tokio_rt", "serde-json"] }
+napi-derive = "2"
+serde = { workspace = true }
+serde_json = "1"
+tokio.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[build-dependencies]
+napi-build = "2"
