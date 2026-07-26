@@ -18,7 +18,7 @@ use rusqlite::Connection;
 use crate::error::{Error, Result};
 
 /// Bumped whenever the schema changes in a way that needs a migration.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// Create every table and index, if they do not already exist.
 pub fn create(connection: &Connection) -> Result<()> {
@@ -27,6 +27,12 @@ pub fn create(connection: &Connection) -> Result<()> {
         PRAGMA journal_mode = WAL;
         PRAGMA foreign_keys = ON;
         PRAGMA synchronous = NORMAL;
+        -- Freed pages keep their contents until something overwrites them, so
+        -- deleting an attachment is not the same as the bytes leaving the file.
+        -- This has to be set before the first table exists — on a database that
+        -- already has one it is a silent no-op, and only a full VACUUM would
+        -- change it — which is why it is here rather than in a migration.
+        PRAGMA auto_vacuum = INCREMENTAL;
 
         -- People. Exactly one row has profile = 1: the owner of this device.
         CREATE TABLE IF NOT EXISTS users (
@@ -350,16 +356,87 @@ pub fn create(connection: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_update_dms_target ON update_dms (target);
 
+        -- A change to a user's profile: their name, or one of their images.
+        --
+        -- Kept rather than folded straight into the `users` row for the same
+        -- reason group updates are: the row is *derived* by replaying every
+        -- update for that user, which is what makes the result independent of
+        -- the order they arrived in, and what lets a device that was offline be
+        -- caught up with the frames rather than with a summary.
+        CREATE TABLE IF NOT EXISTS update_users (
+            id                BLOB PRIMARY KEY NOT NULL,
+            target            BLOB NOT NULL,
+            type              INTEGER NOT NULL DEFAULT 0,
+            data              BLOB,
+            -- The value being replaced, kept locally so the timeline can say
+            -- what a name changed *from*. Never travels on the wire.
+            previous_data     BLOB,
+            timestamp         INTEGER NOT NULL DEFAULT 0,
+            saved_at          INTEGER NOT NULL DEFAULT 0,
+            seen              INTEGER NOT NULL DEFAULT 0,
+            signer            TEXT NOT NULL DEFAULT '',
+            original_payload  BLOB NOT NULL DEFAULT x'',
+            signature         BLOB NOT NULL DEFAULT x''
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_update_users_target ON update_users (target);
+
+        -- An unsent message body, one per thread.
+        --
+        -- The signature columns are what make a draft relayable: a device that
+        -- was offline is caught up with the frame itself, so the bytes it was
+        -- signed as have to survive the round trip through the database.
         CREATE TABLE IF NOT EXISTS drafts (
-            id         BLOB PRIMARY KEY NOT NULL,
-            thread     BLOB NOT NULL UNIQUE,
-            text       TEXT NOT NULL DEFAULT '',
-            timestamp  INTEGER NOT NULL DEFAULT 0,
-            saved_at   INTEGER NOT NULL DEFAULT 0
+            id                BLOB PRIMARY KEY NOT NULL,
+            thread            BLOB NOT NULL UNIQUE,
+            text              TEXT NOT NULL DEFAULT '',
+            timestamp         INTEGER NOT NULL DEFAULT 0,
+            saved_at          INTEGER NOT NULL DEFAULT 0,
+            signer            TEXT NOT NULL DEFAULT '',
+            original_payload  BLOB NOT NULL DEFAULT x'',
+            signature         BLOB NOT NULL DEFAULT x''
         );
 
         -- Short-lived secrets for adding a contact or pairing a device.
+        -- A change to one device in a device group: a rename, a public key,
+        -- or a revocation.
+        --
+        -- Kept as frames rather than merely applied, because a revocation is
+        -- broadcast globally and every contact that was offline has to be able
+        -- to catch up on it. A contact who never learns of a revocation keeps
+        -- trusting the revoked device, which is the whole thing revoking is
+        -- meant to prevent.
+        CREATE TABLE IF NOT EXISTS update_devices (
+            id                BLOB PRIMARY KEY NOT NULL,
+            target            BLOB,
+            type              INTEGER NOT NULL DEFAULT 0,
+            data              BLOB,
+            timestamp         INTEGER NOT NULL DEFAULT 0,
+            saved_at          INTEGER NOT NULL DEFAULT 0,
+            author            BLOB,
+            signer            TEXT NOT NULL DEFAULT '',
+            original_payload  BLOB NOT NULL DEFAULT x'',
+            signature         BLOB NOT NULL DEFAULT x''
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_update_devices_target ON update_devices (target);
+
+        -- The secret behind an "add me as a contact" code.
         CREATE TABLE IF NOT EXISTS pairing_offers (
+            id         BLOB PRIMARY KEY NOT NULL,
+            timestamp  INTEGER NOT NULL DEFAULT 0,
+            secret     TEXT NOT NULL UNIQUE
+        );
+
+        -- The secret behind a "link this device" code.
+        --
+        -- Deliberately a separate table from `pairing_offers`, as it is in the
+        -- Go implementation. The two codes look identical and grant wildly
+        -- different things: one makes somebody a contact, the other hands over
+        -- the profile's private keys. Sharing a table would mean a code shown
+        -- to a stranger so they could message you could instead be redeemed to
+        -- join your device group.
+        CREATE TABLE IF NOT EXISTS sync_device_offers (
             id         BLOB PRIMARY KEY NOT NULL,
             timestamp  INTEGER NOT NULL DEFAULT 0,
             secret     TEXT NOT NULL UNIQUE

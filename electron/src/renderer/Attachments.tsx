@@ -94,8 +94,6 @@ export interface AttachmentIntake {
   dropActive: boolean;
   /** The most recent rejection, or null. Cleared by the next successful add. */
   error: string | null;
-  /** Attach to the composer: paste bubbles up from the textarea. */
-  onPaste: (event: React.ClipboardEvent<HTMLElement>) => void;
   onDragOver: (event: React.DragEvent<HTMLElement>) => void;
   onDragLeave: (event: React.DragEvent<HTMLElement>) => void;
   onDrop: (event: React.DragEvent<HTMLElement>) => void;
@@ -113,8 +111,18 @@ export interface AttachmentIntake {
  * Wire up the three ways a file gets into a message.
  *
  * Pasting is the one that matters most in practice — screenshot, Cmd-V, send —
- * and it is also the most fragile, because the clipboard's `DataTransferItem`s
- * are only readable inside the event handler itself.
+ * and it is the most fragile, for two separate reasons.
+ *
+ * The clipboard's `DataTransferItem`s are only readable inside the handler
+ * itself, so every `getAsFile` has to happen before the first await.
+ *
+ * And the paste has to be caught on the *document*, not on the composer. A
+ * paste event targets whatever has focus, and the realistic way to paste a
+ * screenshot is to take one, click the window to bring it forward, and hit
+ * Cmd-V — at which point focus is on whatever you happened to click, and a
+ * listener bound to the composer subtree never hears about it. Attaching from
+ * the file picker worked; pasting silently did nothing unless you had first
+ * clicked into the text box.
  */
 export function useAttachmentIntake(
   options: AttachmentIntakeOptions = {},
@@ -187,13 +195,20 @@ export function useAttachmentIntake(
     if (rejection) onErrorRef.current?.(rejection);
   }, []);
 
-  const onPaste = React.useCallback(
-    (event: React.ClipboardEvent<HTMLElement>) => {
+  // Bound to the document, so a paste is caught wherever focus happens to be.
+  // Text pastes are never touched: the handler returns before doing anything
+  // unless the clipboard is actually carrying files.
+  React.useEffect(() => {
+    const onPaste = (event: ClipboardEvent) => {
       const items = event.clipboardData?.items;
       if (!items) return;
 
-      // Every `getAsFile` has to happen before the first await: the item list is
-      // emptied as soon as the handler returns, so a version of this that
+      // A dialog covers the composer, and staging into something the user
+      // cannot see would be worse than ignoring the paste.
+      if (document.querySelector('.modal__backdrop')) return;
+
+      // Every `getAsFile` has to happen before the first await: the item list
+      // is emptied as soon as the handler returns, so a version of this that
       // awaited inside the loop would find the clipboard already gone.
       const files: File[] = [];
       for (const item of Array.from(items)) {
@@ -204,13 +219,14 @@ export function useAttachmentIntake(
 
       if (files.length === 0) return;
 
-      // Only swallow the paste once we know we took something from it —
-      // pasting text into the composer has to keep working.
+      // Only swallow the paste once we know we took something from it.
       event.preventDefault();
       void addFiles(files);
-    },
-    [addFiles],
-  );
+    };
+
+    document.addEventListener('paste', onPaste);
+    return () => document.removeEventListener('paste', onPaste);
+  }, [addFiles]);
 
   const onDragOver = React.useCallback((event: React.DragEvent<HTMLElement>) => {
     if (!carriesFiles(event.dataTransfer)) return;
@@ -277,7 +293,6 @@ export function useAttachmentIntake(
     attachments,
     dropActive,
     error,
-    onPaste,
     onDragOver,
     onDragLeave,
     onDrop,

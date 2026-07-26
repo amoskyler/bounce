@@ -20,7 +20,8 @@
     "package": "node scripts/package.mjs",
     "package:dir": "node scripts/package.mjs --dir",
     "package:universal": "node scripts/package.mjs --universal",
-    "test": "esbuild src/renderer/__tests__/*.test.ts --bundle --platform=node --format=cjs --target=node20 --loader:.css=empty --outdir=dist/tests --out-extension:.js=.cjs && node --test dist/tests"
+    "test": "esbuild src/renderer/__tests__/*.test.ts --bundle --platform=node --format=cjs --target=node20 --loader:.css=empty --outdir=dist/tests --out-extension:.js=.cjs && node --test dist/tests",
+    "diagnose": "node scripts/diagnose.mjs"
   },
   "devDependencies": {
     "@types/react": "^18.3.12",
@@ -51,6 +52,7 @@
     ],
     "mac": {
       "category": "public.app-category.social-networking",
+      "icon": "build/icon.icns",
       "target": [
         "dmg",
         "zip"
@@ -58,6 +60,7 @@
       "artifactName": "${productName}-${version}-${arch}.${ext}"
     },
     "win": {
+      "icon": "build/icon.ico",
       "target": [
         "nsis",
         "portable"
@@ -66,6 +69,7 @@
     },
     "linux": {
       "category": "Network",
+      "icon": "build/icon.png",
       "target": [
         "AppImage",
         "deb"

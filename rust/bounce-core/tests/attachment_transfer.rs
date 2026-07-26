@@ -205,3 +205,76 @@ async fn an_attachment_sent_while_offline_arrives_on_reconnection() {
         Some(payload.as_slice()),
     );
 }
+
+#[tokio::test]
+async fn a_profile_picture_reaches_a_contact() {
+    // An avatar is an ordinary distributed file with a global scope, plus an
+    // UpdateUser naming it. Both halves have to arrive: the id without the file
+    // is a broken image, and the file without the id is bytes nobody looks at.
+    logging();
+
+    let directory = Arc::new(StaticDirectory::new());
+    let alice = start("Alice", Arc::clone(&directory)).await;
+    let mut bob = start("Bob", Arc::clone(&directory)).await;
+
+    let code = bob.engine.create_pairing_code().expect("code");
+    Arc::clone(&alice.engine).request_to_add_user(&code).await.expect("pairs");
+
+    let mut alice_events = alice.events;
+    wait_for(&mut alice_events, "alice to add bob", 10, |event| {
+        matches!(event, Event::UserAdded { .. }).then_some(())
+    })
+    .await
+    .expect("alice adds bob");
+    wait_for(&mut bob.events, "bob to add alice", 10, |event| {
+        matches!(event, Event::UserAdded { .. }).then_some(())
+    })
+    .await
+    .expect("bob adds alice");
+
+    let picture: Vec<u8> = (0..9000).map(|index| (index % 251) as u8).collect();
+    alice
+        .engine
+        .set_profile_image(OutgoingAttachment {
+            name: "me.png".into(),
+            data: picture.clone(),
+            is_image: true,
+            width: 96,
+            height: 96,
+            blur_hash: String::new(),
+        })
+        .await
+        .expect("sets the picture");
+
+    // Bob learns which file is Alice's picture...
+    let updated = wait_for(&mut bob.events, "bob to see the new picture", 15, |event| {
+        match event {
+            Event::UserUpdated { user } if !user.images.is_empty() => Some(user.clone()),
+            _ => None,
+        }
+    })
+    .await
+    .expect("the profile update arrives");
+
+    let image_id = *updated.images.last().expect("an image id");
+
+    // ...and can actually fetch it.
+    let complete = wait_for(&mut bob.events, "the picture to download", 20, |event| {
+        match event {
+            Event::FileComplete { file_id } if *file_id == image_id => Some(*file_id),
+            _ => None,
+        }
+    })
+    .await;
+
+    assert_eq!(complete, Some(image_id), "the picture itself must arrive too");
+    assert_eq!(
+        bob.engine.file_data(image_id).unwrap().as_deref(),
+        Some(picture.as_slice()),
+    );
+
+    // And it is filed as a picture rather than as a message attachment, which
+    // is what keeps it out of the timeline.
+    let stored = bob.engine.file(image_id).unwrap().expect("stored");
+    assert_eq!(stored.file_type, bounce_core::types::FileType::UserImage as i64);
+}

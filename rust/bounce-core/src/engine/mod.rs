@@ -31,7 +31,9 @@
 
 pub mod event;
 pub mod files;
+pub mod pairing;
 pub mod peering;
+pub mod retention;
 pub mod settings;
 pub mod system;
 
@@ -52,7 +54,7 @@ use crate::consensus;
 use crate::crypto::DeviceKey;
 use crate::device_group;
 use crate::error::{Error, Result};
-use crate::frames::group::{Group, GroupCreation, UpdateGroup};
+use crate::frames::group::{Confirmation, Group, GroupCreation, UpdateGroup};
 use crate::frames::identity::{Device, ProfileSettings, User};
 use crate::frames::pairing::{
     AddUser, AddUserRequest, AddUserRequestAccepted, AddUserRequestRejected, SyncDeviceOffer,
@@ -567,6 +569,14 @@ impl<N: Network + 'static> Engine<N> {
     /// messages.
     pub async fn respond_to_invite(&self, group_id: Uuid, accept: bool) -> Result<()> {
         let my_id = self.store.my_user_id()?;
+        if accept {
+            // Joining is consent to be in a group with the people already in
+            // it, so everyone in it becomes accepted — which is what the
+            // auto-join policy later reads to decide whether a group contains
+            // anybody new. Go does this first too, in `AcceptInvite`
+            // (chat/update_group.go:821).
+            self.accept_all_users(group_id)?;
+        }
         let response = if accept {
             consensus::state::sentinels::ACCEPT_INVITE
         } else {
@@ -591,6 +601,74 @@ impl<N: Network + 'static> Engine<N> {
             my_id.as_bytes().to_vec(),
         )?;
         self.apply_update_group(update).await
+    }
+
+    /// Mark everyone in a group as somebody this device's owner has agreed to
+    /// be in a group with.
+    fn accept_all_users(&self, group_id: Uuid) -> Result<()> {
+        let Some(group) = self.store.group(group_id)? else {
+            return Ok(());
+        };
+        let everyone: Vec<Uuid> = group
+            .member_ids()
+            .into_iter()
+            .chain(group.invite_ids())
+            .collect();
+        self.store.mark_users_accepted(&everyone)
+    }
+
+    /// Accept an invitation without asking, if the policy says to.
+    ///
+    /// The default is [`auto_join::ONLY_WITHOUT_NEW_USERS`], which is why the
+    /// flag it reads has to mean something: a group that contains anybody this
+    /// device's owner has not knowingly agreed to is one they get asked about.
+    /// Users met through a group are exactly the ones that are not accepted
+    /// (see [`Engine::adopt_group_user`]), so the policy holds.
+    ///
+    /// One thing Go has and this does not: it refuses to apply a setting that
+    /// was changed *after* the invitation arrived
+    /// (`chat/consensus_store.go:592`), so turning auto-join on cannot
+    /// retroactively accept invitations already sitting there. Nothing here
+    /// records when a setting changed, so that guard is unported.
+    async fn auto_join_if_policy_allows(&self, group_id: Uuid) -> Result<()> {
+        let my_id = self.store.my_user_id()?;
+        let Some(group) = self.store.group(group_id)? else {
+            return Ok(());
+        };
+        if !group.invite_ids().contains(&my_id) || group.member_ids().contains(&my_id) {
+            return Ok(());
+        }
+
+        let settings = self
+            .store
+            .profile_settings(my_id)?
+            .unwrap_or_else(|| ProfileSettings::defaults(my_id));
+
+        let join = match settings.auto_join_groups {
+            auto_join::ALWAYS => true,
+            auto_join::ONLY_WITHOUT_NEW_USERS => {
+                // A user we have no row for at all counts as new, exactly as an
+                // unaccepted one does.
+                let mut all_known = true;
+                for id in group.member_ids().into_iter().chain(group.invite_ids()) {
+                    if id == my_id {
+                        continue;
+                    }
+                    all_known &= self
+                        .store
+                        .user(id)?
+                        .is_some_and(|user| user.accepted && !user.blocked);
+                }
+                all_known
+            }
+            _ => false,
+        };
+
+        if join {
+            tracing::info!(%group_id, "auto-joining a group of people already accepted");
+            self.respond_to_invite(group_id, true).await?;
+        }
+        Ok(())
     }
 
     fn sign_update_group(
@@ -630,7 +708,7 @@ impl<N: Network + 'static> Engine<N> {
         // Recompute before broadcasting: the update may itself change who is in
         // scope for it, and an invitation only reaches the invitee once the
         // recomputed state lists them.
-        self.recompute_group(update.target)?;
+        self.recompute_and_confirm(update.target).await?;
         self.emit_group_system_message(&update);
         self.broadcast(&update).await?;
         self.reoffer_to_group_scope(update.target).await?;
@@ -682,13 +760,19 @@ impl<N: Network + 'static> Engine<N> {
     ///
     /// State is always rebuilt rather than mutated, which is what makes the
     /// outcome independent of the order updates arrived in.
-    fn recompute_group(&self, group_id: Uuid) -> Result<()> {
+    /// Rebuild a group from its creation record and every update it has seen.
+    ///
+    /// Returns the confirmations this device now owes — a signature for each
+    /// valid update it has not yet vouched for. Minting is separated from
+    /// broadcasting because this is synchronous and the broadcast is not; see
+    /// [`Engine::recompute_and_confirm`], which is what callers want.
+    fn recompute_group(&self, group_id: Uuid) -> Result<Vec<Confirmation>> {
         let my_id = self.store.my_user_id()?;
 
         let Some(creation) = self.store.group_creation(group_id)? else {
             // An update for a group we have not been told about yet. It will be
             // recomputed once the creation record arrives.
-            return Ok(());
+            return Ok(Vec::new());
         };
 
         let updates = self.store.updates_for_group(group_id)?;
@@ -712,6 +796,15 @@ impl<N: Network + 'static> Engine<N> {
         group.invited_at = state.invited_at;
         group.accepted_at = state.accepted_at;
 
+        // Anyone the group brought us into contact with is stored first, or the
+        // loop below would drop them: it reads membership out of the database,
+        // and a member who is not there is not merely missing a contact card —
+        // `save_group` rewrites `group_users` from this list, `signer_speaks_for`
+        // has no device to attribute their messages to, and peering never dials
+        // them. Go creates the row in the same place, as a side effect of
+        // consensus (`createNewUserIfNeeded`, chat/consensus_store.go:1021).
+        self.adopt_users_met_through_group(group_id, &group.users, &stack, state)?;
+
         // Membership comes from the consensus result, not the founding record.
         group.users.clear();
         for member in &state.users {
@@ -728,21 +821,155 @@ impl<N: Network + 'static> Engine<N> {
                 group_id,
                 actor: removed.actor,
             });
-            return Ok(());
+            return Ok(Vec::new());
         }
         if let Some(deleted) = &state.deleted_by {
             self.emit(Event::GroupRemoved {
                 group_id,
                 actor: deleted.actor,
             });
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         self.store.save_group(&group)?;
         self.emit(Event::GroupUpdated {
             group: Box::new(self.group_view(&group)),
         });
+
+        // Confirmations are minted only after the group has been written,
+        // because they go out at group scope and that scope is what has just
+        // been recomputed (chat/consensus_store.go:255).
+        let my_address = self.network.address();
+        let now = crate::now();
+        let mut minted = Vec::new();
+        for update in consensus::confirmation::owed(&stack, my_id, &my_address)? {
+            let confirmation = consensus::confirmation::mint(update, my_id, &self.key, now);
+            self.store.save_confirmation(&confirmation)?;
+            minted.push(confirmation);
+        }
+        Ok(minted)
+    }
+
+    /// Recompute a group and broadcast whatever confirmations that produced.
+    ///
+    /// Timestamps are forgeable, so confirmations are the protocol's answer to
+    /// an admin backdating an update: the earlier of two conflicting updates
+    /// wins unless the later one carries more of them. A device that computes
+    /// them and never sends them leaves the defence inert and, worse, disagrees
+    /// with a Go peer about which update is canonical.
+    async fn recompute_and_confirm(&self, group_id: Uuid) -> Result<()> {
+        for confirmation in self.recompute_group(group_id)? {
+            self.broadcast(&confirmation).await?;
+        }
         Ok(())
+    }
+
+    /// Store every user this group has introduced us to.
+    ///
+    /// A group of three where two people have never paired is the ordinary
+    /// case, not a corner one: each learns of the other from the invitation
+    /// that brought them in, and that record is the only copy of their device
+    /// group anyone will ever send.
+    ///
+    /// Only *accepted* updates are read. An invitation consensus rejected — one
+    /// from a stranger, or from a member without the right to invite — is a
+    /// stranger's claim about who somebody is, and adopting from it would let
+    /// any peer that can reach us write rows into our contact list.
+    fn adopt_users_met_through_group(
+        &self,
+        group_id: Uuid,
+        founding: &[User],
+        stack: &consensus::CanonicalStack,
+        state: &consensus::GroupState,
+    ) -> Result<()> {
+        let mut carried: Vec<User> = founding.to_vec();
+
+        for update in stack.accepted_updates() {
+            if !matches!(update.kind(), Ok(UpdateGroupType::InviteUser)) {
+                continue;
+            }
+            match crate::msgpack::from_slice::<User>(&update.data) {
+                Ok(user) => carried.push(user),
+                Err(error) => {
+                    tracing::warn!(%error, update = %update.id, "invitation carries no readable user")
+                }
+            }
+        }
+
+        for user in carried {
+            // The same filter Go applies (`chat/consensus_store.go:246`): a
+            // record only becomes a contact if the resolved state actually puts
+            // them in the group.
+            if state.is_member(user.id) || state.is_invited(user.id) {
+                self.adopt_group_user(&user, group_id)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Adopt one user we have met through a group, if they are new and their
+    /// record holds up.
+    ///
+    /// Returns whether a contact was created.
+    fn adopt_group_user(&self, user: &User, group_id: Uuid) -> Result<bool> {
+        if self.store.my_user_id().is_ok_and(|my_id| my_id == user.id) {
+            return Ok(false);
+        }
+        // Already known, from a pairing or from an earlier group. Their record
+        // was established by a stronger introduction than this one, and a group
+        // update is not authority to rewrite it.
+        if self.store.user(user.id)?.is_some() {
+            return Ok(false);
+        }
+
+        let refuse = |reason: &str| {
+            tracing::warn!(user = %user.id, %group_id, reason, "refusing a user carried by a group");
+            Ok(false)
+        };
+
+        if !crate::frames::identity::valid_user_name(&user.name) {
+            return refuse("the name is not acceptable");
+        }
+        if !device_group::user_has_valid_device_group(user) {
+            return refuse("the device group does not validate");
+        }
+        // Every device must claim the user it is filed under, or a device row
+        // lands under an id the record chose and `save_device`'s upsert would
+        // let it overwrite an unrelated device.
+        if user.devices.iter().any(|device| device.user_id != user.id) {
+            return refuse("a device in the group claims a different owner");
+        }
+        // A device address is a public key, so two users claiming one is a
+        // contradiction rather than a merge.
+        for device in &user.devices {
+            if self
+                .store
+                .device_owner(&device.address)?
+                .is_some_and(|owner| owner != user.id)
+            {
+                return refuse("a device is already held by another user");
+            }
+        }
+
+        let mut adopted = shareable(user);
+        adopted.introduction_method = crate::types::introduction::GROUP.to_string();
+        adopted.introduction_time = crate::now();
+        adopted.introduction_metadata = group_id;
+        // Somebody met in a group is not somebody this device's owner chose:
+        // no conversation is opened for them, and they are not accepted until
+        // an invitation is answered — which is what the auto-join policy reads.
+        adopted.open_dm = false;
+        adopted.accepted = false;
+        // Go dials them immediately (`UserConnectionDesired`). Here peering
+        // decides from activity, so a contact met a second ago has to look
+        // active or nothing would ever reach out to them.
+        adopted.last_activity = crate::now();
+
+        self.store.save_user(&adopted)?;
+        self.emit(Event::UserAdded {
+            user: self.user_view(&adopted, false),
+        });
+        Ok(true)
     }
 
     // ---------------------------------------------------------------------
@@ -1388,6 +1615,40 @@ impl<N: Network + 'static> Engine<N> {
             .await
     }
 
+    /// Show or hide a direct conversation.
+    ///
+    /// Not a local view toggle: `SetOpen` is sync-scoped, so the choice reaches
+    /// this profile's other devices. Nothing is discarded — the contact, their
+    /// messages and their device group all stay — which is what makes it the
+    /// reversible counterpart to blocking, and the way back to somebody whose
+    /// conversation was closed.
+    pub async fn set_open_dm(&self, user_id: Uuid, open: bool) -> Result<()> {
+        self.apply_update_dm(user_id, UpdateDmType::SetOpen, vec![u8::from(open)])
+            .await
+    }
+
+    /// Stamp a conversation as opened now.
+    ///
+    /// Local on both implementations — there is nothing to send — so this is
+    /// the one conversation setting that is not a frame. A thread holding an
+    /// unsent draft should stay where the user left it rather than sinking to
+    /// the age of its last message, and this is what the ordering reads.
+    pub fn set_last_opened(&self, conversation: Uuid) -> Result<()> {
+        let now = crate::now();
+        self.store.note_conversation_opened(conversation, now)?;
+
+        if let Some(group) = self.store.group(conversation)? {
+            self.emit(Event::GroupUpdated {
+                group: Box::new(self.group_view(&group)),
+            });
+        } else if let Some(user) = self.store.user(conversation)? {
+            self.emit(Event::UserUpdated {
+                user: self.user_view(&user, false),
+            });
+        }
+        Ok(())
+    }
+
     /// Give a contact a local nickname, or clear it with an empty string.
     pub async fn set_user_alias(&self, user_id: Uuid, alias: &str) -> Result<()> {
         if !alias.is_empty() && !crate::frames::identity::valid_user_name(alias) {
@@ -1591,26 +1852,170 @@ impl<N: Network + 'static> Engine<N> {
 
         let my_id = self.store.my_user_id()?;
         let mut profile = self.store.profile()?.ok_or(Error::NoProfile)?;
+        let previous = profile.name.clone();
         profile.name = name.to_string();
         self.store.save_user(&profile)?;
+
+        // Profile updates are replayed in timestamp order, and timestamps have
+        // one-second resolution — so two renames in the same second would be
+        // ordered by their random ids, and the older one could win. Advancing
+        // past the newest we hold is the same rule `sign_update_group` follows,
+        // for the same reason.
+        let latest_known = self
+            .store
+            .updates_for_user(my_id)?
+            .iter()
+            .map(|update| update.timestamp)
+            .max()
+            .unwrap_or(0);
 
         let mut update = UpdateUser::new(
             my_id,
             crate::frames::update::UpdateUserType::UpdateName,
             name.as_bytes().to_vec(),
-            crate::now(),
+            crate::now().max(latest_known + 1),
         );
         update.saved_at = crate::now();
+        update.previous_data = previous.into_bytes();
 
         let body = crate::msgpack::to_vec(&update)?;
         let container = SignedContainer::create(&self.key, body);
         update.signed = SignedFrame::from_container(&container);
+
+        // Stored, not merely broadcast: a device that was offline for the
+        // rename is caught up with the frame, and our other devices replay it
+        // to reach the same name rather than being told what to write.
+        self.store.save_update_user(&update)?;
 
         self.emit(Event::UserUpdated {
             user: self.user_view(&profile, true),
         });
         self.broadcast(&update).await?;
         Ok(())
+    }
+
+    /// Apply a profile change somebody made to themselves.
+    async fn handle_update_user(&self, peer: &str, payload: &[u8]) -> Result<()> {
+        let (mut update, signed) = self.unpack_signed::<UpdateUser>(payload)?;
+        update.signed = signed;
+
+        // A profile is the user's own to change and nobody else's, so the
+        // author and the target are the same person by definition.
+        if !self.signer_speaks_for(&update.signed.signer, update.target, update.timestamp)? {
+            return Err(Error::InvalidFrame(
+                "update user signer does not speak for the user it changes".into(),
+            ));
+        }
+        if let Some(target) = self.store.user(update.target)? {
+            if target.blocked {
+                // Acknowledged, so a blocked contact stops offering it.
+                self.send_ack(peer, update.id, FrameType::UpdateUser).await;
+                return Ok(());
+            }
+        }
+        if self.store.has_frame(update.id, FrameType::UpdateUser)? {
+            self.send_ack(peer, update.id, FrameType::UpdateUser).await;
+            return Ok(());
+        }
+        if !update_user_payload_is_valid(&update) {
+            self.send_ack(peer, update.id, FrameType::UpdateUser).await;
+            return Err(Error::InvalidFrame("unusable update user payload".into()));
+        }
+
+        update.saved_at = crate::now();
+        update.previous_data = self.previous_profile_value(&update)?;
+        self.store.save_update_user(&update)?;
+        self.send_ack(peer, update.id, FrameType::UpdateUser).await;
+
+        self.replay_profile_updates(update.target)?;
+        self.broadcast(&update).await?;
+        Ok(())
+    }
+
+    /// Rebuild a user's profile from every update we hold for them.
+    ///
+    /// Replaying rather than applying the update that just arrived is what
+    /// makes the outcome independent of arrival order — the same reason group
+    /// state is rebuilt rather than mutated. It is also what makes a rename
+    /// signed by a device that was later revoked drop out of the result.
+    fn replay_profile_updates(&self, target: Uuid) -> Result<()> {
+        use crate::frames::update::UpdateUserType;
+
+        let Some(mut user) = self.store.user(target)? else {
+            // A profile change for somebody we have never met. The frame is
+            // kept and relayed; there is no row to apply it to.
+            return Ok(());
+        };
+
+        let mut name = user.name.clone();
+        let mut images = user.image_ids();
+
+        for update in self.store.updates_for_user(target)? {
+            if !self.signer_speaks_for(&update.signed.signer, target, update.timestamp)? {
+                continue;
+            }
+            match update.kind() {
+                Ok(UpdateUserType::UpdateName) => {
+                    if let Ok(new_name) = std::str::from_utf8(&update.data) {
+                        if crate::frames::identity::valid_user_name(new_name) {
+                            name = new_name.to_string();
+                        }
+                    }
+                }
+                Ok(UpdateUserType::UpdateImage) => {
+                    if let Ok(image) = Uuid::from_slice(&update.data) {
+                        if !images.contains(&image) {
+                            images.push(image);
+                        }
+                    }
+                }
+                // Key rolling and encrypted device management are their own
+                // gaps; replaying them here would apply half a feature.
+                _ => {}
+            }
+        }
+
+        let images = crate::frames::identity::join_uuid_list(&images);
+        if name == user.name && images == user.images {
+            return Ok(());
+        }
+
+        user.name = name;
+        user.images = images;
+        self.store.save_user(&user)?;
+        self.emit(Event::UserUpdated {
+            user: self.user_view(&user, false),
+        });
+        Ok(())
+    }
+
+    /// The value an update replaces, kept so the interface can say what a name
+    /// changed *from*.
+    fn previous_profile_value(&self, update: &UpdateUser) -> Result<Vec<u8>> {
+        use crate::frames::update::UpdateUserType;
+
+        if !matches!(update.kind(), Ok(UpdateUserType::UpdateName)) {
+            return Ok(Vec::new());
+        }
+        // The newest earlier rename, or failing that whatever the row says now.
+        let earlier = self
+            .store
+            .updates_for_user(update.target)?
+            .into_iter()
+            .rfind(|stored| {
+                matches!(stored.kind(), Ok(UpdateUserType::UpdateName))
+                    && stored.timestamp < update.timestamp
+            })
+            .map(|stored| stored.data);
+
+        Ok(match earlier {
+            Some(data) => data,
+            None => self
+                .store
+                .user(update.target)?
+                .map(|user| user.name.into_bytes())
+                .unwrap_or_default(),
+        })
     }
 
     // ---------------------------------------------------------------------
@@ -2060,6 +2465,26 @@ impl<N: Network + 'static> Engine<N> {
         }
     }
 
+    /// Give up on messages that have never reached anybody.
+    ///
+    /// Go schedules a timer per message at send time and re-runs the same query
+    /// at start-up (`chat/database.go:180`); the timers do not survive a
+    /// restart, so the sweep is the part that actually decides. Four weeks with
+    /// no delivery record from any device is the threshold, and the flag is
+    /// advisory — the message stays, and the reference flow stops offering it
+    /// to anyone but our own devices.
+    pub fn mark_stale_messages_undeliverable(&self) -> Result<Vec<Uuid>> {
+        let cutoff = crate::now() - crate::UNDELIVERABLE_AFTER_SECONDS;
+        let marked = self.store.mark_stale_messages_undeliverable(cutoff)?;
+
+        for message_id in &marked {
+            self.emit(Event::MessageUndeliverable {
+                message_id: *message_id,
+            });
+        }
+        Ok(marked)
+    }
+
     /// Whether typing indicators are on for a conversation.
     fn typing_indicators_enabled_for(&self, thread: Uuid, message_type: FrameType) -> Result<bool> {
         let my_id = self.store.my_user_id()?;
@@ -2110,6 +2535,56 @@ impl<N: Network + 'static> Engine<N> {
         Ok(())
     }
 
+    /// Adopt a draft typed on another of this profile's devices.
+    async fn handle_draft(&self, peer: &str, payload: &[u8]) -> Result<()> {
+        let (mut draft, signed) = self.unpack_signed::<Draft>(payload)?;
+        draft.signed = signed;
+
+        // A draft never leaves the device group, so anything claiming to be one
+        // from outside it is not a draft at all.
+        let my_id = self.store.my_user_id()?;
+        if !self.signer_speaks_for(&draft.signed.signer, my_id, draft.timestamp)? {
+            return Err(Error::InvalidFrame(
+                "a draft must be signed by one of our own devices".into(),
+            ));
+        }
+
+        if self.store.has_frame(draft.id, FrameType::Draft)? {
+            self.send_ack(peer, draft.id, FrameType::Draft).await;
+            return Ok(());
+        }
+
+        // Newest wins, and an emptied draft wins a tie: two devices typing into
+        // the same thread in the same second must converge, and converging on
+        // "cleared" is the harmless direction. This is the rule at
+        // `chat/drafts.go:157`.
+        if let Some(existing) = self.store.draft_for_thread(draft.thread)? {
+            let stale = draft.timestamp < existing.timestamp
+                || (draft.timestamp == existing.timestamp && !draft.text.trim().is_empty());
+            if stale {
+                self.send_ack(peer, draft.id, FrameType::Draft).await;
+                return Ok(());
+            }
+        }
+
+        draft.saved = true;
+        draft.saved_at = crate::now();
+        self.store.save_draft(&draft)?;
+        self.send_ack(peer, draft.id, FrameType::Draft).await;
+
+        self.emit(Event::DraftUpdated {
+            draft: DraftView {
+                thread: draft.thread,
+                text: draft.text.clone(),
+            },
+        });
+
+        // Relayed onward, so a third device that was offline for the keystroke
+        // still ends up with it.
+        self.broadcast(&draft).await?;
+        Ok(())
+    }
+
     // ---------------------------------------------------------------------
     // Broadcast
     // ---------------------------------------------------------------------
@@ -2136,6 +2611,10 @@ impl<N: Network + 'static> Engine<N> {
         let raw = RawFrame::new(frame.frame_type().as_u16(), payload);
 
         let peers = self.peers.read().await;
+        let in_scope = targets.len();
+        let mut written = 0usize;
+        let mut offline = 0usize;
+
         for address in targets {
             // Skip anything the peer already told us it has.
             if self
@@ -2145,13 +2624,25 @@ impl<N: Network + 'static> Engine<N> {
             {
                 continue;
             }
+            if !peers.contains_key(&address) {
+                offline += 1;
+            }
             if let Some(peer) = peers.get(&address) {
+                written += 1;
                 // A full queue means the peer is not keeping up; dropping is
                 // correct, because the reference flow will offer the frame
                 // again on the next connection.
                 let _ = peer.sender.try_send(raw.clone());
             }
         }
+
+        // The commonest reason a frame appears to vanish is that nobody in its
+        // scope was connected, which is invisible from the outside.
+        tracing::debug!(
+            frame = ?frame.frame_type(), id = %frame.id(),
+            in_scope, written, offline,
+            "broadcast",
+        );
 
         Ok(())
     }
@@ -2356,7 +2847,20 @@ impl<N: Network + 'static> Engine<N> {
             }
             FrameType::AddUserRequestRejected => self.handle_add_user_rejected(peer).await,
             FrameType::AddUser => self.handle_add_user(peer, &frame.payload).await,
+            FrameType::UpdateDevice => self.handle_update_device(peer, &frame.payload).await,
+            FrameType::SyncDeviceRequest => {
+                self.handle_sync_device_request(peer, &frame.payload).await
+            }
+            FrameType::SyncDeviceRequestAccepted => {
+                self.handle_sync_device_request_accepted(peer, &frame.payload).await
+            }
+            FrameType::SyncDeviceRequestRejected => {
+                self.handle_sync_device_request_rejected(peer).await
+            }
             FrameType::UpdateDm => self.handle_update_dm(peer, &frame.payload).await,
+            FrameType::Confirmation => self.handle_confirmation(peer, &frame.payload).await,
+            FrameType::UpdateUser => self.handle_update_user(peer, &frame.payload).await,
+            FrameType::Draft => self.handle_draft(peer, &frame.payload).await,
             FrameType::File => self.handle_file(peer, &frame.payload).await,
             FrameType::ChunkOffer => self.handle_chunk_offer(peer, &frame.payload).await,
             FrameType::ChunkRequest => self.handle_chunk_request(peer, &frame.payload).await,
@@ -2430,6 +2934,15 @@ impl<N: Network + 'static> Engine<N> {
         }
 
         let my_id = self.store.my_user_id()?;
+
+        // A message that expired, or that predates the thread's clear cutoff,
+        // is refused rather than stored and swept: storing it would let gossip
+        // undo retention on every reconnection. Acknowledged so the peer stops
+        // offering it.
+        if self.already_gone(message.destination(my_id), message.written_at, message.delete_at)? {
+            self.send_ack(peer, message.id, FrameType::DirectMessage).await;
+            return Ok(());
+        }
         message.saved_at = crate::now();
         message.seen = message.author == my_id;
 
@@ -2483,6 +2996,13 @@ impl<N: Network + 'static> Engine<N> {
         }
 
         if self.store.has_frame(message.id, FrameType::GroupMessage)? {
+            self.send_ack(peer, message.id, FrameType::GroupMessage).await;
+            return Ok(());
+        }
+
+        // As for a direct message: what retention removed must not come back
+        // through the reference flow.
+        if self.already_gone(message.destination, message.written_at, message.delete_at)? {
             self.send_ack(peer, message.id, FrameType::GroupMessage).await;
             return Ok(());
         }
@@ -2562,18 +3082,26 @@ impl<N: Network + 'static> Engine<N> {
         creation.saved_at = crate::now();
         self.store.save_group_creation(&creation)?;
 
-        // Learn the founding devices, so their later frames can be attributed.
+        // Learn the founder, so their later frames can be attributed — and so
+        // the interface has a name for them. Until this emitted an event the
+        // client had no way to resolve the id mid-session: its user map is fed
+        // by the boot snapshot and by user events, and nothing else, so an
+        // admin who was not already a contact rendered as "Unknown" until the
+        // next restart.
         for user in &group.users {
-            self.store.save_user(user)?;
+            self.adopt_group_user(user, creation.id)?;
         }
         let mut stored = group.clone();
         stored.id = creation.id;
         self.store.save_group(&stored)?;
 
         self.send_ack(peer, creation.id, FrameType::GroupCreation).await;
-        self.recompute_group(creation.id)?;
+        self.recompute_and_confirm(creation.id).await?;
         self.broadcast(&creation).await?;
         self.reoffer_to_group_scope(creation.id).await?;
+        // The invitation can arrive before the record of the group it is for,
+        // in which case this is the first moment the policy can be applied.
+        self.auto_join_if_policy_allows(creation.id).await?;
         Ok(())
     }
 
@@ -2603,10 +3131,79 @@ impl<N: Network + 'static> Engine<N> {
 
         // Whether the update is actually accepted is consensus's decision, made
         // when the group is rebuilt.
-        self.recompute_group(update.target)?;
+        self.recompute_and_confirm(update.target).await?;
         self.emit_group_system_message(&update);
         self.broadcast(&update).await?;
         self.reoffer_to_group_scope(update.target).await?;
+        // Last, so the acceptance this may create is signed against the state
+        // everything above has already settled.
+        self.auto_join_if_policy_allows(update.target).await?;
+        Ok(())
+    }
+
+    /// Ingest a peer's confirmation of an update group.
+    ///
+    /// A confirmation is not wrapped in a signed container — it *is* a
+    /// signature — so attributing it to a device is the whole of the
+    /// authentication, and the three fields Go keeps off the wire are derived
+    /// from the update it refers to rather than believed.
+    async fn handle_confirmation(&self, peer: &str, payload: &[u8]) -> Result<()> {
+        let mut confirmation: Confirmation = crate::msgpack::from_slice(payload)?;
+
+        if self.store.has_frame(confirmation.id, FrameType::Confirmation)? {
+            self.send_ack(peer, confirmation.id, FrameType::Confirmation).await;
+            return Ok(());
+        }
+
+        confirmation.author = consensus::confirmation::attribute(&confirmation, |address| {
+            self.store.device_owner(address).ok().flatten()
+        })?;
+
+        // A blocked user's vote is discarded, but the peer that relayed it is
+        // acked anyway so it stops re-offering it.
+        if matches!(self.store.user(confirmation.author), Ok(Some(ref user)) if user.blocked) {
+            self.send_ack(peer, confirmation.id, FrameType::Confirmation).await;
+            return Ok(());
+        }
+
+        let Some(update) = self.store.update_group(confirmation.update_group_id)? else {
+            // The confirmation outran the update it refers to. Keep it so it
+            // counts the moment the update lands; with no destination yet there
+            // is nobody to relay it to, so the delivery record is written here
+            // rather than by `broadcast`.
+            confirmation.saved_at = crate::now();
+            self.store.save_confirmation(&confirmation)?;
+            self.store.record_delivery(&DeliveryRecord::new(
+                peer.to_string(),
+                confirmation.id,
+                FrameType::Confirmation,
+                crate::now(),
+            ))?;
+            self.send_ack(peer, confirmation.id, FrameType::Confirmation).await;
+            return Ok(());
+        };
+
+        confirmation.destination = update.target;
+        confirmation.custom_scope = update.custom_scope;
+
+        if let Some(group) = self.store.group(update.target)? {
+            if !consensus::confirmation::author_may_confirm(&group, confirmation.author) {
+                // Nothing to store, but ack regardless: the delivery record is
+                // only written on ack, so a silent drop is re-offered on every
+                // reference cycle forever.
+                self.send_ack(peer, confirmation.id, FrameType::Confirmation).await;
+                return Ok(());
+            }
+        }
+
+        confirmation.saved_at = crate::now();
+        self.store.save_confirmation(&confirmation)?;
+        self.send_ack(peer, confirmation.id, FrameType::Confirmation).await;
+
+        // A confirmation can flip which of two conflicting updates is
+        // canonical, so the group is rebuilt before the frame is relayed.
+        self.recompute_and_confirm(update.target).await?;
+        self.broadcast(&confirmation).await?;
         Ok(())
     }
 
@@ -2725,6 +3322,41 @@ impl<N: Network + 'static> Engine<N> {
                     None => false,
                 }
             }
+
+            FrameType::UpdateUser => match self.store.update_user(frame_id)? {
+                // A profile change reaches the same people the profile does:
+                // our own devices, the user it is about, and anyone who shares
+                // a group with them. Key rolling scopes to Sync and stays home.
+                Some(update) => {
+                    if update.scope(my_id) == Scope::Sync {
+                        peer_user == my_id
+                    } else {
+                        peer_user == my_id
+                            || peer_user == update.target
+                            || update.target == my_id
+                            || self
+                                .store
+                                .users_sharing_a_group_with(update.target)?
+                                .contains(&peer_user)
+                    }
+                }
+                None => false,
+            },
+
+            // A draft is nobody's business but this profile's own devices.
+            FrameType::Draft => peer_user == my_id && self.store.draft(frame_id)?.is_some(),
+
+            FrameType::Confirmation => match self.store.confirmation(frame_id)? {
+                // A confirmation reaches exactly the audience the update it
+                // refers to reaches.
+                Some(record) => self.peer_may_have(
+                    peer_user,
+                    my_id,
+                    record.update_group_id,
+                    FrameType::UpdateGroup,
+                )?,
+                None => false,
+            },
 
             FrameType::File => match self.store.file(frame_id)? {
                 // A file reaches whoever the message it hangs off reaches, so
@@ -2892,6 +3524,10 @@ impl<N: Network + 'static> Engine<N> {
             FrameType::ReadReceipt => self.handle_read_receipt(peer, &frame.payload).await,
             FrameType::File => self.handle_file(peer, &frame.payload).await,
             FrameType::UpdateDm => self.handle_update_dm(peer, &frame.payload).await,
+            FrameType::UpdateUser => self.handle_update_user(peer, &frame.payload).await,
+            FrameType::Draft => self.handle_draft(peer, &frame.payload).await,
+            FrameType::Confirmation => self.handle_confirmation(peer, &frame.payload).await,
+            FrameType::UpdateDevice => self.handle_update_device(peer, &frame.payload).await,
             other => {
                 // Loud, because this is what the omission above looked like:
                 // a frame accepted into catch-up, counted towards progress,
@@ -2917,6 +3553,18 @@ impl<N: Network + 'static> Engine<N> {
             introduction_time: user.introduction_time,
             last_activity: user.last_activity,
             muted_until: user.muted_until,
+            // Every one of these is already in the `users` row; the view simply
+            // stopped carrying them, which left each control on the client
+            // seeded from its default rather than from the stored value.
+            retention: user.retention,
+            clear_before: user.clear_before,
+            open_dm: user.open_dm,
+            notes: user.notes.clone(),
+            read_receipts_overridden: user.read_receipts_overridden,
+            read_receipts_enabled: user.read_receipts_enabled,
+            typing_indicators_overridden: user.typing_indicators_overridden,
+            typing_indicators_enabled: user.typing_indicators_enabled,
+            last_opened: user.last_opened,
             online: false,
         }
     }
@@ -2947,6 +3595,7 @@ impl<N: Network + 'static> Engine<N> {
             last_activity: group.last_activity,
             muted_until: group.muted_until,
             retention: group.retention,
+            last_opened: group.last_opened,
             restrict_posting: group.restrict_posting,
             restrict_group_edits: group.restrict_group_edits,
             restrict_user_management: group.restrict_user_management,
@@ -3015,6 +3664,26 @@ fn shareable(user: &User) -> User {
     shared.alias = String::new();
     shared.notes = String::new();
     shared
+}
+
+/// Whether a profile update carries a payload its type can use.
+///
+/// Checked before the frame is stored, because a stored update is replayed on
+/// every recomputation and an unusable one would be re-examined forever.
+fn update_user_payload_is_valid(update: &UpdateUser) -> bool {
+    use crate::frames::update::UpdateUserType::*;
+
+    match update.kind() {
+        Ok(UpdateName) => std::str::from_utf8(&update.data)
+            .map(crate::frames::identity::valid_user_name)
+            .unwrap_or(false),
+        Ok(UpdateImage) => Uuid::from_slice(&update.data).is_ok(),
+        Ok(AddEncryptedDevice) | Ok(RemoveEncryptedDevice) => !update.data.is_empty(),
+        // Key material and encrypted device names have no length this layer can
+        // check; Go says the same (`chat/update_user.go:130`).
+        Ok(_) => true,
+        Err(_) => false,
+    }
 }
 
 /// Which of a group's three restrictions is being changed.

@@ -280,3 +280,40 @@ fn a_file_with_no_key_encodes_its_empty_fields_as_bin() {
     assert!(decoded.key.is_empty());
     assert!(decoded.nonce.is_empty());
 }
+
+#[test]
+fn a_chunk_frame_is_the_bare_bytes_with_no_wrapper() {
+    // Every other frame is a MessagePack structure. A chunk is not: Go's
+    // `chunk.getPayload()` returns `c.Data` directly, and `handleChunk`
+    // identifies it with `blake3.Sum256(payload)` over the whole frame.
+    //
+    // Wrapping it — which the port did — produces a payload that hashes to
+    // something nobody recognises. Two ports doing the same thing agree with
+    // each other and with no one else, so images moved happily between two
+    // Rust clients and never reached a Go one. That is a failure mode no
+    // amount of Rust-to-Rust testing can see, which is why this test compares
+    // against the Go rule rather than against ourselves.
+    use bounce_core::crypto;
+    use bounce_core::frames::file::split_into_chunks;
+
+    let data: Vec<u8> = (0..5000u32).map(|index| (index % 251) as u8).collect();
+    let chunks = split_into_chunks(Uuid::new_v4(), &data);
+    assert_eq!(chunks.len(), 1);
+
+    // What the wire carries is the chunk, byte for byte.
+    let payload = &chunks[0].data;
+    assert_eq!(payload.as_slice(), data.as_slice());
+
+    // And the identity of a chunk is the hash of exactly that, which is what
+    // the Go side computes.
+    assert_eq!(chunks[0].hash, hex::encode(crypto::hash(&data)));
+
+    // A MessagePack encoding of the same chunk hashes to something else
+    // entirely — the shape of the bug.
+    let wrapped = msgpack::to_vec(&chunks[0]).expect("encodes");
+    assert_ne!(
+        hex::encode(crypto::hash(&wrapped)),
+        chunks[0].hash,
+        "a wrapped chunk must not be mistaken for a valid one",
+    );
+}

@@ -45,12 +45,13 @@
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
-use crate::frames::file::{self, Chunk, ChunkOffer, ChunkRequest, ChunkUnavailable, File};
+use crate::frames::file::{self, ChunkOffer, ChunkRequest, ChunkUnavailable, File};
 use crate::frames::message::{DirectMessage, FileAttachment, GroupMessage, ImageAttachment};
+use crate::frames::update::{UpdateUser, UpdateUserType};
 use crate::frames::SignedFrame;
 use crate::net::Network;
 use crate::signed::SignedContainer;
-use crate::types::{FileType, FrameType, Scope};
+use crate::types::{FileType, FrameType, Scope, UpdateGroupType};
 use crate::wire::RawFrame;
 
 use super::event::{AttachmentView, MessageView};
@@ -208,9 +209,125 @@ impl<N: Network + 'static> Engine<N> {
         Ok(view)
     }
 
+    /// Set this profile's picture.
+    ///
+    /// An avatar is an ordinary distributed file with two differences: its type
+    /// says what it is for, and its scope is [`Scope::Global`] rather than one
+    /// conversation — a picture is shown to everyone who knows you, so it has
+    /// to reach all of them. The [`UpdateUser`] that follows is what tells
+    /// contacts to look for it; the file itself is fetched the same way any
+    /// attachment is.
+    pub async fn set_profile_image(&self, image: OutgoingAttachment) -> Result<()> {
+        let my_id = self.store.my_user_id()?;
+        let mut profile = self.store.profile()?.ok_or(Error::NoProfile)?;
+
+        let record = self.stage_image(&image, my_id, my_id, FileType::UserImage)?;
+
+        // Go keeps the history as a comma-separated list and reads the last
+        // entry as current, so an older device shown an earlier id still has
+        // something to render rather than nothing.
+        profile.images = push_image(&profile.images, record.id);
+        self.store.save_user(&profile)?;
+
+        let mut update = UpdateUser::new(
+            my_id,
+            UpdateUserType::UpdateImage,
+            record.id.as_bytes().to_vec(),
+            self.next_profile_update_timestamp(my_id)?,
+        );
+        update.saved_at = crate::now();
+
+        let body = crate::msgpack::to_vec(&update)?;
+        let container = SignedContainer::create(&self.key, body);
+        update.signed = SignedFrame::from_container(&container);
+        self.store.save_update_user(&update)?;
+
+        self.emit(Event::UserUpdated {
+            user: self.user_view(&profile, true),
+        });
+
+        self.broadcast(&update).await?;
+        self.announce_files(std::slice::from_ref(&record)).await?;
+        Ok(())
+    }
+
+    /// Set a group's picture.
+    ///
+    /// Unlike a profile picture this goes through group consensus, because a
+    /// group's appearance is shared state that any admin may change and two
+    /// admins may change at once.
+    pub async fn set_group_image(&self, group_id: Uuid, image: OutgoingAttachment) -> Result<()> {
+        let my_id = self.store.my_user_id()?;
+        let group = self.store.group(group_id)?.ok_or(Error::GroupNotFound)?;
+
+        if group.restrict_group_edits && !group.admin_ids().contains(&my_id) {
+            return Err(Error::NotPermitted("editing is restricted to admins"));
+        }
+
+        let record = self.stage_image(&image, my_id, group_id, FileType::GroupImage)?;
+
+        // The file is announced before the update that names it, or a member
+        // acts on an id they cannot yet fetch.
+        self.announce_files(std::slice::from_ref(&record)).await?;
+
+        let update = self.sign_update_group(
+            my_id,
+            group_id,
+            UpdateGroupType::SetImage,
+            record.id.as_bytes().to_vec(),
+        )?;
+        self.apply_update_group(update).await
+    }
+
+    /// A timestamp strictly newer than any profile update we hold.
+    ///
+    /// Profile updates replay in timestamp order and timestamps have
+    /// one-second resolution, so two changes in the same second would be
+    /// ordered by their random ids and the older one could win.
+    fn next_profile_update_timestamp(&self, user_id: Uuid) -> Result<i64> {
+        let latest = self
+            .store
+            .updates_for_user(user_id)?
+            .iter()
+            .map(|update| update.timestamp)
+            .max()
+            .unwrap_or(0);
+        Ok(crate::now().max(latest + 1))
+    }
+
+    /// Store an image as a globally scoped file, ready to be announced.
+    fn stage_image(
+        &self,
+        image: &OutgoingAttachment,
+        author: Uuid,
+        destination: Uuid,
+        kind: FileType,
+    ) -> Result<File> {
+        if !image.is_image {
+            return Err(Error::InvalidFrame("a picture is expected here".into()));
+        }
+
+        self.stage_file(
+            image,
+            // An avatar hangs off the thing it depicts rather than off a
+            // message, which is what `attached_to` means for these types.
+            destination,
+            author,
+            Scope::Global,
+            destination,
+            crate::now(),
+            kind,
+        )
+    }
+
     /// The assembled bytes of a file, once every chunk is present.
     pub fn file_data(&self, file_id: Uuid) -> Result<Option<Vec<u8>>> {
         self.store.file_data(file_id)
+    }
+
+    /// A file's metadata, for callers that need to know what it is for.
+    pub fn file(&self, file_id: Uuid) -> Result<Option<File>> {
+        self.store.file(file_id)
     }
 
     /// Split each attachment into chunks and store it, signed and ready to
@@ -241,6 +358,32 @@ impl<N: Network + 'static> Engine<N> {
         destination: Uuid,
         written_at: i64,
     ) -> Result<File> {
+        self.stage_file(
+            attachment,
+            message_id,
+            author,
+            scope,
+            destination,
+            written_at,
+            FileType::MessageAttachment,
+        )
+    }
+
+    /// Store a file, signed and ready to serve, without announcing anything.
+    ///
+    /// `kind` is on the wire and therefore inside the signature, so it has to
+    /// be decided here rather than patched onto the record afterwards.
+    #[allow(clippy::too_many_arguments)]
+    fn stage_file(
+        &self,
+        attachment: &OutgoingAttachment,
+        attached_to: Uuid,
+        author: Uuid,
+        scope: Scope,
+        destination: Uuid,
+        written_at: i64,
+        kind: FileType,
+    ) -> Result<File> {
         if attachment.data.is_empty() {
             return Err(Error::InvalidFrame("refusing to send an empty file".into()));
         }
@@ -259,8 +402,8 @@ impl<N: Network + 'static> Engine<N> {
             signed: SignedFrame::default(),
             id: file_id,
             name: attachment.name.clone(),
-            file_type: FileType::MessageAttachment as i64,
-            attached_to: message_id,
+            file_type: kind as i64,
+            attached_to,
             hash: hex::encode(crate::crypto::hash(&attachment.data)),
             size: attachment.data.len() as i64,
             chunk_size: crate::CHUNK_SIZE as i64,
@@ -297,6 +440,11 @@ impl<N: Network + 'static> Engine<N> {
     /// Broadcast each file's metadata, then advertise every chunk of it.
     async fn announce_files(&self, files: &[File]) -> Result<()> {
         for record in files {
+            tracing::info!(
+                file = %record.id, name = %record.name, size = record.size,
+                chunks = record.chunk_hashes().len(), scope = record.scope,
+                "announcing a file",
+            );
             self.broadcast(record).await?;
             for hash in record.chunk_hashes() {
                 self.offer_chunk(record, &hash).await?;
@@ -331,6 +479,7 @@ impl<N: Network + 'static> Engine<N> {
         let container = SignedContainer::create(&self.key, body);
         offer.signed = SignedFrame::from_container(&container);
 
+        tracing::debug!(file = %record.id, hash = %hash, "offering a chunk");
         self.broadcast(&offer).await
     }
 
@@ -382,6 +531,11 @@ impl<N: Network + 'static> Engine<N> {
         record.wanted = record.is_embedded();
         record.downloaded = false;
 
+        tracing::info!(
+            file = %record.id, name = %record.name, size = record.size,
+            chunks = hashes.len(), wanted = record.wanted,
+            "accepted a file record",
+        );
         self.store.save_file(&record)?;
         for (index, hash) in hashes.iter().enumerate() {
             self.store.save_chunk(record.id, index as i64, hash, None)?;
@@ -429,16 +583,26 @@ impl<N: Network + 'static> Engine<N> {
             .store
             .record_chunk_location(&offer.hash, &offer.location, offer.timestamp)?
         {
+            tracing::trace!(hash = %offer.hash, "a chunk offer we already had");
             return Ok(());
         }
+        tracing::debug!(
+            file = %offer.file_id, hash = %offer.hash, from = %offer.location,
+            "a chunk was offered",
+        );
         self.broadcast(&offer).await?;
 
         let Some(record) = self.store.file(offer.file_id)? else {
             // Metadata we have not seen yet. The location is remembered, and
             // the request goes out when the file record arrives.
+            tracing::debug!(file = %offer.file_id, "offered a chunk of a file we do not know yet");
             return Ok(());
         };
-        if !record.wanted || self.store.has_chunk(&offer.hash)? {
+        if !record.wanted {
+            tracing::debug!(file = %offer.file_id, "not fetching a file we do not want");
+            return Ok(());
+        }
+        if self.store.has_chunk(&offer.hash)? {
             return Ok(());
         }
 
@@ -453,19 +617,15 @@ impl<N: Network + 'static> Engine<N> {
 
         match self.store.chunk_data(&request.hash)? {
             Some(data) => {
-                let chunk = Chunk {
-                    id: Uuid::nil(),
-                    file_id: Uuid::nil(),
-                    hash: request.hash.clone(),
-                    encrypted_hash: String::new(),
-                    index: 0,
-                    downloaded: true,
-                    data,
-                };
-                self.send_to(peer, RawFrame::new(FrameType::Chunk.as_u16(), chunk.encode()?))
+                tracing::debug!(hash = %request.hash, to = %peer, bytes = data.len(), "serving a chunk");
+                // The payload is the chunk itself. See `frames::file::Chunk`:
+                // the receiver hashes the whole frame to identify it, so any
+                // wrapper at all makes the chunk unrecognisable.
+                self.send_to(peer, RawFrame::new(FrameType::Chunk.as_u16(), data))
                     .await;
             }
             None => {
+                tracing::warn!(hash = %request.hash, to = %peer, "asked for a chunk we do not have");
                 let reply = ChunkUnavailable { hash: request.hash };
                 self.send_to(
                     peer,
@@ -483,15 +643,23 @@ impl<N: Network + 'static> Engine<N> {
     /// does. A peer that sends bytes we never asked for simply matches no
     /// outstanding chunk and is dropped.
     pub(super) async fn handle_chunk(&self, _peer: &str, payload: &[u8]) -> Result<()> {
-        let chunk: Chunk = crate::msgpack::from_slice(payload)?;
-        if chunk.data.is_empty() || chunk.data.len() > crate::CHUNK_SIZE {
+        // The payload is the chunk, unwrapped. Hashing it is the only way to
+        // learn which chunk it is.
+        if payload.is_empty() || payload.len() > crate::CHUNK_SIZE {
             return Err(Error::InvalidFrame("chunk is not a plausible size".into()));
         }
 
-        let hash = chunk.computed_hash();
+        let hash = hex::encode(crate::crypto::hash(payload));
         let Some(file_id) = self.store.file_for_chunk(&hash)? else {
+            // Either a chunk we never asked for, or — the interop failure —
+            // one whose framing does not match what we hash.
+            tracing::warn!(
+                bytes = payload.len(), hash = %hash,
+                "a chunk arrived that matches no file we know",
+            );
             return Ok(());
         };
+        tracing::debug!(file = %file_id, hash = %hash, bytes = payload.len(), "a chunk arrived");
         let Some(record) = self.store.file(file_id)? else {
             return Ok(());
         };
@@ -504,8 +672,7 @@ impl<N: Network + 'static> Engine<N> {
             .iter()
             .position(|candidate| candidate == &hash)
             .unwrap_or(0) as i64;
-        self.store
-            .save_chunk(file_id, index, &hash, Some(&chunk.data))?;
+        self.store.save_chunk(file_id, index, &hash, Some(payload))?;
 
         // Having it means we can serve it.
         self.offer_chunk(&record, &hash).await?;
@@ -534,6 +701,7 @@ impl<N: Network + 'static> Engine<N> {
 
     /// Ask one device for one chunk.
     async fn request_chunk(&self, hash: &str, location: &str) {
+        tracing::debug!(hash = %hash, from = %location, "requesting a chunk");
         let request = ChunkRequest {
             hash: hash.to_string(),
         };
@@ -674,4 +842,19 @@ fn attach(
             });
         }
     }
+}
+
+/// Append an image id to a user's or group's image history.
+///
+/// Kept as a comma-separated list with the current picture last, matching Go.
+/// The history is what lets a device that only ever heard about an earlier id
+/// still render something rather than nothing.
+fn push_image(existing: &str, image: Uuid) -> String {
+    if existing.is_empty() {
+        return image.to_string();
+    }
+    if existing.split(',').any(|id| id == image.to_string()) {
+        return existing.to_string();
+    }
+    format!("{existing},{image}")
 }

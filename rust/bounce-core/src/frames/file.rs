@@ -250,8 +250,23 @@ impl ChunkUnavailable {
 
 /// One piece of a file.
 ///
-/// Only `data` goes on the wire; the chunk is identified by hashing what
-/// arrives, so a peer cannot mislabel a chunk to poison a download.
+/// ## The wire form is the bare bytes
+///
+/// Every other frame in the protocol is a MessagePack structure. A chunk is
+/// not: its frame payload *is* the chunk, with no header of any kind, because
+/// the receiver identifies it by hashing the whole payload —
+/// `blake3.Sum256(payload)` in `chat/file.go`. That is also what makes a chunk
+/// unforgeable without a signature: a peer cannot mislabel one, because the
+/// name is the content.
+///
+/// Encoding this struct with MessagePack and sending that instead produces a
+/// payload that hashes to nothing either side recognises. Two ports doing it
+/// agree with each other and with nobody else, which is exactly the shape the
+/// bug took — images moved fine between two Rust clients and never reached a
+/// Go one.
+///
+/// So the fields below are storage, and [`Chunk::data`] alone is the frame.
+/// There is deliberately no `encode`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Chunk {
     #[serde(skip)]
@@ -272,10 +287,6 @@ pub struct Chunk {
 }
 
 impl Chunk {
-    pub fn encode(&self) -> Result<Vec<u8>> {
-        msgpack::to_vec(self)
-    }
-
     /// The hash the data actually has.
     pub fn computed_hash(&self) -> String {
         hex::encode(crate::crypto::hash(&self.data))
@@ -475,19 +486,26 @@ mod tests {
     }
 
     #[test]
-    fn only_chunk_data_goes_on_the_wire() {
+    fn the_wire_form_of_a_chunk_is_the_chunk() {
+        // This test used to assert the opposite — that a chunk was encoded as
+        // a MessagePack map with a `Data` key — and in doing so it held the
+        // interop bug in place. Go sends `c.Data` and identifies what arrives
+        // with `blake3.Sum256(payload)` over the entire frame, so any wrapper
+        // at all makes the chunk unrecognisable to every other implementation.
         let chunk = &split_into_chunks(Uuid::new_v4(), b"payload")[0];
-        let encoded = chunk.encode().unwrap();
-        let text = String::from_utf8_lossy(&encoded);
 
-        assert!(text.contains("Data"));
-        assert!(!text.contains("Hash"));
-        assert!(!text.contains("Index"));
-        assert!(!text.contains("FileID"));
+        // No framing, no field names, no length prefix of our own.
+        assert_eq!(chunk.data, b"payload");
 
-        let decoded: Chunk = msgpack::from_slice(&encoded).unwrap();
-        assert_eq!(decoded.data, chunk.data);
-        // The receiver recomputes the identity rather than trusting it.
-        assert_eq!(decoded.computed_hash(), chunk.hash);
+        // The identity is the hash of exactly those bytes, which is the only
+        // thing the receiver has to go on.
+        assert_eq!(chunk.computed_hash(), chunk.hash);
+        assert!(chunk.matches_expected_hash(&chunk.hash));
+
+        // And bytes that hash to something else are refused, which is what
+        // makes a chunk safe to accept without a signature.
+        let mut tampered = chunk.clone();
+        tampered.data = b"different".to_vec();
+        assert!(!tampered.matches_expected_hash(&chunk.hash));
     }
 }

@@ -23,6 +23,7 @@ import {
   DeliveredIcon,
   EmojiIcon,
   InfoIcon,
+  JumpToBottomIcon,
   MoreIcon,
   SendIcon,
   SendingIcon,
@@ -39,6 +40,7 @@ import {
 import { MessageText } from './MessageText';
 import { dismissNotifications, setTimelineAtBottom } from './notifications';
 import { LOCAL_USER, SystemMessageRow, type DisplayNames } from './SystemMessage';
+import { typingAvatarIds, typingLabel } from './typing';
 import { useVisibleRange } from './useVisibleRange';
 import type { Message, SystemMessage } from '../preload';
 import type { Conversation as ConversationSummary, State } from './state';
@@ -49,8 +51,27 @@ import type { Conversation as ConversationSummary, State } from './state';
  */
 const ESTIMATED_ROW_HEIGHT = 56;
 
+/**
+ * How far above the end the reader has to be before the jump control appears.
+ *
+ * Go shows its icon when the content is taller than 2.5 screens *and* the
+ * offset is more than 2.5 screens from the end (`ui/chat_history.go:576-589`),
+ * which is the same thing as being more than 1.5 screens from the bottom: the
+ * last screenful is the viewport itself.
+ */
+const JUMP_TO_BOTTOM_SCREENS = 1.5;
+
+/**
+ * Renders before the reveal is abandoned.
+ *
+ * Scrolling to a row that is not mounted takes a pass to move the window over
+ * it and another to find it. A handful of passes is generous; a count at all is
+ * what stops a bad height estimate from looping.
+ */
+const MAX_REVEAL_ATTEMPTS = 8;
+
 /** One row of the timeline: either a message or a status change. */
-type Entry =
+export type Entry =
   | { kind: 'message'; at: number; id: string; message: Message }
   | { kind: 'system'; at: number; id: string; system: SystemMessage };
 
@@ -95,10 +116,18 @@ export function ConversationView({
 
   const [viewerImage, setViewerImage] = React.useState<{ src: string; alt: string } | null>(null);
 
+  // The header avatar's photo. The summary carries no images — it is derived
+  // from both tables — so it is looked up here from whichever one owns the id.
+  const images =
+    conversation.kind === 'group'
+      ? state.groups[conversation.id]?.images
+      : state.users[conversation.id]?.images;
+
   return (
     <div className="conversation">
       <ConversationHeader
         conversation={conversation}
+        images={images}
         onLeaveGroup={onLeaveGroup}
         onCopyAddress={onCopyAddress}
         onShowDetails={onShowDetails}
@@ -110,7 +139,7 @@ export function ConversationView({
         systemMessages={systemMessages}
         state={state}
         isGroup={conversation.kind === 'group'}
-        typingCount={typing.length}
+        typing={typing}
         onOpenImage={(src, alt) => setViewerImage({ src, alt })}
       />
 
@@ -138,11 +167,13 @@ export function ConversationView({
 
 function ConversationHeader({
   conversation,
+  images,
   onLeaveGroup,
   onCopyAddress,
   onShowDetails,
 }: {
   conversation: ConversationSummary;
+  images: readonly string[] | undefined;
   onLeaveGroup: () => void;
   onCopyAddress: () => void;
   onShowDetails: () => void;
@@ -169,6 +200,7 @@ function ConversationHeader({
       <Avatar
         id={conversation.id}
         name={conversation.name}
+        images={images}
         size={32}
         online={conversation.online}
       />
@@ -267,13 +299,31 @@ function buildEntries(messages: Message[], systemMessages: SystemMessage[]): Ent
   return entries.sort((a, b) => a.at - b.at || (a.id < b.id ? -1 : 1));
 }
 
+/**
+ * The first row the reader has not seen, or -1 when the thread is fully read.
+ *
+ * Only an incoming message counts: a status row is not something to be read,
+ * and one's own message never is. Go walks the same list with the same test
+ * (`ui/chat_history.go:534-551`), skipping anything that does not count as
+ * unread and stopping at the first unseen item.
+ */
+export function firstUnreadIndex(entries: readonly Entry[]): number {
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index];
+    if (entry.kind !== 'message') continue;
+    if (entry.message.outgoing) continue;
+    if (!entry.message.seen) return index;
+  }
+  return -1;
+}
+
 function Timeline({
   threadId,
   messages,
   systemMessages,
   state,
   isGroup,
-  typingCount,
+  typing,
   onOpenImage,
 }: {
   threadId: string;
@@ -281,15 +331,29 @@ function Timeline({
   systemMessages: SystemMessage[];
   state: State;
   isGroup: boolean;
-  typingCount: number;
+  /** User ids currently composing, oldest first. */
+  typing: readonly string[];
   onOpenImage: (src: string, alt: string) => void;
 }) {
   const scrollRef = React.useRef<HTMLDivElement>(null);
   const atBottomRef = React.useRef(true);
 
+  // The row to bring into view on opening, and how many passes it has had. Refs
+  // rather than state: the reveal has to survive the renders it takes to get
+  // the row mounted, and none of it is anything to draw.
+  const revealRef = React.useRef<number | null>(null);
+  const revealAttemptsRef = React.useRef(0);
+
+  const [farFromBottom, setFarFromBottom] = React.useState(false);
+
   const entries = React.useMemo(
     () => buildEntries(messages, systemMessages),
     [messages, systemMessages],
+  );
+
+  const unreadCount = React.useMemo(
+    () => messages.filter((message) => !message.outgoing && !message.seen).length,
+    [messages],
   );
 
   // Only the rows near the viewport are mounted; the spacers below stand in for
@@ -317,29 +381,123 @@ function Timeline({
     const distance = element.scrollHeight - element.scrollTop - element.clientHeight;
     atBottomRef.current = distance < 80;
     setTimelineAtBottom(threadId, atBottomRef.current);
+    setFarFromBottom(distance > element.clientHeight * JUMP_TO_BOTTOM_SCREENS);
   }, [threadId]);
 
-  // A conversation opens pinned to its newest message, and opening it is reason
-  // enough to withdraw any notification still on screen for it.
-  React.useEffect(() => {
-    atBottomRef.current = true;
-    setTimelineAtBottom(threadId, true);
+  // Opening a conversation is reason enough to withdraw any notification still
+  // on screen for it, and it is where the reader is put back at the last thing
+  // they read rather than at the newest message: Go's `scrollToLastRead`
+  // (`ui/thread.go:440`). A layout effect, and declared above the one that
+  // scrolls, so the decision is made before the first paint rather than after
+  // a frame pinned to the bottom.
+  React.useLayoutEffect(() => {
     dismissNotifications(threadId);
+
+    const unread = firstUnreadIndex(entries);
+    revealAttemptsRef.current = 0;
+
+    if (unread < 0) {
+      // Everything read: open at the newest message, as before.
+      atBottomRef.current = true;
+      revealRef.current = null;
+    } else {
+      // Go scrolls to the row above the first unseen one, so what you last read
+      // is at the top of the screen and the new material begins under it.
+      atBottomRef.current = false;
+      revealRef.current = Math.max(0, unread - 1);
+    }
+
+    setTimelineAtBottom(threadId, atBottomRef.current);
+    setFarFromBottom(false);
+    // `entries` is deliberately not a dependency: this is where the thread is
+    // opened, and Go positions a thread on first open only (`ui/thread.go:435`).
+    // Re-running it as messages arrive would drag the reader back up the list.
   }, [threadId]);
 
   // The window is in the dependencies because one that grows after a scroll has
-  // to be re-pinned: the rows it added sit below where we last scrolled to.
+  // to be re-pinned: the rows it added sit below where we last scrolled to. It
+  // is also what gives the reveal below a second pass once the window it asked
+  // for has been mounted.
   React.useLayoutEffect(() => {
     const element = scrollRef.current;
-    if (element && atBottomRef.current) {
+    if (!element) return;
+
+    const reveal = revealRef.current;
+    if (reveal !== null) {
+      revealAttemptsRef.current += 1;
+      const row = rowElement(element, reveal) ?? rowElement(element, reveal + 1);
+
+      if (row) {
+        // Align the row with the top of the viewport.
+        element.scrollTop += row.getBoundingClientRect().top - element.getBoundingClientRect().top;
+        revealRef.current = null;
+      } else if (revealAttemptsRef.current >= MAX_REVEAL_ATTEMPTS) {
+        // The row is not being mounted where the arithmetic says it is. The
+        // approximate position is where we are, and it is close enough to stop.
+        revealRef.current = null;
+      } else {
+        // It is outside the mounted window. Jumping to where the windowing
+        // arithmetic puts it moves the window over it, and the next pass — this
+        // effect again, on the render that scroll causes — finds the row.
+        element.scrollTop = (reveal / entries.length) * element.scrollHeight;
+      }
+      return;
+    }
+
+    if (atBottomRef.current) {
       element.scrollTop = element.scrollHeight;
     }
-  }, [entries.length, typingCount, range.start, range.end]);
+  }, [entries.length, typing.length, range.start, range.end]);
+
+  // Go's jump-to-bottom does three things: scrolls down, zeroes the unread
+  // counter, and marks the thread read (`ui/chat_history.go:89-110`). The last
+  // one matters here because the read sweep on selection is gated on the window
+  // being focused, so a thread opened in the background is still unread when
+  // the reader finally scrolls to the end of it.
+  const jumpToBottom = React.useCallback(() => {
+    const element = scrollRef.current;
+    revealRef.current = null;
+    atBottomRef.current = true;
+    setTimelineAtBottom(threadId, true);
+    setFarFromBottom(false);
+
+    if (element) element.scrollTop = element.scrollHeight;
+
+    for (const message of messages) {
+      if (message.outgoing || message.seen) continue;
+      void window.bounce.markAsRead(message.id, isGroup).catch(() => {
+        // The engine will be asked again the next time the thread is opened.
+      });
+    }
+  }, [threadId, messages, isGroup]);
 
   // A typing indicator has to render in the empty case too — a brand new
   // conversation is exactly where you first watch for one.
-  const typingIndicator = typingCount > 0 && (
-    <div className="typing" aria-label="typing">
+  //
+  // The engine has always said *who*; the view used to reduce that to a count,
+  // which in a group of eight told you only that somebody was composing
+  // something. See `typing.ts` for the wording and the cap.
+  const label = typingLabel(typing, names, {
+    isGroup,
+    selfId: state.profile?.id ?? null,
+  });
+  const typingFaces = isGroup
+    ? typingAvatarIds(typing, { selfId: state.profile?.id ?? null })
+    : [];
+
+  const typingIndicator = typing.length > 0 && (
+    <div className="typing" aria-label={label ?? 'typing'}>
+      {typingFaces.map((userId) => (
+        <Avatar
+          key={userId}
+          id={userId}
+          name={names[userId] ?? '?'}
+          images={state.users[userId]?.images}
+          size={20}
+          className="typing__face"
+        />
+      ))}
+      {label && <span className="typing__who">{label}</span>}
       <span className="typing__dot" />
       <span className="typing__dot" />
       <span className="typing__dot" />
@@ -348,14 +506,16 @@ function Timeline({
 
   if (entries.length === 0) {
     return (
-      <div className="timeline" ref={scrollRef} onScroll={handleScroll}>
-        <div className="timeline__spacer" />
-        <div className="placeholder">
-          <div className="placeholder__body">
-            No messages yet. Say something to start the conversation.
+      <div className="timeline-area">
+        <div className="timeline" ref={scrollRef} onScroll={handleScroll}>
+          <div className="timeline__spacer" />
+          <div className="placeholder">
+            <div className="placeholder__body">
+              No messages yet. Say something to start the conversation.
+            </div>
           </div>
+          {typingIndicator}
         </div>
-        {typingIndicator}
       </div>
     );
   }
@@ -396,6 +556,7 @@ function Timeline({
     rendered.push(
       <MessageRow
         key={message.id}
+        index={index}
         message={message}
         state={state}
         isGroup={isGroup}
@@ -409,21 +570,42 @@ function Timeline({
   }
 
   return (
-    <div className="timeline" ref={scrollRef} onScroll={handleScroll}>
-      <div className="timeline__spacer" />
-      {range.topSpacer > 0 && (
-        // `flexShrink: 0` is not optional: `.timeline` is a flex column, so an
-        // empty div with a height is shrunk away the moment the content
-        // overflows, and the scroller collapses to the rendered rows.
-        <div style={{ height: range.topSpacer, flexShrink: 0 }} aria-hidden="true" />
+    <div className="timeline-area">
+      <div className="timeline" ref={scrollRef} onScroll={handleScroll}>
+        <div className="timeline__spacer" />
+        {range.topSpacer > 0 && (
+          // `flexShrink: 0` is not optional: `.timeline` is a flex column, so an
+          // empty div with a height is shrunk away the moment the content
+          // overflows, and the scroller collapses to the rendered rows.
+          <div style={{ height: range.topSpacer, flexShrink: 0 }} aria-hidden="true" />
+        )}
+        {rendered}
+        {range.bottomSpacer > 0 && (
+          <div style={{ height: range.bottomSpacer, flexShrink: 0 }} aria-hidden="true" />
+        )}
+        {typingIndicator}
+      </div>
+
+      {farFromBottom && (
+        <button
+          className="timeline__jump"
+          onClick={jumpToBottom}
+          title="Jump to the newest message"
+          aria-label="Jump to the newest message"
+        >
+          <JumpToBottomIcon />
+          {unreadCount > 0 && (
+            <span className="timeline__jump-badge">{unreadCount > 99 ? '99+' : unreadCount}</span>
+          )}
+        </button>
       )}
-      {rendered}
-      {range.bottomSpacer > 0 && (
-        <div style={{ height: range.bottomSpacer, flexShrink: 0 }} aria-hidden="true" />
-      )}
-      {typingIndicator}
     </div>
   );
+}
+
+/** A mounted timeline row by its index, or null if it is outside the window. */
+function rowElement(container: HTMLElement, index: number): HTMLElement | null {
+  return container.querySelector<HTMLElement>(`[data-row="${index}"]`);
 }
 
 /** The nearest message above a window's start, for grouping and dating. */
@@ -474,6 +656,7 @@ function useAttachmentUrls(attachments: readonly BubbleAttachment[]): BubbleAtta
 }
 
 function MessageRow({
+  index,
   message,
   state,
   isGroup,
@@ -481,6 +664,8 @@ function MessageRow({
   continuesAfter,
   onOpenImage,
 }: {
+  /** Position in the whole thread, so the scroller can find this row again. */
+  index: number;
   message: Message;
   state: State;
   isGroup: boolean;
@@ -509,11 +694,11 @@ function MessageRow({
     .join(' ');
 
   return (
-    <div className={groupClassName}>
+    <div className={groupClassName} data-row={index}>
       <div className="message-group__avatar-slot">
         {/* In groups, the avatar sits beside the last bubble of an incoming run. */}
         {isGroup && !message.outgoing && !continuesAfter && (
-          <Avatar id={message.author} name={authorName} size={28} />
+          <Avatar id={message.author} name={authorName} images={author?.images} size={28} />
         )}
       </div>
 
@@ -648,11 +833,11 @@ function Composer({
     .join(' ');
 
   return (
-    // Paste is bound here rather than on the textarea because it bubbles, and
-    // the drop target has to cover the tray as well as the input row.
+    // Drag and drop are bound here so the target covers the tray as well as
+    // the input row. Paste is not: it is caught on the document, because focus
+    // is rarely in the composer at the moment somebody pastes a screenshot.
     <div
       className={areaClassName}
-      onPaste={intake.onPaste}
       onDragOver={intake.onDragOver}
       onDragLeave={intake.onDragLeave}
       onDrop={intake.onDrop}

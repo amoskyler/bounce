@@ -5,8 +5,10 @@
 import * as React from 'react';
 
 import type { PendingAttachment } from './Attachments';
+import { Avatar } from './Avatar';
 import { blurHashFromImage } from './blurhash';
 import { ConversationView, NoConversationSelected } from './Conversation';
+import { QrCode } from './icons';
 import { DetailsPanel } from './DetailsPanel';
 import { LeftPane } from './LeftPane';
 import {
@@ -19,10 +21,14 @@ import {
 import { Onboarding } from './Onboarding';
 import { SettingsPanel } from './SettingsPanel';
 import {
+  contacts as deriveContacts,
   conversations as deriveConversations,
+  filterContacts,
   filterConversations,
   initialState,
   reducer,
+  type Contact,
+  type State,
 } from './state';
 import type { BounceApi, Message, TransportInfo } from '../preload';
 
@@ -35,7 +41,7 @@ declare global {
 export function App() {
   const [state, dispatch] = React.useReducer(reducer, initialState);
   const [hasProfile, setHasProfile] = React.useState<boolean | null>(null);
-  const [dialog, setDialog] = React.useState<'newGroup' | 'addContact' | null>(null);
+  const [dialog, setDialog] = React.useState<'newGroup' | 'addContact' | 'contacts' | null>(null);
   const [transport, setTransport] = React.useState<TransportInfo | null>(null);
   const [detailsOpen, setDetailsOpen] = React.useState(false);
   const [settingsOpen, setSettingsOpen] = React.useState(false);
@@ -162,6 +168,45 @@ export function App() {
     (conversation) => conversation.id === state.selectedConversation,
   );
 
+  const openConversation = React.useCallback((id: string) => {
+    dispatch({ type: 'selectConversation', id });
+
+    // Displaying a thread is what stamps its last-opened time in Go
+    // (`ui/direct_message.go:309-310`), which is what holds a thread carrying
+    // a draft near the top of the list.
+    void window.bounce.setLastOpened(id).catch(() => {
+      // Losing the stamp costs ordering on the next launch, nothing more.
+    });
+
+    // Opening a conversation is a statement that the other side is
+    // wanted; the engine's own peering pass is a minute away.
+    void window.bounce.reachFor(id).catch(() => {
+      // A dial that fails is retried by the peering audit.
+    });
+
+    setDetailsOpen(false);
+    setSettingsOpen(false);
+  }, []);
+
+  // Starting a conversation from the contact list is what puts it in the
+  // sidebar, and the flag syncs, so it opens on every device you own.
+  const startConversation = React.useCallback(
+    async (id: string) => {
+      try {
+        // Awaited rather than fired off, so the `userUpdated` it provokes has
+        // landed before we select — otherwise the row we are selecting does
+        // not exist yet and the pane flashes its empty state.
+        await window.bounce.setOpenDm(id, true);
+      } catch (error) {
+        dispatch({ type: 'engineEvent', event: { type: 'error', message: String(error) } });
+        return;
+      }
+      setDialog(null);
+      openConversation(id);
+    },
+    [openConversation],
+  );
+
   const handleSend = React.useCallback(
     async (text: string, attachments: readonly PendingAttachment[]) => {
       if (!selected) return;
@@ -240,7 +285,11 @@ export function App() {
   }, [selectedId, state.messagesByThread]);
 
   React.useEffect(() => {
-    if (!selectedId || unreadIds === '') return;
+    // Go gates this on the thread being active AND the window being focused
+    // (ui/chat_history.go:807). Without the second half, selecting a
+    // conversation while the window is behind another one tells the author
+    // their message was read by somebody who has not looked at it.
+    if (!selectedId || unreadIds === '' || !windowFocused) return;
 
     for (const id of unreadIds.split(',')) {
       if (reportedRead.current.has(id)) continue;
@@ -250,7 +299,7 @@ export function App() {
         reportedRead.current.delete(id);
       });
     }
-  }, [selectedId, selectedIsGroup, unreadIds]);
+  }, [selectedId, selectedIsGroup, unreadIds, windowFocused]);
 
   if (hasProfile === null) {
     // The engine may have failed to start, in which case there is a reason to
@@ -272,40 +321,52 @@ export function App() {
 
   return (
     <div className="app">
-      {transport && !transport.anonymous && (
-        <div className="banner banner--insecure" role="alert">
-          Running without Tor — this connection protects no metadata.
-        </div>
-      )}
+      {/* Banners stack rather than share the grid row they are placed in, so
+          two conditions at once read as two lines instead of overlapping. */}
+      <div className="app__banners">
+        {/* Nothing this device does will reach anyone once it has been
+            revoked, so this outranks every other warning. */}
+        {state.deviceRevoked && (
+          <div className="banner banner--revoked" role="alert">
+            This device has been revoked
+          </div>
+        )}
 
-      {state.error && (
-        <div className="banner banner--error" role="alert">
-          <span style={{ flex: 1 }}>{state.error}</span>
-          <button
-            className="banner__dismiss"
-            onClick={() => dispatch({ type: 'dismissError' })}
-            aria-label="Dismiss"
-          >
-            ×
-          </button>
-        </div>
-      )}
+        {transport && !transport.anonymous && (
+          <div className="banner banner--insecure" role="alert">
+            Running without Tor — this connection protects no metadata.
+          </div>
+        )}
+
+        {!state.networkOnline && (
+          <div className="banner banner--offline" role="status">
+            {state.networkStarting
+              ? 'network is starting...'
+              : 'network connection lost, reconnecting...'}
+          </div>
+        )}
+
+        {state.error && (
+          <div className="banner banner--error" role="alert">
+            <span style={{ flex: 1 }}>{state.error}</span>
+            <button
+              className="banner__dismiss"
+              onClick={() => dispatch({ type: 'dismissError' })}
+              aria-label="Dismiss"
+            >
+              ×
+            </button>
+          </div>
+        )}
+      </div>
+
       <LeftPane
         state={state}
         conversations={visibleConversations}
-        onSelect={(id) => {
-          dispatch({ type: 'selectConversation', id });
-          // Opening a conversation is a statement that the other side is
-          // wanted; the engine's own peering pass is a minute away.
-          void window.bounce.reachFor(id).catch(() => {
-            // A dial that fails is retried by the peering audit.
-          });
-          setDetailsOpen(false);
-          setSettingsOpen(false);
-        }}
+        onSelect={openConversation}
         onSearch={(query) => dispatch({ type: 'search', query })}
         onNewGroup={() => setDialog('newGroup')}
-        onNewContact={() => setDialog('addContact')}
+        onBrowseContacts={() => setDialog('contacts')}
         onOpenSettings={() => {
           setSettingsOpen(true);
           setDetailsOpen(false);
@@ -344,13 +405,26 @@ export function App() {
 
       {settingsOpen && <SettingsPanel state={state} onClose={() => setSettingsOpen(false)} />}
 
-      {dialog === 'newGroup' && (
-        <NewGroupDialog
-          contactNames={allConversations
-            .filter((conversation) => conversation.kind === 'direct')
-            .map((conversation) => ({ id: conversation.id, name: conversation.name }))}
+      {dialog === 'contacts' && (
+        <ContactsDialog
+          state={state}
+          onStart={startConversation}
+          onHide={(id) =>
+            void window.bounce.setOpenDm(id, false).catch((error) => {
+              dispatch({ type: 'engineEvent', event: { type: 'error', message: String(error) } });
+            })
+          }
+          onAddContact={() => setDialog('addContact')}
           onClose={() => setDialog(null)}
         />
+      )}
+
+      {dialog === 'newGroup' && (
+        // Built from the contact store rather than from the sidebar: the
+        // sidebar carries a note-to-self row, and inviting yourself to a group
+        // you are already in costs a signed frame and a nonsense status line
+        // (`ui/new_group_container.go:340-347` skips the profile too).
+        <NewGroupDialog contacts={deriveContacts(state)} onClose={() => setDialog(null)} />
       )}
 
       {dialog === 'addContact' && <AddContactDialog onClose={() => setDialog(null)} />}
@@ -358,11 +432,143 @@ export function App() {
   );
 }
 
-function NewGroupDialog({
-  contactNames,
+/**
+ * The contact store, as a browser.
+ *
+ * The counterpart to the sidebar: it lists everyone regardless of whether a
+ * conversation is open with them, which is the only way back to somebody the
+ * sidebar is not showing — Bounce has no directory, so a contact you cannot
+ * reach from here is a contact you would have to re-pair with in person.
+ * Modelled on `ui/new_dm_container.go`, down to the "Show blocked" checkbox.
+ */
+function ContactsDialog({
+  state,
+  onStart,
+  onHide,
+  onAddContact,
   onClose,
 }: {
-  contactNames: Array<{ id: string; name: string }>;
+  state: State;
+  onStart: (id: string) => void;
+  onHide: (id: string) => void;
+  onAddContact: () => void;
+  onClose: () => void;
+}) {
+  const [query, setQuery] = React.useState('');
+  const [showBlocked, setShowBlocked] = React.useState(false);
+
+  const visible = React.useMemo(
+    () => filterContacts(deriveContacts(state, showBlocked), query),
+    [state, showBlocked, query],
+  );
+
+  return (
+    <div className="modal__backdrop" onClick={onClose}>
+      <div className="modal modal--wide" onClick={(event) => event.stopPropagation()}>
+        <div className="modal__title">Contacts</div>
+
+        <input
+          className="onboarding__field"
+          placeholder="Search contacts"
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          aria-label="Search contacts"
+          autoFocus
+        />
+
+        <label className="contacts__filter">
+          <input
+            type="checkbox"
+            checked={showBlocked}
+            onChange={(event) => setShowBlocked(event.target.checked)}
+          />
+          Show blocked
+        </label>
+
+        <div className="contacts__list" role="list">
+          {visible.length === 0 ? (
+            <div className="contacts__empty">
+              {query.trim().length > 0
+                ? 'No contacts found.'
+                : 'Nobody here yet. Contacts are added by exchanging a code in person.'}
+            </div>
+          ) : (
+            visible.map((contact) => (
+              <ContactRow
+                key={contact.id}
+                contact={contact}
+                onStart={onStart}
+                onHide={onHide}
+              />
+            ))
+          )}
+        </div>
+
+        <div className="modal__actions">
+          <button className="modal__button" onClick={onClose}>
+            Close
+          </button>
+          <button className="modal__button modal__button--primary" onClick={onAddContact}>
+            Add contact
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ContactRow({
+  contact,
+  onStart,
+  onHide,
+}: {
+  contact: Contact;
+  onStart: (id: string) => void;
+  onHide: (id: string) => void;
+}) {
+  return (
+    <div className="contact-row" role="listitem">
+      <Avatar
+        id={contact.id}
+        name={contact.name}
+        images={contact.images}
+        size={32}
+        online={contact.online}
+      />
+      <span className="contact-row__name">{contact.name}</span>
+
+      {contact.blocked ? (
+        // Listed so you can see who you blocked, but not a way in: the sidebar
+        // refuses blocked rows, so opening one would select a conversation
+        // that does not render. Unblocking lives in the conversation details.
+        <span className="contact-row__tag">Blocked</span>
+      ) : (
+        <>
+          {/* Offered only when it would visibly do something. A conversation
+              with messages in it stays in the sidebar whatever the flag says,
+              so a Hide button on one would look broken. */}
+          {contact.hideable && (
+            <button className="contact-row__action" onClick={() => onHide(contact.id)}>
+              Hide
+            </button>
+          )}
+          <button
+            className="contact-row__action contact-row__action--primary"
+            onClick={() => onStart(contact.id)}
+          >
+            {contact.open ? 'Open' : 'Message'}
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
+function NewGroupDialog({
+  contacts,
+  onClose,
+}: {
+  contacts: Contact[];
   onClose: () => void;
 }) {
   const [name, setName] = React.useState('');
@@ -398,9 +604,9 @@ function NewGroupDialog({
           autoFocus
         />
 
-        {contactNames.length > 0 && (
+        {contacts.length > 0 && (
           <div style={{ marginTop: 12, maxHeight: 220, overflowY: 'auto' }}>
-            {contactNames.map((contact) => (
+            {contacts.map((contact) => (
               <label
                 key={contact.id}
                 style={{
@@ -441,6 +647,15 @@ function NewGroupDialog({
 
 function AddContactDialog({ onClose }: { onClose: () => void }) {
   const [code, setCode] = React.useState('');
+  const [copied, setCopied] = React.useState(false);
+
+  // The confirmation reverts on its own; a button stuck on "Copied" reads as
+  // broken the second time you use it.
+  React.useEffect(() => {
+    if (!copied) return;
+    const timer = window.setTimeout(() => setCopied(false), 2000);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
   const [theirCode, setTheirCode] = React.useState('');
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
@@ -477,8 +692,23 @@ function AddContactDialog({ onClose }: { onClose: () => void }) {
           paste theirs below. Codes are single-use and expire after five minutes.
         </p>
 
-        <div className="onboarding__address" style={{ marginBottom: 16 }}>
-          {code || 'Generating…'}
+        {code && (
+          <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 12 }}>
+            <QrCode text={code} size={196} />
+          </div>
+        )}
+
+        <div className="settings__address-row" style={{ marginBottom: 16 }}>
+          <code className="settings__address">{code || 'Generating…'}</code>
+          <button
+            className="settings__copy"
+            disabled={!code}
+            onClick={() => {
+              void navigator.clipboard.writeText(code).then(() => setCopied(true));
+            }}
+          >
+            {copied ? 'Copied' : 'Copy'}
+          </button>
         </div>
 
         <input

@@ -108,16 +108,15 @@ impl BounceNode {
     /// connections from Go peers work either way.
     #[napi(factory)]
     pub fn open(data_directory: String, use_tor: bool, go_compatible: bool) -> Result<Self> {
-        install_logging();
+        let directory = std::path::PathBuf::from(&data_directory);
+        std::fs::create_dir_all(&directory).map_err(to_napi_error)?;
+        install_logging(&directory);
 
         let handshake = if go_compatible {
             HandshakeMode::Compatible
         } else {
             HandshakeMode::Strict
         };
-
-        let directory = std::path::PathBuf::from(&data_directory);
-        std::fs::create_dir_all(&directory).map_err(to_napi_error)?;
 
         let key = load_or_create_key(&directory)?;
         let address = key.address();
@@ -193,6 +192,11 @@ impl BounceNode {
         // service and waits, and two clients that both wait never speak
         // again after a restart.
         runtime.spawn(Arc::clone(&engine).run_peering());
+        // Retention is a promise about plaintext, not a label. The engine
+        // prunes once on start-up, but a client left open for a week would
+        // otherwise keep everything that expired during it, so the sweep has
+        // to run for the life of the process.
+        runtime.spawn(Arc::clone(&engine).run_retention());
 
         Ok(BounceNode {
             engine,
@@ -472,6 +476,21 @@ impl BounceNode {
             .map_err(to_napi_error)
     }
 
+    /// Show or hide a direct conversation.
+    ///
+    /// Not a local view toggle: it is sync-scoped, so hiding a conversation
+    /// hides it on this profile's other devices too. Hiding does not discard
+    /// anything — the contact, their messages and their device group stay — so
+    /// this is the reversible counterpart to `set_user_blocked`.
+    #[napi]
+    pub async fn set_open_dm(&self, user_id: String, open: bool) -> Result<()> {
+        let user_id = parse_uuid(&user_id)?;
+        Arc::clone(&self.engine)
+            .set_open_dm(user_id, open)
+            .await
+            .map_err(to_napi_error)
+    }
+
     /// Give a contact a local nickname; an empty string clears it.
     #[napi]
     pub async fn set_user_alias(&self, user_id: String, alias: String) -> Result<()> {
@@ -539,6 +558,21 @@ impl BounceNode {
         Arc::clone(&self.engine)
             .set_typing_indicators(conversation, setting)
             .await
+            .map_err(to_napi_error)
+    }
+
+    /// Stamp a conversation as opened now.
+    ///
+    /// Synchronous, unlike its neighbours, because there is nothing to send:
+    /// `last_opened` is local on both implementations, so this writes a column
+    /// and emits an event. It exists because a thread holding an unsent draft
+    /// should stay near the top of the list rather than sinking to the age of
+    /// its last message.
+    #[napi]
+    pub fn set_last_opened(&self, conversation: String) -> Result<()> {
+        let conversation = parse_uuid(&conversation)?;
+        self.engine
+            .set_last_opened(conversation)
             .map_err(to_napi_error)
     }
 
@@ -737,6 +771,57 @@ impl BounceNode {
         Ok(())
     }
 
+    // -- device pairing and pictures ----------------------------------------
+
+    /// A code another device can use to join this profile.
+    ///
+    /// Deliberately distinct from `create_pairing_code`, which invites a
+    /// contact. The two look the same and grant very different things.
+    #[napi]
+    pub fn create_sync_code(&self) -> Result<String> {
+        self.engine.create_sync_code().map_err(to_napi_error)
+    }
+
+    /// Join an existing profile using a code from one of its devices.
+    #[napi]
+    pub async fn request_to_sync(&self, code: String) -> Result<()> {
+        Arc::clone(&self.engine)
+            .request_to_sync(&code)
+            .await
+            .map_err(to_napi_error)
+    }
+
+    /// Take a device out of this profile's device group.
+    #[napi]
+    pub async fn revoke_device(&self, device_id: String) -> Result<()> {
+        let device_id = parse_uuid(&device_id)?;
+        Arc::clone(&self.engine)
+            .revoke_device(device_id)
+            .await
+            .map_err(to_napi_error)
+    }
+
+    /// Set this profile's picture.
+    #[napi]
+    pub async fn set_profile_image(&self, image: Attachment) -> Result<()> {
+        let image = convert(vec![image]).remove(0);
+        Arc::clone(&self.engine)
+            .set_profile_image(image)
+            .await
+            .map_err(to_napi_error)
+    }
+
+    /// Set a group's picture.
+    #[napi]
+    pub async fn set_group_image(&self, group_id: String, image: Attachment) -> Result<()> {
+        let group_id = parse_uuid(&group_id)?;
+        let image = convert(vec![image]).remove(0);
+        Arc::clone(&self.engine)
+            .set_group_image(group_id, image)
+            .await
+            .map_err(to_napi_error)
+    }
+
     /// Dial a peer by address.
     #[napi]
     pub async fn connect_to_peer(&self, address: String) -> Result<()> {
@@ -790,16 +875,17 @@ fn load_or_create_key(directory: &std::path::Path) -> Result<DeviceKey> {
     Ok(key)
 }
 
-/// Send the engine's tracing output to stderr when `BOUNCE_LOG` is set.
+/// Turn on engine logging when `BOUNCE_LOG` is set.
 ///
-/// The engine logs a great deal below the event stream — every rejected frame,
-/// every dial, every dropped peer — and none of it was reachable from the
-/// Electron client. An attachment failure that showed up as "nothing happens"
-/// turned out to be one `warn!` line about a frame size.
+/// Everything below the event stream — which frame was refused and why, which
+/// peer a chunk went to, why a transfer stopped — is invisible to the client
+/// otherwise. An attachment that silently failed turned out to be one line
+/// about a frame size.
 ///
-/// Off unless asked for, because those lines name onion addresses and
-/// conversation ids.
-fn install_logging() {
+/// Output goes to stderr *and* to `bounce.log` in the data directory, because
+/// an app launched from Finder has no stderr anybody can read. Off unless
+/// asked for: these lines name onion addresses and conversation ids.
+fn install_logging(directory: &std::path::Path) {
     use std::sync::Once;
 
     static ONCE: Once = Once::new();
@@ -807,11 +893,57 @@ fn install_logging() {
         let Ok(filter) = std::env::var("BOUNCE_LOG") else {
             return;
         };
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
-            .with_writer(std::io::stderr)
-            .try_init();
+
+        let path = directory.join("bounce.log");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path);
+
+        match file {
+            Ok(file) => {
+                let _ = tracing_subscriber::fmt()
+                    .with_env_filter(tracing_subscriber::EnvFilter::new(&filter))
+                    .with_ansi(false)
+                    .with_writer(move || {
+                        // Cloning the handle per event costs a syscall, which
+                        // is nothing next to what is being logged.
+                        file.try_clone().map(LogSink::File).unwrap_or(LogSink::Stderr)
+                    })
+                    .try_init();
+                eprintln!("bounce: logging to {}", path.display());
+            }
+            Err(error) => {
+                eprintln!("bounce: could not open {}: {error}", path.display());
+                let _ = tracing_subscriber::fmt()
+                    .with_env_filter(tracing_subscriber::EnvFilter::new(&filter))
+                    .with_writer(std::io::stderr)
+                    .try_init();
+            }
+        }
     });
+}
+
+/// Where a log line goes, with a fallback if the file handle is lost.
+enum LogSink {
+    File(std::fs::File),
+    Stderr,
+}
+
+impl std::io::Write for LogSink {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        match self {
+            LogSink::File(file) => file.write(buffer),
+            LogSink::Stderr => std::io::stderr().write(buffer),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            LogSink::File(file) => file.flush(),
+            LogSink::Stderr => std::io::stderr().flush(),
+        }
+    }
 }
 
 fn parse_uuid(value: &str) -> Result<uuid::Uuid> {

@@ -1,12 +1,17 @@
 /**
  * Avatars.
  *
- * With no profile photo, Signal falls back to initials on a tinted background,
- * with the tint chosen deterministically from the contact's identifier so the
- * same person is always the same colour on every device.
+ * A contact or group can carry images, and the newest one is drawn
+ * circle-cropped. With no photo — or before its bytes have arrived — this falls
+ * back to initials on a tinted background, with the tint chosen
+ * deterministically from the contact's identifier so the same person is always
+ * the same colour on every device. Go makes the same two-way choice in
+ * `ui/default_image.go:82-198`.
  */
 
 import * as React from 'react';
+
+import { cachedFileUrl, fileUrl } from './attachment-data';
 
 /**
  * Signal's avatar palette: twelve background/foreground pairs, each a muted
@@ -67,21 +72,68 @@ function initialsFor(name: string): string {
   return (first + last).toUpperCase();
 }
 
+/**
+ * The object URL for the image to draw, or undefined to fall back to initials.
+ *
+ * The last image in the list is the current one, which is why Go walks the list
+ * backwards looking for one it can draw (`ui/default_image.go:84-100`). The
+ * bytes come through the same cache the attachment bubbles use, so the same
+ * contact in the sidebar, the header and a run of bubbles costs one decode
+ * between them.
+ *
+ * A file still being fetched resolves to null, and this returns undefined: the
+ * initials stand in, exactly as they do for someone with no photo at all. The
+ * next render after the bytes land picks the URL up.
+ */
+function useAvatarImage(images: readonly string[] | undefined): string | undefined {
+  const fileId = images && images.length > 0 ? images[images.length - 1] : undefined;
+  const [, forceRender] = React.useReducer((count: number) => count + 1, 0);
+
+  const cached = fileId === undefined ? undefined : cachedFileUrl(fileId);
+
+  // `cached` is a dependency so that an avatar whose URL was evicted from the
+  // cache — it is bounded, and a thread full of photographs can fill it — asks
+  // for the bytes again on the next render instead of showing initials for the
+  // rest of the session.
+  React.useEffect(() => {
+    if (fileId === undefined || cached !== undefined) return;
+
+    let cancelled = false;
+    void fileUrl(fileId).then((url) => {
+      // Only a URL that arrived is worth a render; a file that is still
+      // downloading would otherwise re-render every avatar on screen.
+      if (!cancelled && url !== null) forceRender();
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [fileId, cached]);
+
+  return cached;
+}
+
 type AvatarProps = {
   /** Stable identifier, used to choose the colour. */
   id: string;
   /** Display name, used for the initials. */
   name: string;
+  /** File ids of the profile or group images, oldest first. */
+  images?: readonly string[];
   size?: number;
   /** Shows the presence dot when true. */
   online?: boolean;
   className?: string;
 };
 
-export function Avatar({ id, name, size = 48, online = false, className }: AvatarProps) {
+export function Avatar({ id, name, images, size = 48, online = false, className }: AvatarProps) {
   const { background, foreground } = paletteFor(id);
+  const image = useAvatarImage(images);
 
   return (
+    // The tint stays under the image rather than being dropped: it is what
+    // shows through a photo with transparency, and what is on screen for the
+    // moment between the element being laid out and the image decoding.
     <div
       className={className ? `avatar ${className}` : 'avatar'}
       style={
@@ -93,7 +145,13 @@ export function Avatar({ id, name, size = 48, online = false, className }: Avata
       }
       title={name}
     >
-      <span className="avatar__initials">{initialsFor(name)}</span>
+      {image === undefined ? (
+        <span className="avatar__initials">{initialsFor(name)}</span>
+      ) : (
+        // Decorative: the name is already on the wrapper's title, and in every
+        // call site it is also written beside the avatar.
+        <img className="avatar__image" src={image} alt="" draggable={false} />
+      )}
       {online && <span className="avatar__presence" aria-label="online" />}
     </div>
   );

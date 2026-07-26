@@ -7,7 +7,7 @@ import * as React from 'react';
 import { Avatar } from './Avatar';
 import { ComposeIcon, NewGroupIcon, SearchIcon, SettingsIcon } from './icons';
 import { conversationTimestamp, snippet } from './format';
-import type { Conversation, State } from './state';
+import { contacts as deriveContacts, type Conversation, type State } from './state';
 
 type LeftPaneProps = {
   state: State;
@@ -15,7 +15,7 @@ type LeftPaneProps = {
   onSelect: (id: string) => void;
   onSearch: (query: string) => void;
   onNewGroup: () => void;
-  onNewContact: () => void;
+  onBrowseContacts: () => void;
   onOpenSettings: () => void;
 };
 
@@ -25,9 +25,13 @@ export function LeftPane({
   onSelect,
   onSearch,
   onNewGroup,
-  onNewContact,
+  onBrowseContacts,
   onOpenSettings,
 }: LeftPaneProps) {
+  // The list holds open conversations only, so an empty one does not mean an
+  // empty address book — it matters which of the two is missing.
+  const contactCount = React.useMemo(() => deriveContacts(state).length, [state]);
+
   return (
     <div className="left-pane">
       <div className="left-pane__header">
@@ -40,7 +44,12 @@ export function LeftPane({
             title="Settings"
             aria-label="Settings"
           >
-            <Avatar id={state.profile.id} name={state.profile.name} size={28} />
+            <Avatar
+              id={state.profile.id}
+              name={state.profile.name}
+              images={state.profile.images}
+              size={28}
+            />
           </button>
         )}
 
@@ -56,7 +65,11 @@ export function LeftPane({
         </label>
 
         <div className="left-pane__actions">
-          <button className="icon-button" onClick={onNewContact} title="Add contact">
+          {/* The compose button opens the contact store, the way Go's menu
+              reaches `showNewDM` (`ui/menu.go:71`) — starting a conversation
+              is picking somebody you already know, and adding somebody new is
+              a step inside that. */}
+          <button className="icon-button" onClick={onBrowseContacts} title="New conversation">
             <ComposeIcon />
           </button>
           <button className="icon-button" onClick={onNewGroup} title="New group">
@@ -70,7 +83,11 @@ export function LeftPane({
 
       <div className="left-pane__list" role="list">
         {conversations.length === 0 ? (
-          <EmptyList searching={state.searchQuery.trim().length > 0} />
+          <EmptyList
+            searching={state.searchQuery.trim().length > 0}
+            contactCount={contactCount}
+            onBrowseContacts={onBrowseContacts}
+          />
         ) : (
           conversations.map((conversation) => (
             <ConversationRow
@@ -87,16 +104,38 @@ export function LeftPane({
   );
 }
 
-function EmptyList({ searching }: { searching: boolean }) {
+function EmptyList({
+  searching,
+  contactCount,
+  onBrowseContacts,
+}: {
+  searching: boolean;
+  contactCount: number;
+  onBrowseContacts: () => void;
+}) {
+  if (searching) {
+    return <div className="left-pane__empty">No conversations found.</div>;
+  }
+
   return (
     <div className="left-pane__empty">
-      {searching ? (
-        'No conversations found.'
+      No conversations yet.
+      <br />
+      {contactCount > 0 ? (
+        <>
+          You know {contactCount === 1 ? 'one person' : `${contactCount} people`}.
+          <br />
+          <button className="left-pane__empty-action" onClick={onBrowseContacts}>
+            Start a conversation
+          </button>
+        </>
       ) : (
         <>
-          No conversations yet.
-          <br />
           Add a contact to get started.
+          <br />
+          <button className="left-pane__empty-action" onClick={onBrowseContacts}>
+            Contacts
+          </button>
         </>
       )}
     </div>
@@ -144,6 +183,9 @@ function ConversationRow({ conversation, state, selected, onSelect }: RowProps) 
       <Avatar
         id={conversation.id}
         name={conversation.name}
+        images={
+          state.groups[conversation.id]?.images ?? state.users[conversation.id]?.images
+        }
         size={48}
         online={conversation.online}
       />

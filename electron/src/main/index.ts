@@ -11,6 +11,21 @@ import { join } from 'node:path';
 
 import { BounceEngine, type OutgoingAttachment } from './engine';
 
+/*
+ * Name the application before anything reads it.
+ *
+ * A packaged build takes its name from `productName` and is `Bounce.app`. An
+ * unpackaged one runs inside Electron's own bundle, so the menu bar and the
+ * about panel say "Electron" until told otherwise. The dock *title* in that
+ * case still comes from the bundle and cannot be changed from here — only
+ * packaging fixes that — but the icon can, and is, below.
+ *
+ * This must come before `app.getPath('userData')` is called, because the name
+ * is part of that path. It already resolves to `Bounce`, since `productName`
+ * is honoured for it, so setting the same name explicitly moves nothing.
+ */
+app.setName('Bounce');
+
 // Running a second client on the same machine needs a separate profile
 // directory, and separating it before anything else also makes the
 // single-instance lock below distinguish the two. Development only.
@@ -18,6 +33,16 @@ const dataDirOverride = process.env.BOUNCE_DATA_DIR;
 if (dataDirOverride) {
   app.setPath('userData', dataDirOverride);
 }
+
+/**
+ * The icon for an unpackaged run.
+ *
+ * A packaged build takes its icon from the bundle, but `npm run dev` — which is
+ * exactly when somebody sees the first-run screen — otherwise shows the default
+ * Electron mark. `__dirname` is `dist/main` at runtime, so this resolves to
+ * `electron/build/icon.png`.
+ */
+const DEVELOPMENT_ICON = join(__dirname, '..', '..', 'build', 'icon.png');
 
 let mainWindow: BrowserWindow | null = null;
 let engine: BounceEngine | null = null;
@@ -43,6 +68,8 @@ function createWindow(): void {
     // places the buttons, that reserves the space below them, and nothing
     // checks that the two agree.
     trafficLightPosition: { x: 10, y: 10 },
+    // Windows and Linux take the task bar icon from the window.
+    icon: app.isPackaged ? undefined : DEVELOPMENT_ICON,
     show: false,
     webPreferences: {
       preload: join(__dirname, '..', 'preload', 'index.js'),
@@ -184,6 +211,9 @@ function registerHandlers(): void {
   handle('bounce:setUserBlocked', (userId: any, blocked: any) =>
     engine!.setUserBlocked(userId, blocked),
   );
+  handle('bounce:setOpenDm', (userId: any, open: any) =>
+    engine!.setOpenDm(userId, open),
+  );
   handle('bounce:setUserAlias', (userId: any, alias: any) =>
     engine!.setUserAlias(userId, alias),
   );
@@ -201,6 +231,9 @@ function registerHandlers(): void {
   );
   handle('bounce:setTypingIndicators', (conversation: any, setting: any) =>
     engine!.setTypingIndicators(conversation, setting),
+  );
+  handle('bounce:setLastOpened', (conversation: any) =>
+    engine!.setLastOpened(conversation),
   );
   handle('bounce:removeFromGroup', (groupId: any, userId: any) =>
     engine!.removeFromGroup(groupId, userId),
@@ -225,6 +258,16 @@ function registerHandlers(): void {
   );
   handle('bounce:connectToPeer', (address: string) => engine!.connectToPeer(address));
   handle('bounce:reachFor', (conversation: string) => engine!.reachFor(conversation));
+
+  handle('bounce:createSyncCode', () => engine!.createSyncCode());
+  handle('bounce:requestToSync', (code: string) => engine!.requestToSync(code));
+  handle('bounce:revokeDevice', (deviceId: string) => engine!.revokeDevice(deviceId));
+  handle('bounce:setProfileImage', (image: OutgoingAttachment) =>
+    engine!.setProfileImage(image),
+  );
+  handle('bounce:setGroupImage', (groupId: string, image: OutgoingAttachment) =>
+    engine!.setGroupImage(groupId, image),
+  );
 
   handle('bounce:settings', () => engine!.settings());
   handle('bounce:setDefaultRetention', (seconds: number) =>
@@ -262,6 +305,12 @@ if (!app.requestSingleInstanceLock()) {
   });
 
   void app.whenReady().then(() => {
+    // macOS takes the dock icon from the bundle, which an unpackaged run does
+    // not have.
+    if (!app.isPackaged && process.platform === 'darwin') {
+      app.dock?.setIcon(DEVELOPMENT_ICON);
+    }
+
     registerHandlers();
 
     // The window comes up first. Bootstrapping Tor takes tens of seconds, and

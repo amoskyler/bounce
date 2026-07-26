@@ -45,14 +45,21 @@ interface NativeNode {
   saveDraft(thread: string, text: string): Promise<void>;
   connectToPeer(address: string): Promise<void>;
   reachFor(conversation: string): Promise<void>;
+  createSyncCode(): string;
+  requestToSync(code: string): Promise<void>;
+  revokeDevice(deviceId: string): Promise<void>;
+  setProfileImage(image: NativeAttachment): Promise<void>;
+  setGroupImage(groupId: string, image: NativeAttachment): Promise<void>;
   setMutedUntil(conversation: string, until: number): Promise<void>;
   setUserBlocked(userId: string, blocked: boolean): Promise<void>;
+  setOpenDm(userId: string, open: boolean): Promise<void>;
   setUserAlias(userId: string, alias: string): Promise<void>;
   setUserNotes(userId: string, notes: string): Promise<void>;
   setRetention(conversation: string, seconds: number): Promise<void>;
   clearHistory(conversation: string): Promise<void>;
   setReadReceipts(conversation: string, setting: boolean | null): Promise<void>;
   setTypingIndicators(conversation: string, setting: boolean | null): Promise<void>;
+  setLastOpened(conversation: string): void;
   removeFromGroup(groupId: string, userId: string): Promise<void>;
   revokeInvite(groupId: string, userId: string): Promise<void>;
   setGroupAdmin(groupId: string, userId: string, admin: boolean): Promise<void>;
@@ -294,6 +301,32 @@ export class BounceEngine extends EventEmitter {
     return this.node.reachFor(conversation);
   }
 
+  /**
+   * A code another device can use to join this profile.
+   *
+   * Not the same as `createPairingCode`, which invites a contact — that one
+   * makes somebody a correspondent, this one hands over the private keys.
+   */
+  createSyncCode(): string {
+    return this.node.createSyncCode();
+  }
+
+  requestToSync(code: string): Promise<void> {
+    return this.node.requestToSync(code);
+  }
+
+  revokeDevice(deviceId: string): Promise<void> {
+    return this.node.revokeDevice(deviceId);
+  }
+
+  setProfileImage(image: OutgoingAttachment): Promise<void> {
+    return this.node.setProfileImage(toNative(image));
+  }
+
+  setGroupImage(groupId: string, image: OutgoingAttachment): Promise<void> {
+    return this.node.setGroupImage(groupId, toNative(image));
+  }
+
 
   setMutedUntil(conversation: string, until: number): Promise<void> {
     return this.node.setMutedUntil(conversation, until);
@@ -301,6 +334,11 @@ export class BounceEngine extends EventEmitter {
 
   setUserBlocked(userId: string, blocked: boolean): Promise<void> {
     return this.node.setUserBlocked(userId, blocked);
+  }
+
+  /** Show or hide a direct conversation, on this device and its siblings. */
+  setOpenDm(userId: string, open: boolean): Promise<void> {
+    return this.node.setOpenDm(userId, open);
   }
 
   setUserAlias(userId: string, alias: string): Promise<void> {
@@ -325,6 +363,11 @@ export class BounceEngine extends EventEmitter {
 
   setTypingIndicators(conversation: string, setting: boolean | null): Promise<void> {
     return this.node.setTypingIndicators(conversation, setting);
+  }
+
+  /** Stamp a conversation as opened. Local; nothing is sent. */
+  setLastOpened(conversation: string): void {
+    this.node.setLastOpened(conversation);
   }
 
   removeFromGroup(groupId: string, userId: string): Promise<void> {

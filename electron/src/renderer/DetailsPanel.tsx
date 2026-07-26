@@ -15,8 +15,9 @@ import * as React from 'react';
 
 import { Avatar } from './Avatar';
 import { CloseIcon } from './icons';
+import { choosePicture, prepareImage } from './outgoing-image';
 import { shortAddress } from './format';
-import type { Group, User } from '../preload';
+import type { Group, Settings, User } from '../preload';
 import type { Conversation, State } from './state';
 
 /** Retention choices, matching what the Fyne client offers. */
@@ -30,6 +31,16 @@ const RETENTION_OPTIONS: ReadonlyArray<{ label: string; seconds: number }> = [
 
 const MUTED_FOREVER = -1;
 
+/**
+ * What a conversation's receipt and indicator settings fall back to when it has
+ * no override, used only to label the first option of the tri-state selects.
+ *
+ * True on both counts because that is what the Fyne client ships and what the
+ * settings panel falls back to; a label is the only thing this affects, and one
+ * that guesses wrong is better than a control that renders "Default (?)".
+ */
+const FALLBACK_DEFAULTS = { readReceipts: true, typingIndicators: true };
+
 type DetailsProps = {
   conversation: Conversation;
   state: State;
@@ -39,6 +50,8 @@ type DetailsProps = {
 export function DetailsPanel({ conversation, state, onClose }: DetailsProps) {
   const group = state.groups[conversation.id];
   const user = state.users[conversation.id];
+  const defaults = useProfileDefaults(state);
+  const [pictureError, setPictureError] = React.useState<string | null>(null);
 
   return (
     <aside className="details" aria-label="Conversation details">
@@ -53,8 +66,36 @@ export function DetailsPanel({ conversation, state, onClose }: DetailsProps) {
 
       <div className="details__body">
         <div className="details__identity">
-          <Avatar id={conversation.id} name={conversation.name} size={96} />
+          {/*
+            A group picture is shared state that any admin may change, so the
+            control follows the same permission as renaming. A contact's
+            picture is theirs to set, not ours, so it is never a button.
+          */}
+          {group && (group.admins.includes(state.profile?.id ?? '') || !group.restrictGroupEdits) ? (
+            <button
+              className="settings__avatar-button"
+              onClick={() => void pickGroupPicture(group.id, setPictureError)}
+              title="Change the group picture"
+              aria-label="Change the group picture"
+            >
+              <Avatar
+                id={conversation.id}
+                name={conversation.name}
+                images={group.images}
+                size={96}
+              />
+              <span className="settings__avatar-overlay">Change</span>
+            </button>
+          ) : (
+            <Avatar
+              id={conversation.id}
+              name={conversation.name}
+              images={group ? group.images : user?.images}
+              size={96}
+            />
+          )}
           <div className="details__name">{conversation.name}</div>
+          {pictureError && <p className="settings__error">{pictureError}</p>}
           {group ? (
             <div className="details__subtitle">
               {group.members.length} {group.members.length === 1 ? 'member' : 'members'}
@@ -67,21 +108,103 @@ export function DetailsPanel({ conversation, state, onClose }: DetailsProps) {
           )}
         </div>
 
+        {/*
+          Keyed by conversation so that selecting a different one remounts the
+          body. The edit fields below seed their state from props once, and a
+          panel that stayed mounted across a switch would keep the previous
+          contact's text — and write it to the new contact on the next blur.
+        */}
         {group ? (
-          <GroupDetails group={group} state={state} />
+          <GroupDetails key={group.id} group={group} state={state} />
         ) : (
-          user && <ContactDetails user={user} state={state} />
+          user && <ContactDetails key={user.id} user={user} state={state} defaults={defaults} />
         )}
       </div>
     </aside>
   );
 }
 
+/**
+ * The profile-wide defaults, for labelling "Default (On)" and "Default (Off)".
+ *
+ * `state.settings` is only filled in once the engine has emitted a
+ * `settingsUpdated`, which may not happen in a session, so the panel asks for
+ * them itself and lets a later event win.
+ */
+function useProfileDefaults(state: State): Settings | null {
+  const [fetched, setFetched] = React.useState<Settings | null>(null);
+
+  React.useEffect(() => {
+    if (state.settings) return;
+    let cancelled = false;
+
+    void window.bounce
+      .settings()
+      .then((settings) => {
+        if (!cancelled) setFetched(settings);
+      })
+      .catch((error: unknown) => console.warn('could not read the profile defaults:', error));
+
+    return () => {
+      cancelled = true;
+    };
+  }, [state.settings]);
+
+  return state.settings ?? fetched;
+}
+
+/**
+ * A control's value, owned by the engine but not waiting for it.
+ *
+ * Every write here is echoed back as a `userUpdated` or `groupUpdated` event,
+ * so the stored value is the source of truth and a change made on another
+ * device still reaches the control. Keeping a copy beside it is what stops a
+ * select snapping back to its old value for the length of a round trip, which
+ * is what made the retention select look inert.
+ */
+function useStoredValue<T>(stored: T): [T, (next: T) => void] {
+  const [value, setValue] = React.useState(stored);
+  const [seed, setSeed] = React.useState(stored);
+
+  // Adjusted during render rather than in an effect, which is React's own
+  // advice for resetting state from a prop: nothing ever paints the stale one.
+  if (seed !== stored) {
+    setSeed(stored);
+    setValue(stored);
+  }
+
+  return [value, setValue];
+}
+
+/**
+ * Unblock a contact and put the conversation back in the list.
+ *
+ * Go ties the two together in the reducer — `SetBlocked` also sets
+ * `open = !blocked` (`chat/update_dm.go:382-383`) — while the Rust reducer
+ * applies only the flag it was handed (`engine/mod.rs:1333-1334`). The second
+ * call is this client's half of that pairing, so unblocking cannot leave
+ * someone unblocked but with no thread to reach them through.
+ */
+export async function unblockContact(userId: string): Promise<void> {
+  await window.bounce.setUserBlocked(userId, false);
+  await window.bounce.setOpenDm(userId, true);
+}
+
 /* ------------------------------------------------------------------ */
 
-function ContactDetails({ user, state }: { user: User; state: State }) {
+function ContactDetails({
+  user,
+  state,
+  defaults,
+}: {
+  user: User;
+  state: State;
+  defaults: Settings | null;
+}) {
   const [alias, setAlias] = React.useState(user.alias);
-  const [notes, setNotes] = React.useState('');
+  // Seeded from the stored note, and re-seeded when one arrives from another
+  // device, the way `SetUserState` re-seeds the Fyne entry (`ui/user.go:131`).
+  const [notes, setNotes] = useStoredValue(user.notes);
   const isSelf = state.profile?.id === user.id;
 
   return (
@@ -122,13 +245,27 @@ function ContactDetails({ user, state }: { user: User; state: State }) {
               value={notes}
               rows={3}
               onChange={(event) => setNotes(event.target.value)}
-              onBlur={() => void window.bounce.setUserNotes(user.id, notes)}
+              onBlur={() => {
+                // Go saves from a button and cancels back to the stored text
+                // (`ui/direct_message.go:780-791`); a blur is this panel's save
+                // button, so it has to be a save of *something*. An unchanged
+                // write is not harmless: `SetNotes` syncs to your own devices
+                // and leaves no record to replay back from.
+                if (notes !== user.notes) void window.bounce.setUserNotes(user.id, notes);
+              }}
             />
           </Field>
         </Section>
       )}
 
-      <ConversationSettings conversationId={user.id} mutedUntil={user.mutedUntil} />
+      <ConversationSettings
+        conversationId={user.id}
+        mutedUntil={user.mutedUntil}
+        retention={user.retention}
+        defaults={defaults}
+        // A `User` carries exactly the four fields `Overrides` names.
+        overrides={user}
+      />
 
       {!isSelf && (
         <Section title="Danger zone">
@@ -138,16 +275,22 @@ function ContactDetails({ user, state }: { user: User; state: State }) {
             onConfirm={() => window.bounce.clearHistory(user.id)}
           />
           {user.blocked ? (
-            <button
-              className="details__action"
-              onClick={() => void window.bounce.setUserBlocked(user.id, false)}
-            >
+            <button className="details__action" onClick={() => void unblockContact(user.id)}>
               Unblock {user.name}
             </button>
           ) : (
             <DestructiveButton
               label={`Block ${user.name}`}
-              confirm={`Block ${user.name}? Their messages will be refused rather than hidden.`}
+              // Blocking takes the conversation out of the list, so the
+              // sentence says where the contact went and how to get them back.
+              // There is no directory to re-find anyone through, and re-pairing
+              // in person does not clear the flag (`engine/mod.rs:1079-1086`),
+              // so an unadvertised route back is the same as no route back.
+              confirm={
+                `Block ${user.name}? Their messages will be refused rather than hidden, ` +
+                'and the conversation leaves your list. You can unblock them from ' +
+                'Settings, under Contacts.'
+              }
               onConfirm={() => window.bounce.setUserBlocked(user.id, true)}
             />
           )}
@@ -220,7 +363,12 @@ function GroupDetails({ group, state }: { group: Group; state: State }) {
                   setInviting(false);
                 }}
               >
-                <Avatar id={contact.id} name={contact.alias || contact.name} size={28} />
+                <Avatar
+                  id={contact.id}
+                  name={contact.alias || contact.name}
+                  images={contact.images}
+                  size={28}
+                />
                 <span className="details__member-name">{contact.alias || contact.name}</span>
                 <span className="details__link">Invite</span>
               </button>
@@ -243,7 +391,12 @@ function GroupDetails({ group, state }: { group: Group; state: State }) {
 
           return (
             <div key={memberId} className="details__member">
-              <Avatar id={memberId} name={realName} size={28} />
+              <Avatar
+                id={memberId}
+                name={realName}
+                images={state.users[memberId]?.images}
+                size={28}
+              />
               <span className="details__member-name">{displayName}</span>
               {memberIsAdmin && <span className="details__badge">Admin</span>}
 
@@ -264,7 +417,12 @@ function GroupDetails({ group, state }: { group: Group; state: State }) {
           const displayName = invitee ? invitee.alias || invitee.name : 'Unknown';
           return (
             <div key={inviteId} className="details__member details__member--pending">
-              <Avatar id={inviteId} name={displayName} size={28} />
+              <Avatar
+                id={inviteId}
+                name={displayName}
+                images={state.users[inviteId]?.images}
+                size={28}
+              />
               <span className="details__member-name">{displayName}</span>
               <span className="details__badge">Invited</span>
               {canManageUsers && (
@@ -343,48 +501,217 @@ function GroupDetails({ group, state }: { group: Group; state: State }) {
 
 /* ------------------------------------------------------------------ */
 
+/**
+ * The per-conversation receipt and indicator state, as the views carry it.
+ *
+ * Two booleans rather than one nullable flag because that is the shape the
+ * protocol writes — `vec![override_flag, value]` (`engine/mod.rs:1452-1480`),
+ * the same two bytes Go sends — and the value byte is meaningless while the
+ * override byte is clear.
+ */
+type Overrides = {
+  readReceiptsOverridden: boolean;
+  readReceiptsEnabled: boolean;
+  typingIndicatorsOverridden: boolean;
+  typingIndicatorsEnabled: boolean;
+};
+
+/** The three states Go's override selectors offer, in Go's order. */
+export type Override = 'default' | 'on' | 'off';
+
+/**
+ * Which of the three a stored override reads as.
+ *
+ * Deliberately does not consult `enabled` while `overridden` is false, as
+ * `refreshReadReceiptSettingSelection` does not (`ui/direct_message.go:125-137`):
+ * a conversation that has never been overridden still carries a value byte, and
+ * reading it would show "Off" for a conversation that follows an "On" default.
+ */
+export function overrideSelection(overridden: boolean, enabled: boolean): Override {
+  if (!overridden) return 'default';
+  return enabled ? 'on' : 'off';
+}
+
+/** What the bridge is told for a selection; null means "follow the profile". */
+export function overrideSetting(selection: Override): boolean | null {
+  if (selection === 'default') return null;
+  return selection === 'on';
+}
+
+/**
+ * The first option's label, which tracks the profile-wide default.
+ *
+ * Go relabels it whenever the default moves (`ui/settings_container.go:288-308`)
+ * rather than writing a bare "Default", so choosing it is never a guess about
+ * what you would be following.
+ */
+export function defaultOptionLabel(enabled: boolean): string {
+  return enabled ? 'Default (On)' : 'Default (Off)';
+}
+
 /** Mute and retention, which work the same for contacts and groups. */
 function ConversationSettings({
   conversationId,
   mutedUntil,
   retention,
   retentionDisabled,
+  overrides,
+  defaults,
 }: {
   conversationId: string;
   mutedUntil: number;
   retention?: number;
   retentionDisabled?: boolean;
+  /** Omitted while a conversation's view does not carry the override state. */
+  overrides?: Overrides;
+  defaults?: Settings | null;
 }) {
   const muted = mutedUntil !== 0;
+  const [seconds, setSeconds] = useStoredValue(retention ?? 0);
 
   return (
-    <Section title="Settings">
-      <Toggle
-        label="Mute notifications"
-        checked={muted}
-        onChange={(value) =>
-          void window.bounce.setMutedUntil(conversationId, value ? MUTED_FOREVER : 0)
-        }
-      />
-
-      <Field label="Disappearing messages">
-        <select
-          className="details__input"
-          value={retention ?? 0}
-          disabled={retentionDisabled}
-          title={retentionDisabled ? 'Only admins can change this' : undefined}
-          onChange={(event) =>
-            void window.bounce.setRetention(conversationId, Number(event.target.value))
+    <>
+      <Section title="Settings">
+        <Toggle
+          label="Mute notifications"
+          checked={muted}
+          onChange={(value) =>
+            void window.bounce.setMutedUntil(conversationId, value ? MUTED_FOREVER : 0)
           }
-        >
-          {RETENTION_OPTIONS.map((option) => (
-            <option key={option.seconds} value={option.seconds}>
-              {option.label}
-            </option>
-          ))}
-        </select>
-      </Field>
+        />
+
+        <Field label="Disappearing messages">
+          <select
+            className="details__input"
+            value={seconds}
+            disabled={retentionDisabled}
+            title={retentionDisabled ? 'Only admins can change this' : undefined}
+            onChange={(event) => {
+              const chosen = Number(event.target.value);
+              setSeconds(chosen);
+              void window.bounce.setRetention(conversationId, chosen);
+            }}
+          >
+            {RETENTION_OPTIONS.map((option) => (
+              <option key={option.seconds} value={option.seconds}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </Field>
+      </Section>
+
+      {/*
+        Hidden rather than shown empty when the view has no override state:
+        a select seeded from nothing reads "Default" for a conversation that
+        was overridden elsewhere, which is worse than not offering the control.
+      */}
+      {overrides && (
+        <AdvancedOptions
+          conversationId={conversationId}
+          overrides={overrides}
+          defaults={defaults ?? null}
+        />
+      )}
+    </>
+  );
+}
+
+/**
+ * Read receipts and typing indicators for one conversation.
+ *
+ * Behind a disclosure because Go puts them behind an accordion on both edit
+ * screens (`ui/direct_message.go:961-972`): they are settings you go looking
+ * for, and a panel that leads with them reads as a privacy checklist rather
+ * than a conversation.
+ */
+function AdvancedOptions({
+  conversationId,
+  overrides,
+  defaults,
+}: {
+  conversationId: string;
+  overrides: Overrides;
+  defaults: Settings | null;
+}) {
+  // Collapsed, as Go's accordion is — except for a conversation that already
+  // carries an override, which opens showing it. A privacy setting that
+  // differs from your default should not be behind a click you have no reason
+  // to make.
+  const [open, setOpen] = React.useState(
+    overrides.readReceiptsOverridden || overrides.typingIndicatorsOverridden,
+  );
+
+  return (
+    <Section
+      title="Advanced options"
+      action={
+        <button className="details__link" onClick={() => setOpen((value) => !value)}>
+          {open ? 'Hide' : 'Show'}
+        </button>
+      }
+    >
+      {open && (
+        <>
+          <OverrideSelect
+            label="Read receipts"
+            overridden={overrides.readReceiptsOverridden}
+            enabled={overrides.readReceiptsEnabled}
+            defaultEnabled={defaults?.defaultReadReceipts ?? FALLBACK_DEFAULTS.readReceipts}
+            onChange={(setting) => void window.bounce.setReadReceipts(conversationId, setting)}
+          />
+          <OverrideSelect
+            label="Typing indicators"
+            overridden={overrides.typingIndicatorsOverridden}
+            enabled={overrides.typingIndicatorsEnabled}
+            defaultEnabled={
+              defaults?.defaultTypingIndicators ?? FALLBACK_DEFAULTS.typingIndicators
+            }
+            onChange={(setting) =>
+              void window.bounce.setTypingIndicators(conversationId, setting)
+            }
+          />
+          <p className="details__hint">
+            These apply to this conversation only. Following the default means it moves
+            when you change it in Settings.
+          </p>
+        </>
+      )}
     </Section>
+  );
+}
+
+function OverrideSelect({
+  label,
+  overridden,
+  enabled,
+  defaultEnabled,
+  onChange,
+}: {
+  label: string;
+  overridden: boolean;
+  enabled: boolean;
+  defaultEnabled: boolean;
+  onChange: (setting: boolean | null) => void;
+}) {
+  const [selection, setSelection] = useStoredValue(overrideSelection(overridden, enabled));
+
+  return (
+    <Field label={label}>
+      <select
+        className="details__input"
+        value={selection}
+        onChange={(event) => {
+          const chosen = event.target.value as Override;
+          setSelection(chosen);
+          onChange(overrideSetting(chosen));
+        }}
+      >
+        <option value="default">{defaultOptionLabel(defaultEnabled)}</option>
+        <option value="on">On</option>
+        <option value="off">Off</option>
+      </select>
+    </Field>
   );
 }
 
@@ -529,4 +856,20 @@ function DestructiveButton({
       {label}
     </button>
   );
+}
+
+/** Choose a picture and set it as the group's, reporting any refusal. */
+async function pickGroupPicture(
+  groupId: string,
+  onError: (message: string | null) => void,
+) {
+  onError(null);
+  const file = await choosePicture();
+  if (!file) return;
+
+  try {
+    await window.bounce.setGroupImage(groupId, await prepareImage(file));
+  } catch (failure) {
+    onError(failure instanceof Error ? failure.message : String(failure));
+  }
 }

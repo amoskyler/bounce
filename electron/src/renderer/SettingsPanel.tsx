@@ -17,10 +17,12 @@
 import * as React from 'react';
 
 import { Avatar } from './Avatar';
-import { CloseIcon } from './icons';
+import { unblockContact } from './DetailsPanel';
+import { CloseIcon, QrCode } from './icons';
 import { conversationTimestamp, shortAddress } from './format';
+import { choosePicture, prepareImage } from './outgoing-image';
 import { version } from '../../package.json';
-import type { Device, Settings, TransportInfo } from '../preload';
+import type { Device, Settings, TransportInfo, User } from '../preload';
 import type { State } from './state';
 
 // Imported here rather than from the entry point so the panel travels with its
@@ -29,17 +31,6 @@ import './settings.css';
 
 /** Where the source lives, for the About section. */
 const PROJECT_URL = 'https://github.com/bounce-chat/bounce';
-
-/**
- * Why the device controls are inert.
- *
- * `frames/pairing.rs` has the wire format for adopting a second device, but
- * nothing drives it, so a device list on a running client always has exactly
- * one row in it.
- */
-const PAIRING_PENDING =
-  'Multi-device pairing is not implemented yet. The frames exist in the core, but ' +
-  'nothing drives the flow that adopts or retires a second device.';
 
 /**
  * Retention choices for new conversations.
@@ -128,6 +119,7 @@ export function SettingsPanel({ state, onClose }: SettingsProps) {
       <div className="settings__body">
         <ProfileSection state={state} />
         <DevicesSection devices={state.devices} />
+        <ContactsSection state={state} />
         <DefaultsSection />
         <AboutSection />
       </div>
@@ -141,12 +133,33 @@ function ProfileSection({ state }: { state: State }) {
   const profile = state.profile;
   const storedName = profile?.name ?? '';
   const [name, setName] = React.useState(storedName);
+  const [pictureError, setPictureError] = React.useState<string | null>(null);
 
   return (
     <>
       <div className="settings__identity">
-        <Avatar id={profile?.id ?? state.address} name={storedName || 'You'} size={96} />
+        {/*
+          The avatar is the control. A separate "change picture" button beside
+          it would say the same thing twice, and clicking your own face is what
+          people try first.
+        */}
+        <button
+          className="settings__avatar-button"
+          onClick={() => void pickProfilePicture(setPictureError)}
+          title="Change your picture"
+          aria-label="Change your picture"
+        >
+          <Avatar
+            images={profile?.images}
+            id={profile?.id ?? state.address}
+            name={storedName || 'You'}
+            size={96}
+          />
+          <span className="settings__avatar-overlay">Change</span>
+        </button>
       </div>
+
+      {pictureError && <p className="settings__error">{pictureError}</p>}
 
       <Section title="Profile">
         <Field label="Display name">
@@ -221,6 +234,9 @@ function AddressWithCopy({ address }: { address: string }) {
 /* ------------------------------------------------------------------ */
 
 function DevicesSection({ devices }: { devices: Device[] }) {
+  const [linking, setLinking] = React.useState(false);
+  const [revoking, setRevoking] = React.useState<Device | null>(null);
+
   // The local device first, then the rest by name, so the row a user is
   // looking for is never buried by connection order.
   const ordered = [...devices].sort((a, b) => {
@@ -242,7 +258,35 @@ function DevicesSection({ devices }: { devices: Device[] }) {
           />
           <div className="settings__device-text">
             <div className="settings__device-name">
-              <span className="settings__device-label">{device.name}</span>
+              {/*
+                Editable in place. The name is local — nothing is broadcast —
+                so this writes on blur and lets the engine's `deviceUpdated`
+                event put the value back, rather than holding a second copy.
+              */}
+              <input
+                className="settings__device-label settings__device-input"
+                defaultValue={device.name}
+                aria-label={`Name for ${shortAddress(device.address)}`}
+                onBlur={(event) => {
+                  const name = event.target.value.trim();
+                  if (!name || name === device.name) {
+                    event.target.value = device.name;
+                    return;
+                  }
+                  void window.bounce.renameDevice(device.id, name).catch(() => {
+                    // A rename that does not take should not leave the field
+                    // showing something the engine never accepted.
+                    event.target.value = device.name;
+                  });
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter') event.currentTarget.blur();
+                  if (event.key === 'Escape') {
+                    event.currentTarget.value = device.name;
+                    event.currentTarget.blur();
+                  }
+                }}
+              />
               {device.local && <span className="settings__badge">This device</span>}
               {device.revoked && <span className="settings__badge">Revoked</span>}
             </div>
@@ -256,19 +300,29 @@ function DevicesSection({ devices }: { devices: Device[] }) {
               <span>{presence(device)}</span>
             </div>
           </div>
-          <button className="settings__link" disabled title={PAIRING_PENDING}>
-            Revoke
-          </button>
+          {/*
+            A device cannot revoke itself: it would be signing away its own
+            ability to sign, including for the frame that says so.
+          */}
+          {!device.local && !device.revoked && (
+            <button
+              className="settings__link settings__link--destructive"
+              onClick={() => setRevoking(device)}
+            >
+              Revoke
+            </button>
+          )}
         </div>
       ))}
 
-      <button className="settings__action" disabled title={PAIRING_PENDING}>
-        Add device
+      <button className="settings__action" onClick={() => setLinking(true)}>
+        Link a device
       </button>
-      <p className="settings__hint">
-        Pairing a second device is not built yet, so this profile lives on this device
-        alone. Losing it loses the identity with it.
-      </p>
+
+      {linking && <LinkDeviceDialog onClose={() => setLinking(false)} />}
+      {revoking && (
+        <RevokeDeviceDialog device={revoking} onClose={() => setRevoking(null)} />
+      )}
     </Section>
   );
 }
@@ -278,6 +332,112 @@ function presence(device: Device): string {
   if (device.online) return 'Active now';
   if (!device.lastSeen) return 'Never connected';
   return `Last seen ${conversationTimestamp(device.lastSeen)}`;
+}
+
+/* ------------------------------------------------------------------ */
+
+/**
+ * The contacts this profile knows, blocked ones included.
+ *
+ * The sidebar is a list of *conversations*, and a blocked contact has none, so
+ * blocking used to be a one-way door: the only Unblock button lived in a panel
+ * that blocking unmounted, and there is no directory to re-find anyone through
+ * — re-pairing in person does not clear the flag either
+ * (`engine/mod.rs:1079-1086`). Go pairs blocking with a browser over the
+ * contact store for exactly this reason, with a "Show Blocked" checkbox
+ * (`ui/new_dm_container.go:64-68`); this is that list. It reads `state.users`
+ * rather than `conversations()`, so nothing a contact's own state does can
+ * remove the row that undoes it.
+ *
+ * @param users every known user
+ * @param myId the profile's own id, which is a conversation but not a contact
+ */
+export function visibleContacts(
+  users: readonly User[],
+  myId: string | undefined,
+  showBlocked: boolean,
+): User[] {
+  return users
+    .filter((user) => user.id !== myId && (showBlocked || !user.blocked))
+    .sort((a, b) => (a.alias || a.name).localeCompare(b.alias || b.name));
+}
+
+function ContactsSection({ state }: { state: State }) {
+  const [showBlocked, setShowBlocked] = React.useState(false);
+  const known = Object.values(state.users);
+  const contacts = visibleContacts(known, state.profile?.id, showBlocked);
+  const blocked = known.filter((user) => user.blocked && user.id !== state.profile?.id).length;
+
+  return (
+    <Section title={`Contacts (${contacts.length})`}>
+      {known.length === 0 && (
+        <p className="settings__hint">
+          No contacts yet. Adding one is an exchange of pairing codes in person.
+        </p>
+      )}
+
+      {contacts.map((contact) => {
+        const name = contact.alias || contact.name;
+        return (
+          <div
+            key={contact.id}
+            className={
+              contact.blocked ? 'settings__contact settings__contact--blocked' : 'settings__contact'
+            }
+          >
+            <Avatar id={contact.id} name={name} size={28} />
+            <div className="settings__contact-text">
+              <div className="settings__contact-name">
+                <span className="settings__contact-label">{name}</span>
+                {contact.blocked && <span className="settings__badge">Blocked</span>}
+              </div>
+              <code className="settings__contact-address">{shortAddress(contact.id)}</code>
+            </div>
+
+            {contact.blocked ? (
+              <button
+                className="settings__link"
+                onClick={() => {
+                  void unblockContact(contact.id).catch((error: unknown) =>
+                    console.warn('could not unblock:', error),
+                  );
+                }}
+              >
+                Unblock
+              </button>
+            ) : (
+              // A contact whose thread has been closed is still a contact, so
+              // the row that reopens it is here rather than nowhere.
+              !contact.openDm && (
+                <button
+                  className="settings__link"
+                  onClick={() => {
+                    void window.bounce
+                      .setOpenDm(contact.id, true)
+                      .catch((error: unknown) =>
+                        console.warn('could not open the conversation:', error),
+                      );
+                  }}
+                >
+                  Open
+                </button>
+              )
+            )}
+          </div>
+        );
+      })}
+
+      {/* Always offered, not only when something is hidden: someone who has
+          just blocked a contact comes here to look for them, and a checkbox
+          that appears only once you know it exists is no help. */}
+      <Toggle label="Show blocked" checked={showBlocked} onChange={setShowBlocked} />
+      {blocked > 0 && !showBlocked && (
+        <p className="settings__hint">
+          {blocked === 1 ? '1 blocked contact is' : `${blocked} blocked contacts are`} hidden.
+        </p>
+      )}
+    </Section>
+  );
 }
 
 /* ------------------------------------------------------------------ */
@@ -519,4 +679,151 @@ function Toggle({
       />
     </label>
   );
+}
+
+/* ------------------------------------------------------------------ */
+
+/**
+ * Show a code that lets another device join this profile.
+ *
+ * The warning is not decoration. This code and the "add a contact" code look
+ * identical and are read the same way, and they grant entirely different
+ * things: one lets somebody message you, this one hands over the profile's
+ * private keys. The engine keeps their secrets in separate tables so one
+ * cannot be redeemed for the other, but a person holding a phone cannot see
+ * that — the screen has to say it.
+ */
+function LinkDeviceDialog({ onClose }: { onClose: () => void }) {
+  const [code, setCode] = React.useState('');
+  const [error, setError] = React.useState<string | null>(null);
+  const [copied, setCopied] = React.useState(false);
+
+  React.useEffect(() => {
+    void window.bounce
+      .createSyncCode()
+      .then(setCode)
+      .catch((failure: unknown) => setError(String(failure)));
+  }, []);
+
+  React.useEffect(() => {
+    if (!copied) return;
+    const timer = window.setTimeout(() => setCopied(false), 2000);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
+
+  return (
+    <div className="modal__backdrop" onClick={onClose}>
+      <div className="modal" onClick={(event) => event.stopPropagation()}>
+        <div className="modal__title">Link a device</div>
+
+        <p className="settings__hint" style={{ marginTop: 0 }}>
+          On the new device, choose <strong>Link to an existing profile</strong> and
+          enter this code. It expires in five minutes and works once.
+        </p>
+
+        <p className="settings__warning">
+          Anyone who uses this code becomes one of your devices and receives your
+          private keys. Only show it to a device you own.
+        </p>
+
+        {code && (
+          <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 12 }}>
+            <QrCode text={code} size={196} />
+          </div>
+        )}
+
+        <div className="settings__address-row">
+          <code className="settings__address">{code || 'Generating…'}</code>
+          <button
+            className="settings__copy"
+            disabled={!code}
+            onClick={() => {
+              void navigator.clipboard.writeText(code).then(() => setCopied(true));
+            }}
+          >
+            {copied ? 'Copied' : 'Copy'}
+          </button>
+        </div>
+
+        {error && <p className="settings__error">{error}</p>}
+
+        <div className="modal__actions">
+          <button className="modal__button" onClick={onClose}>
+            Done
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Confirm before retiring a device.
+ *
+ * Revocation is global and permanent: every contact is told, and the device
+ * can never be readmitted under the same identity, because its address *is*
+ * its key. Worth a sentence and a second click.
+ */
+function RevokeDeviceDialog({ device, onClose }: { device: Device; onClose: () => void }) {
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+
+  const revoke = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await window.bounce.revokeDevice(device.id);
+      onClose();
+    } catch (failure) {
+      setError(String(failure));
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="modal__backdrop" onClick={onClose}>
+      <div className="modal" onClick={(event) => event.stopPropagation()}>
+        <div className="modal__title">Revoke this device?</div>
+
+        <p className="settings__hint" style={{ marginTop: 0 }}>
+          <code>{shortAddress(device.address)}</code>
+          {device.name ? ` — ${device.name}` : ''}
+        </p>
+
+        <p className="settings__warning">
+          Every contact is told to stop trusting it, and it cannot be added back:
+          a device's address is its key. Anything it signed before now stays
+          valid, so your history is not affected.
+        </p>
+
+        {error && <p className="settings__error">{error}</p>}
+
+        <div className="modal__actions">
+          <button className="modal__button" onClick={onClose} disabled={busy}>
+            Cancel
+          </button>
+          <button
+            className="modal__button modal__button--destructive"
+            onClick={() => void revoke()}
+            disabled={busy}
+          >
+            {busy ? 'Revoking…' : 'Revoke'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** Choose a picture and set it as the profile's, reporting any refusal. */
+async function pickProfilePicture(onError: (message: string | null) => void) {
+  onError(null);
+  const file = await choosePicture();
+  if (!file) return;
+
+  try {
+    await window.bounce.setProfileImage(await prepareImage(file));
+  } catch (failure) {
+    onError(failure instanceof Error ? failure.message : String(failure));
+  }
 }

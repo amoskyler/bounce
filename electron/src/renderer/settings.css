@@ -211,6 +211,51 @@
   user-select: text;
 }
 
+/* A contact row. Shaped like a device row but written out separately, as the
+ * note at the top of this file asks: it leads with an avatar rather than a
+ * presence dot, and the two are free to diverge further. */
+.settings__contact {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 6px 0;
+}
+
+/* Blocked contacts are dimmed rather than removed: they are listed precisely
+ * so that blocking can be undone, and the row should read as switched off. */
+.settings__contact--blocked {
+  opacity: 0.6;
+}
+
+.settings__contact-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.settings__contact-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 14px;
+}
+
+.settings__contact-label {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.settings__contact-address {
+  display: block;
+  margin-top: 2px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: var(--text-tertiary);
+  user-select: text;
+}
+
 .settings__badge {
   flex-shrink: 0;
   padding: 1px 7px;
@@ -283,4 +328,97 @@
 .settings__about-value {
   color: var(--text-secondary);
   font-variant-numeric: tabular-nums;
+}
+
+/*
+ * The device name is an input that does not look like one until you reach for
+ * it — a settings list full of boxes reads as a form to fill in rather than a
+ * list of what you own.
+ */
+.settings__device-input {
+  border: 1px solid transparent;
+  border-radius: 4px;
+  padding: 1px 4px;
+  margin: -1px -4px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  min-width: 0;
+  flex: 1;
+}
+
+.settings__device-input:hover {
+  border-color: var(--divider);
+}
+
+.settings__device-input:focus {
+  outline: none;
+  border-color: var(--ultramarine);
+  background: var(--input-background);
+}
+
+/* --------------------------------------------------------------------------
+ * Changing a picture
+ * -------------------------------------------------------------------------- */
+
+/*
+ * The avatar itself is the control, so the affordance has to appear on hover
+ * rather than sitting beside it permanently — a "change" button next to your
+ * own face says the same thing twice.
+ */
+.settings__avatar-button {
+  position: relative;
+  display: block;
+  border-radius: 50%;
+  overflow: hidden;
+  line-height: 0;
+}
+
+.settings__avatar-overlay {
+  position: absolute;
+  inset: auto 0 0 0;
+  padding: 6px 0 8px;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1;
+  text-align: center;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.55);
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+
+.settings__avatar-button:hover .settings__avatar-overlay,
+.settings__avatar-button:focus-visible .settings__avatar-overlay {
+  opacity: 1;
+}
+
+/* --------------------------------------------------------------------------
+ * Warnings and errors in panels
+ * -------------------------------------------------------------------------- */
+
+/*
+ * For consequences rather than failures: revoking a device, or showing a code
+ * that hands over the private keys. Tinted rather than red text, because it is
+ * describing what is about to happen, not reporting that something went wrong.
+ */
+.settings__warning {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-primary);
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--red) 30%, transparent);
+}
+
+.settings__error {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: var(--red);
+}
+
+.settings__link--destructive {
+  color: var(--red);
 }

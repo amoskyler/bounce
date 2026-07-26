@@ -16,6 +16,13 @@ use uuid::Uuid;
 use super::settings::SettingsView;
 
 /// A snapshot of a user, as the interface needs it.
+///
+/// The per-conversation settings below are carried for the same reason
+/// [`GroupView`] carries them: every one of these controls is *seeded* from the
+/// current value, so a view that omits one leaves its widget stuck on the
+/// default. A retention selector that always reads "Off" is not a cosmetic
+/// defect — it tells the user their messages are kept when they are expiring,
+/// or the reverse.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserView {
@@ -29,6 +36,28 @@ pub struct UserView {
     pub introduction_time: i64,
     pub last_activity: i64,
     pub muted_until: i64,
+    /// How long messages in this thread are kept, in seconds; zero keeps them
+    /// indefinitely.
+    pub retention: i64,
+    /// Messages written before this are gone, on every device in the thread.
+    pub clear_before: i64,
+    /// Whether the conversation is on the thread list. A contact exists before
+    /// there is anything to show for them.
+    pub open_dm: bool,
+    /// Private notes about the contact, never sent to them.
+    pub notes: String,
+    /// Whether this conversation overrides the profile-wide read receipt
+    /// setting, and what it overrides it to. Two fields rather than an
+    /// `Option<bool>` because that is the shape the wire and the store already
+    /// use — see `UpdateDmType::SetReadReceipts`, which encodes exactly these
+    /// two bytes.
+    pub read_receipts_overridden: bool,
+    pub read_receipts_enabled: bool,
+    pub typing_indicators_overridden: bool,
+    pub typing_indicators_enabled: bool,
+    /// When this conversation was last opened, which is what keeps a thread
+    /// with an unsent draft from sinking down the list.
+    pub last_opened: i64,
     pub online: bool,
 }
 
@@ -47,6 +76,7 @@ pub struct GroupView {
     pub last_activity: i64,
     pub muted_until: i64,
     pub retention: i64,
+    pub last_opened: i64,
     pub restrict_posting: bool,
     pub restrict_group_edits: bool,
     pub restrict_user_management: bool,
@@ -289,6 +319,47 @@ mod tests {
         assert!(json.get("syncDevices").is_some());
         assert!(json.get("systemMessages").is_some());
         assert!(json["messages"][0].get("writtenAt").is_some());
+    }
+
+    #[test]
+    fn a_user_carries_the_settings_its_controls_are_seeded_from() {
+        // Each of these drives a widget the client renders as a *controlled*
+        // input: absent the value, the widget reads its default, and choosing
+        // anything else snaps straight back. The retention selector spent this
+        // whole gap reading "Off" for conversations that were expiring.
+        let view = UserView {
+            id: Uuid::nil(),
+            name: "Alice".into(),
+            alias: String::new(),
+            images: vec![],
+            blocked: false,
+            accepted: true,
+            introduction_time: 0,
+            last_activity: 0,
+            muted_until: 0,
+            retention: 3600,
+            clear_before: 12,
+            open_dm: true,
+            notes: "met at the conference".into(),
+            read_receipts_overridden: true,
+            read_receipts_enabled: false,
+            typing_indicators_overridden: false,
+            typing_indicators_enabled: true,
+            last_opened: 90,
+            online: false,
+        };
+        let json = serde_json::to_value(&view).unwrap();
+
+        assert_eq!(json["retention"], 3600);
+        assert_eq!(json["lastOpened"], 90);
+        assert_eq!(json["clearBefore"], 12);
+        assert_eq!(json["openDm"], true);
+        assert_eq!(json["notes"], "met at the conference");
+        assert_eq!(json["readReceiptsOverridden"], true);
+        assert_eq!(json["readReceiptsEnabled"], false);
+        assert_eq!(json["typingIndicatorsOverridden"], false);
+        assert_eq!(json["typingIndicatorsEnabled"], true);
+        assert!(json.get("clear_before").is_none(), "got {json}");
     }
 
     #[test]

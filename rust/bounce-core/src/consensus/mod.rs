@@ -4,17 +4,20 @@
 //! group's name, membership, admin list, and permissions — even when updates
 //! arrive out of order and even when a participant lies about when they acted.
 //!
-//! Two mechanisms produce that agreement:
+//! Three mechanisms produce that agreement:
 //!
 //! - **[`state`]** defines what a group's state is, which changes are permitted
 //!   against it, and how each change is applied.
 //! - **[`stack`]** replays updates in timestamp order and resolves conflicts,
 //!   using confirmations from other members to decide which of two mutually
 //!   exclusive updates survives.
+//! - **[`confirmation`]** produces those confirmations and vets the ones peers
+//!   send, which is what keeps the conflict resolution supplied with evidence.
 //!
 //! See the [`stack`] module documentation for the attack this design defends
 //! against and how confirmations defeat it.
 
+pub mod confirmation;
 pub mod stack;
 pub mod state;
 

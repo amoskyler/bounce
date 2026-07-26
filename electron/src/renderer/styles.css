@@ -229,8 +229,13 @@ textarea {
  * Rows are pinned explicitly rather than left to auto-placement: with no
  * banner present the panes would otherwise land in the auto-sized first row and
  * collapse to their content height instead of filling the window.
+ *
+ * The banners share one grid item rather than taking one each, because grid
+ * placement would stack two simultaneous warnings on top of each other.
  */
-.app > .banner {
+.app > .app__banners {
+  display: flex;
+  flex-direction: column;
   grid-column: 1 / -1;
   grid-row: 1;
 }
@@ -369,6 +374,20 @@ textarea {
   color: var(--text-secondary);
   font-size: 13px;
   line-height: 1.5;
+}
+
+.left-pane__empty-action {
+  margin-top: 12px;
+  padding: 6px 14px;
+  border-radius: 16px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--ultramarine);
+  transition: background 0.08s ease;
+}
+
+.left-pane__empty-action:hover {
+  background: var(--row-hover);
 }
 
 /* --------------------------------------------------------------------------
@@ -1095,12 +1114,40 @@ textarea {
   animation: typing-pulse 1.4s infinite ease-in-out;
 }
 
-.typing__dot:nth-child(2) {
+/*
+ * Counted from the end, not the start. The dots used to be the only children
+ * of `.typing`, so `nth-child` addressed them; now that avatars and a name can
+ * precede them, only their position relative to the end is fixed.
+ */
+.typing__dot:nth-last-child(2) {
   animation-delay: 0.2s;
 }
 
-.typing__dot:nth-child(3) {
+.typing__dot:nth-last-child(1) {
   animation-delay: 0.4s;
+}
+
+/* Who is typing, when that is not obvious — which is to say, in a group. */
+.typing__who {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-right: 2px;
+  white-space: nowrap;
+}
+
+/*
+ * Faces overlap slightly, the way a stack of avatars does everywhere else, so
+ * eight of them still fit beside the dots.
+ */
+.typing__face {
+  margin-right: -6px;
+  border: 1.5px solid var(--bubble-incoming-background);
+  box-sizing: content-box;
+  flex-shrink: 0;
+}
+
+.typing__face:last-of-type {
+  margin-right: 4px;
 }
 
 @keyframes typing-pulse {
@@ -1133,8 +1180,13 @@ textarea {
   background: var(--timeline-background);
 }
 
+/*
+ * Barely dimmed, not faded out. The mark used to be a monochrome outline that
+ * needed knocking back to sit quietly behind the text; it is now the real
+ * three-colour logo, and 25% opacity turned it into grey mud.
+ */
 .placeholder__logo {
-  opacity: 0.25;
+  opacity: 0.9;
 }
 
 .placeholder__title {
@@ -1302,6 +1354,99 @@ textarea {
 }
 
 /* --------------------------------------------------------------------------
+ * Contacts
+ * -------------------------------------------------------------------------- */
+
+/* The contact list is a list of people rather than a short form, so it gets
+   more room than the dialogs that ask one question. */
+.modal--wide {
+  max-width: 420px;
+}
+
+.contacts__filter {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.contacts__list {
+  max-height: 320px;
+  margin-top: 8px;
+  overflow-y: auto;
+  border-top: 1px solid var(--divider);
+}
+
+.contacts__empty {
+  padding: 32px 12px;
+  text-align: center;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+.contact-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 4px;
+  border-bottom: 1px solid var(--divider);
+}
+
+.contact-row__name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The actions only appear on the row you are pointing at, so a long list reads
+   as names rather than as a column of buttons. */
+.contact-row__action {
+  flex-shrink: 0;
+  padding: 5px 12px;
+  border-radius: 14px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--ultramarine);
+  opacity: 0;
+  transition: background 0.08s ease, opacity 0.08s ease;
+}
+
+.contact-row:hover .contact-row__action,
+.contact-row__action:focus-visible {
+  opacity: 1;
+}
+
+.contact-row__action:hover {
+  background: var(--row-hover);
+}
+
+.contact-row__action--primary {
+  background: var(--ultramarine);
+  color: #ffffff;
+}
+
+.contact-row__action--primary:hover {
+  background: var(--ultramarine-hover);
+}
+
+.contact-row__tag {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: var(--row-selected);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+/* --------------------------------------------------------------------------
  * Banner
  * -------------------------------------------------------------------------- */
 
@@ -1317,6 +1462,18 @@ textarea {
 
 .banner--offline {
   background: var(--gray-62);
+  justify-content: center;
+}
+
+/*
+ * Revocation is not a transport hiccup: nothing this device sends will be
+ * accepted again, so it is styled like the no-Tor warning rather than like the
+ * network label it sits above.
+ */
+.banner--revoked {
+  background: #b8391a;
+  font-weight: 600;
+  justify-content: center;
 }
 
 .banner--syncing {
@@ -1346,4 +1503,43 @@ textarea {
   background: #b8391a;
   font-weight: 500;
   justify-content: center;
+}
+
+/*
+ * A second, quieter action beneath the primary one — "Back", or the path not
+ * taken on the first-run screen.
+ */
+.onboarding__secondary {
+  width: 100%;
+  padding: 10px 16px;
+  border-radius: 8px;
+  font-size: 14px;
+  color: var(--text-secondary);
+  background: transparent;
+  border: 1px solid var(--divider);
+}
+
+.onboarding__secondary:hover:not(:disabled) {
+  color: var(--text-primary);
+  background: var(--row-hover);
+}
+
+.onboarding__secondary:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Destructive confirmation in a dialog. */
+.modal__button--destructive {
+  color: #fff;
+  background: var(--red);
+}
+
+.modal__button--destructive:hover:not(:disabled) {
+  filter: brightness(0.92);
+}
+
+.modal__button--destructive:disabled {
+  opacity: 0.6;
+  cursor: default;
 }

@@ -1,8 +1,10 @@
 /*
- * Attachments — the composer tray, the bubble contents, and the image viewer.
+ * Attachments — the composer tray, the bubble contents, and the image viewer,
+ * plus the two other places a stored file or the scroller itself needs a rule:
+ * the avatar's photo and the timeline's jump-to-bottom control.
  *
- * Kept out of styles.css because it is one feature rather than part of the
- * shared visual system, but it borrows that system's tokens throughout: the
+ * Kept out of styles.css because these are features rather than part of the
+ * shared visual system, but they borrow that system's tokens throughout: the
  * same input background, the same bubble radii, the same gray ramp. Nothing
  * here defines a colour of its own.
  */
@@ -298,4 +300,76 @@
   background: rgba(0, 0, 0, 0.55);
   color: #fff;
   backdrop-filter: blur(2px);
+}
+
+/* --------------------------------------------------------------------------
+ * The avatar's photo
+ *
+ * A profile or group image is an ordinary stored file, fetched through the
+ * same object-URL cache as an attachment, which is why it is styled here. The
+ * circle is `.avatar`'s: it already clips, so this only has to fill it.
+ * -------------------------------------------------------------------------- */
+
+.avatar__image {
+  width: 100%;
+  height: 100%;
+  /* Crop rather than letterbox: a photo of any ratio has to fill the circle. */
+  object-fit: cover;
+  user-select: none;
+}
+
+/* --------------------------------------------------------------------------
+ * Jump to bottom
+ *
+ * The timeline is a scroller inside a flex column, so the floating control
+ * needs a positioned wrapper of its own. `.timeline` keeps `flex: 1`, and the
+ * wrapper takes the place it had in the conversation column.
+ * -------------------------------------------------------------------------- */
+
+.timeline-area {
+  position: relative;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.timeline__jump {
+  position: absolute;
+  right: 18px;
+  bottom: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: var(--background);
+  color: var(--icon);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.28);
+  transition:
+    background 0.08s ease,
+    color 0.08s ease;
+}
+
+.timeline__jump:hover {
+  background: var(--row-hover);
+  color: var(--icon-hover);
+}
+
+/* The count of what is waiting below, as on the sidebar's unread rows. */
+.timeline__jump-badge {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 9px;
+  background: var(--ultramarine);
+  color: #ffffff;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 18px;
+  text-align: center;
 }

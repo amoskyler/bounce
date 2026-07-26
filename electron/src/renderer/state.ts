@@ -33,12 +33,48 @@ export type Conversation = {
   invitationPending: boolean;
 };
 
+/**
+ * Somebody this profile knows, whether or not there is a conversation open
+ * with them.
+ *
+ * The contact store and the conversation list are two different things: Go
+ * adds every user to `ui.users` but only opens a thread for the ones whose
+ * `State.Open` is set (`ui/ui.go:459-465`). This is the first of the pair, and
+ * the only route back to somebody the sidebar is not showing — there is no
+ * directory to search and no way to re-find a person otherwise.
+ */
+export type Contact = {
+  id: string;
+  name: string;
+  /** Image file ids, so the row can show a face rather than initials. */
+  images: string[];
+  online: boolean;
+  blocked: boolean;
+  /** Whether the sidebar is already showing a conversation with them. */
+  open: boolean;
+  /**
+   * Whether closing the conversation would actually take a row off the
+   * sidebar. False once there is history to keep it there; see
+   * `conversations` for why history wins.
+   */
+  hideable: boolean;
+};
+
 export type State = {
   /** False until the initial snapshot arrives. */
   loaded: boolean;
   profile: User | null;
   address: string;
   networkOnline: boolean;
+  /**
+   * True until the network has reported either way. Go opens on "network is
+   * starting..." and only says the connection was lost once it has been
+   * (`ui/ui.go:358`, `:880-886`) — the two read very differently to somebody
+   * who has just launched the app.
+   */
+  networkStarting: boolean;
+  /** This device's authorisation was withdrawn from another one of yours. */
+  deviceRevoked: boolean;
   syncing: boolean;
   syncProgress: number;
 
@@ -68,6 +104,8 @@ export const initialState: State = {
   profile: null,
   address: '',
   networkOnline: false,
+  networkStarting: true,
+  deviceRevoked: false,
   syncing: false,
   syncProgress: 0,
   users: {},
@@ -192,6 +230,12 @@ export function reducer(state: State, action: Action): State {
         profile: action.state.profile,
         address: action.address,
         networkOnline: action.state.networkOnline,
+        // A snapshot that already says we are online ends the starting state
+        // the same way an event would (`ui/ui.go:827-829` calls the same
+        // `NetworkOnline`); a snapshot saying otherwise leaves us starting,
+        // because nothing has been lost yet.
+        networkStarting: state.networkStarting && !action.state.networkOnline,
+        deviceRevoked: action.state.deviceRevoked,
         users,
         groups,
         devices: action.state.syncDevices,
@@ -230,10 +274,10 @@ export function reducer(state: State, action: Action): State {
 function applyEvent(state: State, event: EngineEvent): State {
   switch (event.type) {
     case 'networkOnline':
-      return { ...state, networkOnline: true };
+      return { ...state, networkOnline: true, networkStarting: false };
 
     case 'networkOffline':
-      return { ...state, networkOnline: false };
+      return { ...state, networkOnline: false, networkStarting: false };
 
     case 'profileCreated':
       return { ...state, profile: event.user };
@@ -434,58 +478,144 @@ function applyEvent(state: State, event: EngineEvent): State {
 }
 
 /**
- * Every conversation, ordered the way the list shows them: most recent first.
+ * The conversations that are open, ordered the way the list shows them.
+ *
+ * This is the sidebar, not the address book. Every user Go knows about goes
+ * into `ui.users`, but a thread only exists for the ones whose `open_dm` is
+ * set (`ui/ui.go:459-465`, `ui/direct_message.go:383`), and it is live
+ * membership rather than a start-up filter — `SetDMState` adds and removes the
+ * thread as the flag moves (`ui/direct_message.go:993-1017`). Somebody met
+ * through a group is a contact and nothing more, so joining a twenty-person
+ * group costs twenty contacts and no conversations.
  *
  * Recency comes from the last message rather than the stored activity
  * timestamp, so the ordering matches what is actually on screen.
  */
 export function conversations(state: State): Conversation[] {
   const myId = state.profile?.id;
-  const result: Conversation[] = [];
+
+  // Ordering carries a key the conversation itself does not, so it is held
+  // alongside for the sort and dropped again — see `sortActivityFor`.
+  const result: Array<{ conversation: Conversation; sortActivity: number }> = [];
 
   for (const user of Object.values(state.users)) {
+    // The note-to-self row below is this profile's own, and is built from the
+    // profile rather than from whatever the user table happens to hold.
+    if (user.id === myId) continue;
+
+    // Go blocks and closes together (`chat/update_dm.go:382-383` sets
+    // `open = !blocked`), so a blocked contact leaves the sidebar through the
+    // flag rather than a filter of its own. Skipping explicitly means the
+    // history rule below cannot drag them back in.
     if (user.blocked) continue;
+
+    // History outranks the flag. `open_dm` had no producer for the whole of
+    // this port's life, so a conversation somebody has genuinely been having
+    // may well carry a false one; hiding it would be a worse failure than
+    // showing a row Go would have left out.
+    if (!user.openDm && !hasHistory(state, user.id)) continue;
+
+    const lastActivity = lastActivityFor(state, user.id, user.lastActivity);
     result.push({
-      id: user.id,
-      kind: 'direct',
-      name: user.alias || user.name,
-      memberCount: 0,
-      lastActivity: lastActivityFor(state, user.id, user.lastActivity),
-      online: user.online,
-      muted: user.mutedUntil !== 0,
-      invitationPending: false,
+      conversation: {
+        id: user.id,
+        kind: 'direct',
+        name: user.alias || user.name,
+        memberCount: 0,
+        lastActivity,
+        online: user.online,
+        muted: user.mutedUntil !== 0,
+        invitationPending: false,
+      },
+      sortActivity: sortActivityFor(state, user.id, lastActivity, user.lastOpened),
     });
   }
 
   for (const group of Object.values(state.groups)) {
     const invited = myId !== undefined && !group.members.includes(myId) && group.invites.includes(myId);
+    const lastActivity = lastActivityFor(state, group.id, group.lastActivity);
     result.push({
-      id: group.id,
-      kind: 'group',
-      name: group.name,
-      memberCount: group.members.length,
-      lastActivity: lastActivityFor(state, group.id, group.lastActivity),
-      online: false,
-      muted: group.mutedUntil !== 0,
-      invitationPending: invited,
+      conversation: {
+        id: group.id,
+        kind: 'group',
+        name: group.name,
+        memberCount: group.members.length,
+        lastActivity,
+        online: false,
+        muted: group.mutedUntil !== 0,
+        invitationPending: invited,
+      },
+      sortActivity: sortActivityFor(state, group.id, lastActivity, group.lastOpened),
     });
   }
 
   // A note-to-self conversation, always available.
   if (myId) {
+    const lastActivity = lastActivityFor(state, myId, 0);
     result.push({
-      id: myId,
-      kind: 'direct',
-      name: `${state.profile?.name ?? 'You'} (You)`,
-      memberCount: 0,
-      lastActivity: lastActivityFor(state, myId, 0),
-      online: false,
-      muted: false,
-      invitationPending: false,
+      conversation: {
+        id: myId,
+        kind: 'direct',
+        name: `${state.profile?.name ?? 'You'} (You)`,
+        memberCount: 0,
+        lastActivity,
+        online: false,
+        muted: false,
+        invitationPending: false,
+      },
+      sortActivity: sortActivityFor(state, myId, lastActivity, state.profile?.lastOpened ?? 0),
     });
   }
 
-  return result.sort((a, b) => b.lastActivity - a.lastActivity || a.name.localeCompare(b.name));
+  return result
+    .sort(
+      (a, b) =>
+        b.sortActivity - a.sortActivity ||
+        a.conversation.name.localeCompare(b.conversation.name),
+    )
+    .map((entry) => entry.conversation);
+}
+
+/**
+ * Everyone this profile knows, name-ordered — the other half of the pair.
+ *
+ * Blocked contacts are listed only on request, the way Go's contact browser
+ * hides them behind a "Show Blocked" checkbox (`ui/new_dm_container.go:64-68`,
+ * filtered at `:94-96`).
+ */
+export function contacts(state: State, includeBlocked = false): Contact[] {
+  const myId = state.profile?.id;
+  const result: Contact[] = [];
+
+  for (const user of Object.values(state.users)) {
+    if (user.id === myId) continue;
+    if (user.blocked && !includeBlocked) continue;
+
+    const history = hasHistory(state, user.id);
+    result.push({
+      id: user.id,
+      name: user.alias || user.name,
+      images: user.images,
+      online: user.online,
+      blocked: user.blocked,
+      open: !user.blocked && (user.openDm || history),
+      hideable: !user.blocked && user.openDm && !history,
+    });
+  }
+
+  return result.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** Filter contacts by a search box, on the same rule as conversations. */
+export function filterContacts(list: Contact[], query: string): Contact[] {
+  const trimmed = query.trim().toLowerCase();
+  if (!trimmed) return list;
+  return list.filter((contact) => contact.name.toLowerCase().includes(trimmed));
+}
+
+function hasHistory(state: State, thread: string): boolean {
+  const messages = state.messagesByThread[thread];
+  return messages !== undefined && messages.length > 0;
 }
 
 function lastActivityFor(state: State, thread: string, fallback: number): number {
@@ -494,6 +624,29 @@ function lastActivityFor(state: State, thread: string, fallback: number): number
     return messages[messages.length - 1].writtenAt;
   }
   return fallback;
+}
+
+/**
+ * Where a conversation sits in the list, which is its newest message except
+ * when it is holding an unsent draft.
+ *
+ * A draft pins the thread to the time it was last opened (`ui/thread.go:47-62`
+ * against `hasDraft`, `ui/direct_message.go:121-123`), so half a reply typed
+ * into a quiet conversation stays to hand instead of sinking back to wherever
+ * the last message left it. Without it the row displays "Draft:" from the
+ * bottom of the list, which is the worst of both.
+ */
+function sortActivityFor(
+  state: State,
+  thread: string,
+  lastActivity: number,
+  lastOpened: number,
+): number {
+  const draft = state.drafts[thread];
+  if (draft !== undefined && draft.length > 0 && lastOpened > lastActivity) {
+    return lastOpened;
+  }
+  return lastActivity;
 }
 
 /** Filter conversations by the search box. */

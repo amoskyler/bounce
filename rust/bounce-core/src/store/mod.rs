@@ -27,7 +27,7 @@ use crate::frames::message::{
 };
 use crate::frames::pairing::{AddUser, SyncDeviceOffer};
 use crate::frames::transport::{CustomScope, DeliveryRecord, FrameReference};
-use crate::frames::update::UpdateDm;
+use crate::frames::update::{UpdateDevice, UpdateDm, UpdateUser};
 use crate::frames::SignedFrame;
 use crate::types::FrameType;
 
@@ -214,6 +214,28 @@ impl Store {
         })
     }
 
+    /// Record that a conversation was opened, whichever kind it is.
+    ///
+    /// Written on its own rather than through `save_group`, whose upsert
+    /// deliberately leaves the locally-owned columns alone: everything it
+    /// writes comes from consensus, and a recomputation must not overwrite a
+    /// choice this device made about its own view.
+    pub fn note_conversation_opened(&self, conversation: Uuid, at: i64) -> Result<()> {
+        self.with(|connection| {
+            let changed = connection.execute(
+                "UPDATE groups SET last_opened = ?2 WHERE id = ?1",
+                params![uuid_bytes(conversation), at],
+            )?;
+            if changed == 0 {
+                connection.execute(
+                    "UPDATE users SET last_opened = ?2 WHERE id = ?1",
+                    params![uuid_bytes(conversation), at],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
     /// The same, for a group.
     pub fn note_group_activity(&self, group_id: Uuid, at: i64) -> Result<()> {
         self.with(|connection| {
@@ -236,6 +258,24 @@ impl Store {
             user.devices = self.devices_for_user(user.id)?;
         }
         Ok(users)
+    }
+
+    /// Mark a set of users as accepted.
+    ///
+    /// "Accepted" means this device's owner has knowingly agreed to be in a
+    /// group with them — which is what accepting an invitation asserts about
+    /// everyone already in it. Nothing else reads it, and it never leaves the
+    /// device: the auto-join policy is its only consumer.
+    pub fn mark_users_accepted(&self, ids: &[Uuid]) -> Result<()> {
+        self.with(|connection| {
+            for id in ids {
+                connection.execute(
+                    "UPDATE users SET accepted = 1 WHERE id = ?1",
+                    params![uuid_bytes(*id)],
+                )?;
+            }
+            Ok(())
+        })
     }
 
     /// Overwrite the mutable, locally-owned fields of a user row.
@@ -425,6 +465,60 @@ impl Store {
         })
     }
 
+    /// One device, by ID.
+    pub fn device_by_id(&self, id: Uuid) -> Result<Option<Device>> {
+        self.with(|connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT * FROM devices WHERE id = ?1",
+                    params![uuid_bytes(id)],
+                    row_to_device,
+                )
+                .optional()?)
+        })
+    }
+
+    /// Store a change to a device group.
+    ///
+    /// Kept as a frame, not merely applied, because a revocation has to reach
+    /// every contact and the reference flow can only offer what it can find.
+    pub fn save_update_device(&self, update: &UpdateDevice) -> Result<()> {
+        self.with(|connection| {
+            connection.execute(
+                r#"INSERT INTO update_devices (
+                    id, target, type, data, timestamp, saved_at, author,
+                    signer, original_payload, signature
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                ON CONFLICT (id) DO NOTHING"#,
+                params![
+                    uuid_bytes(update.id),
+                    uuid_bytes(update.target),
+                    update.update_type,
+                    update.data,
+                    update.timestamp,
+                    update.saved_at,
+                    uuid_bytes(update.author),
+                    update.signed.signer,
+                    update.signed.original_payload,
+                    update.signed.signature,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn update_device(&self, id: Uuid) -> Result<Option<UpdateDevice>> {
+        self.with(|connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT * FROM update_devices WHERE id = ?1",
+                    params![uuid_bytes(id)],
+                    row_to_update_device,
+                )
+                .optional()?)
+        })
+    }
+
     pub fn revoke_device(&self, address: &str, at: i64) -> Result<()> {
         self.with(|connection| {
             connection.execute(
@@ -610,6 +704,59 @@ impl Store {
         })
     }
 
+    pub fn mark_group_message_undeliverable(&self, id: Uuid) -> Result<()> {
+        self.with(|connection| {
+            connection.execute(
+                "UPDATE group_messages SET undeliverable = 1 WHERE id = ?1",
+                params![uuid_bytes(id)],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Mark every message written before `cutoff` that has never reached a
+    /// single device, returning what changed.
+    ///
+    /// "Never reached anybody" is the absence of a delivery record for the
+    /// frame — not the absence of one for a particular peer — because a message
+    /// that got to one of the recipient's devices is delivered. The flag is
+    /// advisory: the message is kept, and it never crosses the wire.
+    pub fn mark_stale_messages_undeliverable(&self, cutoff: i64) -> Result<Vec<Uuid>> {
+        self.with(|connection| {
+            let mut marked = Vec::new();
+
+            for (table, frame_type) in [
+                ("direct_messages", FrameType::DirectMessage),
+                ("group_messages", FrameType::GroupMessage),
+            ] {
+                let mut statement = connection.prepare(&format!(
+                    "SELECT m.id FROM {table} AS m
+                     LEFT JOIN delivery_records AS d
+                       ON d.frame_id = m.id AND d.frame_type = ?1
+                     WHERE d.id IS NULL AND m.undeliverable = 0 AND m.written_at <= ?2"
+                ))?;
+                let rows = statement.query_map(params![frame_type.as_u16(), cutoff], |row| {
+                    row.get::<_, Vec<u8>>(0)
+                })?;
+                let ids: Vec<Uuid> = rows
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .filter_map(|bytes| Uuid::from_slice(&bytes).ok())
+                    .collect();
+
+                for id in &ids {
+                    connection.execute(
+                        &format!("UPDATE {table} SET undeliverable = 1 WHERE id = ?1"),
+                        params![uuid_bytes(*id)],
+                    )?;
+                }
+                marked.extend(ids);
+            }
+
+            Ok(marked)
+        })
+    }
+
     // ---------------------------------------------------------------------
     // Group messages
     // ---------------------------------------------------------------------
@@ -714,6 +861,64 @@ impl Store {
     ///
     /// Deliberately done *before* the expiry check, so a secret presented too
     /// late is still burned rather than left usable by whoever else saw it.
+    /// Replace whatever device-pairing offer was outstanding.
+    ///
+    /// A separate table from [`Store::replace_pairing_offer`] on purpose; see
+    /// the schema. Only one is ever live, so a secret shown earlier stops
+    /// working the moment a new one is displayed.
+    pub fn replace_sync_offer(&self, offer: &SyncDeviceOffer) -> Result<()> {
+        self.with(|connection| {
+            connection.execute("DELETE FROM sync_device_offers", [])?;
+            connection.execute(
+                "INSERT INTO sync_device_offers (id, timestamp, secret) VALUES (?1, ?2, ?3)",
+                params![uuid_bytes(offer.id), offer.timestamp, offer.secret],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Drop the outstanding device-pairing offer, spent or abandoned.
+    pub fn clear_sync_offers(&self) -> Result<()> {
+        self.with(|connection| {
+            connection.execute("DELETE FROM sync_device_offers", [])?;
+            Ok(())
+        })
+    }
+
+    /// Look up an outstanding device-pairing offer.
+    pub fn sync_offer_by_secret(&self, secret: &str) -> Result<Option<SyncDeviceOffer>> {
+        self.with(|connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT * FROM sync_device_offers WHERE secret = ?1",
+                    params![secret],
+                    |row| {
+                        Ok(SyncDeviceOffer {
+                            id: row_uuid(row, "id")?,
+                            timestamp: row.get("timestamp")?,
+                            secret: row.get("secret")?,
+                        })
+                    },
+                )
+                .optional()?)
+        })
+    }
+
+    /// Forget what we have already sent a device.
+    ///
+    /// Used when a device re-pairs: its first attempt evidently did not
+    /// finish, and we cannot know how much of what we sent it survived, so the
+    /// reference flow is made to offer everything again.
+    pub fn forget_deliveries_to(&self, address: &str) -> Result<()> {
+        self.with(|connection| {
+            connection.execute(
+                "DELETE FROM delivery_records WHERE destination = ?1",
+                params![address],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn burn_secret(&self, secret: &str) -> Result<()> {
         self.with(|connection| {
             connection.execute("DELETE FROM pairing_offers WHERE secret = ?1", params![secret])?;
@@ -882,6 +1087,41 @@ impl Store {
         })
     }
 
+    /// Delete every message whose retention period has run out.
+    ///
+    /// Zero means "kept indefinitely" rather than "expired at the epoch", which
+    /// is why the predicate is on `delete_at != 0` as well as the cutoff.
+    pub fn delete_expired_messages(&self, now: i64) -> Result<Vec<Uuid>> {
+        self.with(|connection| {
+            let mut removed = Vec::new();
+
+            for table in ["direct_messages", "group_messages"] {
+                let mut statement = connection.prepare(&format!(
+                    "SELECT id FROM {table} WHERE delete_at != 0 AND delete_at <= ?1"
+                ))?;
+                let rows = statement.query_map(params![now], |row| row.get::<_, Vec<u8>>(0))?;
+                for bytes in rows {
+                    if let Ok(id) = Uuid::from_slice(&bytes?) {
+                        removed.push(id);
+                    }
+                }
+
+                connection.execute(
+                    &format!("DELETE FROM {table} WHERE delete_at != 0 AND delete_at <= ?1"),
+                    params![now],
+                )?;
+            }
+
+            delete_attachments_of(connection, &removed)?;
+            // Hand the freed pages back, so the bytes are gone from the file
+            // and not merely unreferenced inside it.
+            if !removed.is_empty() {
+                connection.execute_batch("PRAGMA incremental_vacuum;")?;
+            }
+            Ok(removed)
+        })
+    }
+
     /// Delete a conversation's messages written before a cutoff.
     ///
     /// Returns the IDs removed, so the interface can drop them without
@@ -916,6 +1156,12 @@ impl Store {
                 )?;
             }
 
+            delete_attachments_of(connection, &removed)?;
+            // Hand the freed pages back, so the bytes are gone from the file
+            // and not merely unreferenced inside it.
+            if !removed.is_empty() {
+                connection.execute_batch("PRAGMA incremental_vacuum;")?;
+            }
             Ok(removed)
         })
     }
@@ -1055,6 +1301,22 @@ impl Store {
                 }
                 None => Ok(None),
             }
+        })
+    }
+
+    /// One confirmation, by ID.
+    ///
+    /// The reference flow needs this to decide who a confirmation may be
+    /// offered to, which it works out from the update it refers to.
+    pub fn confirmation(&self, id: Uuid) -> Result<Option<Confirmation>> {
+        self.with(|connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT * FROM confirmations WHERE id = ?1",
+                    params![uuid_bytes(id)],
+                    row_to_confirmation,
+                )
+                .optional()?)
         })
     }
 
@@ -1272,38 +1534,66 @@ impl Store {
     /// `authorized` decides which frames the peer is entitled to; the caller
     /// supplies it because entitlement depends on scope, which depends on state
     /// this module does not interpret.
+    ///
+    /// A message older than [`crate::UNDELIVERABLE_AFTER_SECONDS`] is left out
+    /// for anybody but our own devices. Without that floor a message that can
+    /// never be delivered — the recipient's device is gone — is re-offered on
+    /// every reconnection for the rest of the database's life, and the offer
+    /// grows without bound. Our own devices have no floor: a second device
+    /// joining a year-old profile is entitled to the whole history.
     pub fn references_not_delivered_to(
         &self,
         peer: &str,
         authorized: impl Fn(Uuid, FrameType) -> bool,
     ) -> Result<Vec<FrameReference>> {
+        let own_device = match (self.device_owner(peer)?, self.my_user_id()) {
+            (Some(owner), Ok(my_id)) => owner == my_id,
+            _ => false,
+        };
+        let cutoff = if own_device {
+            0
+        } else {
+            crate::now() - crate::UNDELIVERABLE_AFTER_SECONDS
+        };
+
         let candidates = self.with(|connection| {
             // The frame types that participate in the reference flow, each
-            // paired with the table it lives in.
+            // paired with the table it lives in and with whether that table
+            // records when the frame was written — only messages age out.
             let sources = [
-                ("direct_messages", FrameType::DirectMessage),
-                ("group_messages", FrameType::GroupMessage),
-                ("group_creations", FrameType::GroupCreation),
-                ("update_groups", FrameType::UpdateGroup),
-                ("read_receipts", FrameType::ReadReceipt),
-                ("files", FrameType::File),
-                ("update_dms", FrameType::UpdateDm),
+                ("direct_messages", FrameType::DirectMessage, true),
+                ("group_messages", FrameType::GroupMessage, true),
+                ("group_creations", FrameType::GroupCreation, false),
+                ("update_groups", FrameType::UpdateGroup, false),
+                ("read_receipts", FrameType::ReadReceipt, false),
+                ("files", FrameType::File, false),
+                ("update_dms", FrameType::UpdateDm, false),
+                ("update_users", FrameType::UpdateUser, false),
+                ("drafts", FrameType::Draft, false),
             ];
 
             let mut references = Vec::new();
-            for (table, frame_type) in sources {
+            for (table, frame_type, ages_out) in sources {
+                let floor = if ages_out { "AND t.written_at >= ?3" } else { "" };
                 let sql = format!(
                     "SELECT t.id FROM {table} AS t
                      LEFT JOIN delivery_records AS d
                        ON d.frame_id = t.id AND d.frame_type = ?2 AND d.destination = ?1
-                     WHERE d.id IS NULL"
+                     WHERE d.id IS NULL {floor}"
                 );
                 let mut statement = connection.prepare(&sql)?;
-                let rows = statement.query_map(params![peer, frame_type.as_u16()], |row| {
-                    row.get::<_, Vec<u8>>(0)
-                })?;
+                let id_of = |row: &Row| row.get::<_, Vec<u8>>(0);
+                let rows: Vec<Vec<u8>> = if ages_out {
+                    statement
+                        .query_map(params![peer, frame_type.as_u16(), cutoff], id_of)?
+                        .collect::<std::result::Result<Vec<_>, _>>()?
+                } else {
+                    statement
+                        .query_map(params![peer, frame_type.as_u16()], id_of)?
+                        .collect::<std::result::Result<Vec<_>, _>>()?
+                };
                 for bytes in rows {
-                    if let Ok(id) = Uuid::from_slice(&bytes?) {
+                    if let Ok(id) = Uuid::from_slice(&bytes) {
                         references.push(FrameReference::new(id, frame_type));
                     }
                 }
@@ -1332,6 +1622,8 @@ impl Store {
             FrameType::Device => "devices",
             FrameType::File => "files",
             FrameType::UpdateDm => "update_dms",
+            FrameType::UpdateUser => "update_users",
+            FrameType::Draft => "drafts",
             _ => return Ok(false),
         };
 
@@ -1375,6 +1667,19 @@ impl Store {
                 .update_dm(frame_id)?
                 .map(|update| update.payload())
                 .transpose()?,
+            FrameType::Confirmation => self
+                .confirmation(frame_id)?
+                .map(|confirmation| confirmation.payload())
+                .transpose()?,
+            FrameType::UpdateDevice => self
+                .update_device(frame_id)?
+                .map(|update| update.payload())
+                .transpose()?,
+            FrameType::UpdateUser => self
+                .update_user(frame_id)?
+                .map(|update| update.payload())
+                .transpose()?,
+            FrameType::Draft => self.draft(frame_id)?.map(|draft| draft.payload()).transpose()?,
             _ => None,
         })
     }
@@ -1389,6 +1694,8 @@ impl Store {
             FrameType::ReadReceipt => "read_receipts",
             FrameType::File => "files",
             FrameType::UpdateDm => "update_dms",
+            FrameType::UpdateUser => "update_users",
+            FrameType::Draft => "drafts",
             _ => return Ok(None),
         };
 
@@ -1455,6 +1762,73 @@ impl Store {
             let mut statement =
                 connection.prepare("SELECT * FROM update_dms ORDER BY timestamp, id")?;
             let rows = statement.query_map([], row_to_update_dm)?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    // ---------------------------------------------------------------------
+    // Profile updates
+    // ---------------------------------------------------------------------
+
+    /// Store a change to a user's profile.
+    pub fn save_update_user(&self, update: &UpdateUser) -> Result<()> {
+        self.with(|connection| {
+            connection.execute(
+                r#"INSERT INTO update_users (
+                    id, target, type, data, previous_data, timestamp, saved_at, seen,
+                    signer, original_payload, signature
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                ON CONFLICT (id) DO NOTHING"#,
+                params![
+                    uuid_bytes(update.id),
+                    uuid_bytes(update.target),
+                    update.update_type,
+                    update.data,
+                    update.previous_data,
+                    update.timestamp,
+                    update.saved_at,
+                    update.seen,
+                    update.signed.signer,
+                    update.signed.original_payload,
+                    update.signed.signature,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn update_user(&self, id: Uuid) -> Result<Option<UpdateUser>> {
+        self.with(|connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT * FROM update_users WHERE id = ?1",
+                    params![uuid_bytes(id)],
+                    row_to_update_user,
+                )
+                .optional()?)
+        })
+    }
+
+    /// Every stored change to one user's profile, oldest first.
+    ///
+    /// This is what the profile is rebuilt from, so the order is the order the
+    /// changes are applied in — never the order they arrived in.
+    pub fn updates_for_user(&self, target: Uuid) -> Result<Vec<UpdateUser>> {
+        self.with(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT * FROM update_users WHERE target = ?1 ORDER BY timestamp, id",
+            )?;
+            let rows = statement.query_map(params![uuid_bytes(target)], row_to_update_user)?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    /// Every stored profile update, oldest first.
+    pub fn all_update_users(&self) -> Result<Vec<UpdateUser>> {
+        self.with(|connection| {
+            let mut statement =
+                connection.prepare("SELECT * FROM update_users ORDER BY timestamp, id")?;
+            let rows = statement.query_map([], row_to_update_user)?;
             Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
         })
     }
@@ -1732,28 +2106,36 @@ impl Store {
         })
     }
 
+    /// Store a draft, replacing whatever the thread held before.
+    ///
+    /// The old row is deleted rather than updated in place, because the id is
+    /// the frame's identity: a peer that has acknowledged the previous draft
+    /// would never ask for an update filed under the same id, so editing in
+    /// place would sync the first keystroke and nothing after it. Go does the
+    /// same, at `chat/drafts.go:205-217`.
     pub fn save_draft(&self, draft: &Draft) -> Result<()> {
         self.with(|connection| {
+            connection.execute(
+                "DELETE FROM drafts WHERE thread = ?1",
+                params![uuid_bytes(draft.thread)],
+            )?;
             if draft.text.trim().is_empty() {
                 // An emptied draft is a deleted draft.
-                connection.execute(
-                    "DELETE FROM drafts WHERE thread = ?1",
-                    params![uuid_bytes(draft.thread)],
-                )?;
                 return Ok(());
             }
             connection.execute(
-                "INSERT INTO drafts (id, thread, text, timestamp, saved_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT (thread) DO UPDATE SET
-                    text = excluded.text,
-                    timestamp = excluded.timestamp",
+                "INSERT INTO drafts (
+                    id, thread, text, timestamp, saved_at, signer, original_payload, signature
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     uuid_bytes(draft.id),
                     uuid_bytes(draft.thread),
                     draft.text,
                     draft.timestamp,
                     draft.saved_at,
+                    draft.signed.signer,
+                    draft.signed.original_payload,
+                    draft.signed.signature,
                 ],
             )?;
             Ok(())
@@ -1763,18 +2145,33 @@ impl Store {
     pub fn all_drafts(&self) -> Result<Vec<Draft>> {
         self.with(|connection| {
             let mut statement = connection.prepare("SELECT * FROM drafts")?;
-            let rows = statement.query_map([], |row| {
-                Ok(Draft {
-                    signed: SignedFrame::default(),
-                    id: row_uuid(row, "id")?,
-                    thread: row_uuid(row, "thread")?,
-                    text: row.get("text")?,
-                    timestamp: row.get("timestamp")?,
-                    saved: true,
-                    saved_at: row.get("saved_at")?,
-                })
-            })?;
+            let rows = statement.query_map([], row_to_draft)?;
             Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+    }
+
+    pub fn draft(&self, id: Uuid) -> Result<Option<Draft>> {
+        self.with(|connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT * FROM drafts WHERE id = ?1",
+                    params![uuid_bytes(id)],
+                    row_to_draft,
+                )
+                .optional()?)
+        })
+    }
+
+    /// The draft a thread currently holds, if any.
+    pub fn draft_for_thread(&self, thread: Uuid) -> Result<Option<Draft>> {
+        self.with(|connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT * FROM drafts WHERE thread = ?1",
+                    params![uuid_bytes(thread)],
+                    row_to_draft,
+                )
+                .optional()?)
         })
     }
 }
@@ -1833,6 +2230,122 @@ fn row_to_user(row: &Row) -> rusqlite::Result<User> {
         blocked: row.get("blocked")?,
         accepted: row.get("accepted")?,
         devices: Vec::new(),
+    })
+}
+
+/// Delete the attachments of a set of deleted messages, and the bytes behind
+/// them.
+///
+/// Deleting the rows and leaving the blobs is the worst of both worlds: the
+/// conversation is gone from the interface and every photo in it is still
+/// recoverable from the database file, which is exactly what somebody clearing
+/// their history is trying to prevent. `chunks.file_id` cascades, so removing
+/// the `files` row is what frees the bytes.
+fn delete_attachments_of(connection: &Connection, messages: &[Uuid]) -> Result<()> {
+    for message in messages {
+        let mut files = Vec::new();
+        for table in ["file_attachments", "image_attachments"] {
+            let mut statement =
+                connection.prepare(&format!("SELECT file_id FROM {table} WHERE message_id = ?1"))?;
+            let rows = statement.query_map(params![uuid_bytes(*message)], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })?;
+            for bytes in rows {
+                if let Ok(id) = Uuid::from_slice(&bytes?) {
+                    files.push(id);
+                }
+            }
+            connection.execute(
+                &format!("DELETE FROM {table} WHERE message_id = ?1"),
+                params![uuid_bytes(*message)],
+            )?;
+        }
+
+        for file in files {
+            // A file still hanging off a message that survived is not ours to
+            // remove.
+            let referenced: i64 = connection.query_row(
+                "SELECT (SELECT COUNT(*) FROM file_attachments WHERE file_id = ?1)
+                      + (SELECT COUNT(*) FROM image_attachments WHERE file_id = ?1)",
+                params![uuid_bytes(file)],
+                |row| row.get(0),
+            )?;
+            if referenced > 0 {
+                continue;
+            }
+
+            hand_chunks_to_surviving_files(connection, file)?;
+            connection.execute("DELETE FROM files WHERE id = ?1", params![uuid_bytes(file)])?;
+        }
+    }
+    Ok(())
+}
+
+/// Before a file's chunk rows are cascaded away, give their bytes to any file
+/// that still needs them.
+///
+/// Chunks are content-addressed and shared: the same photo sent twice is two
+/// `files` rows over one set of bytes, and only the row that actually fetched
+/// them holds them — every other row for that content is an empty placeholder.
+/// Deleting the holder without this would leave the surviving copy permanently
+/// unopenable, with no way to fetch the content again.
+fn hand_chunks_to_surviving_files(connection: &Connection, file: Uuid) -> Result<()> {
+    let mut statement =
+        connection.prepare("SELECT hash, data FROM chunks WHERE file_id = ?1 AND data IS NOT NULL")?;
+    let held: Vec<(String, Vec<u8>)> = statement
+        .query_map(params![uuid_bytes(file)], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    for (hash, data) in held {
+        connection.execute(
+            "UPDATE chunks SET data = ?3, downloaded = 1
+             WHERE hash = ?2 AND file_id != ?1 AND data IS NULL",
+            params![uuid_bytes(file), hash, data],
+        )?;
+    }
+    Ok(())
+}
+
+fn row_to_draft(row: &Row) -> rusqlite::Result<Draft> {
+    Ok(Draft {
+        signed: row_to_signed_frame(row)?,
+        id: row_uuid(row, "id")?,
+        thread: row_uuid(row, "thread")?,
+        text: row.get("text")?,
+        timestamp: row.get("timestamp")?,
+        saved: true,
+        saved_at: row.get("saved_at")?,
+    })
+}
+
+fn row_to_update_user(row: &Row) -> rusqlite::Result<UpdateUser> {
+    Ok(UpdateUser {
+        signed: row_to_signed_frame(row)?,
+        id: row_uuid(row, "id")?,
+        target: row_uuid(row, "target")?,
+        update_type: row.get("type")?,
+        data: row.get::<_, Option<Vec<u8>>>("data")?.unwrap_or_default(),
+        previous_data: row
+            .get::<_, Option<Vec<u8>>>("previous_data")?
+            .unwrap_or_default(),
+        timestamp: row.get("timestamp")?,
+        saved_at: row.get("saved_at")?,
+        seen: row.get("seen")?,
+    })
+}
+
+fn row_to_update_device(row: &Row) -> rusqlite::Result<UpdateDevice> {
+    Ok(UpdateDevice {
+        signed: row_to_signed_frame(row)?,
+        id: row_uuid(row, "id")?,
+        target: row_uuid(row, "target")?,
+        update_type: row.get("type")?,
+        data: row.get::<_, Option<Vec<u8>>>("data")?.unwrap_or_default(),
+        timestamp: row.get("timestamp")?,
+        saved_at: row.get("saved_at")?,
+        author: row_uuid(row, "author")?,
     })
 }
 
@@ -2029,22 +2542,24 @@ fn save_confirmation_inner(connection: &Connection, confirmation: &Confirmation)
     Ok(())
 }
 
+fn row_to_confirmation(row: &Row) -> rusqlite::Result<Confirmation> {
+    Ok(Confirmation {
+        id: row_uuid(row, "id")?,
+        update_group_id: row_uuid(row, "update_group_id")?,
+        destination: row_uuid(row, "destination")?,
+        author: row_uuid(row, "author")?,
+        custom_scope: row_uuid(row, "custom_scope")?,
+        signing_device: row.get("signing_device")?,
+        signature: row.get("signature")?,
+        timestamp: row.get("timestamp")?,
+        saved_at: row.get("saved_at")?,
+    })
+}
+
 fn load_confirmations(connection: &Connection, update_id: Uuid) -> Result<Vec<Confirmation>> {
     let mut statement =
         connection.prepare("SELECT * FROM confirmations WHERE update_group_id = ?1")?;
-    let rows = statement.query_map(params![uuid_bytes(update_id)], |row| {
-        Ok(Confirmation {
-            id: row_uuid(row, "id")?,
-            update_group_id: row_uuid(row, "update_group_id")?,
-            destination: row_uuid(row, "destination")?,
-            author: row_uuid(row, "author")?,
-            custom_scope: row_uuid(row, "custom_scope")?,
-            signing_device: row.get("signing_device")?,
-            signature: row.get("signature")?,
-            timestamp: row.get("timestamp")?,
-            saved_at: row.get("saved_at")?,
-        })
-    })?;
+    let rows = statement.query_map(params![uuid_bytes(update_id)], row_to_confirmation)?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
@@ -2366,8 +2881,10 @@ mod tests {
         store.save_user(&me).unwrap();
         let them = Uuid::new_v4();
 
-        let delivered = DirectMessage::new(me.id, them, "already sent".into(), 1);
-        let pending = DirectMessage::new(me.id, them, "still pending".into(), 2);
+        // Written now, because an offer has an age floor: see
+        // `an_undeliverable_message_is_only_offered_to_our_own_devices`.
+        let delivered = DirectMessage::new(me.id, them, "already sent".into(), crate::now());
+        let pending = DirectMessage::new(me.id, them, "still pending".into(), crate::now());
         store.save_direct_message(&delivered).unwrap();
         store.save_direct_message(&pending).unwrap();
 
@@ -2396,8 +2913,8 @@ mod tests {
         let (me, _) = profile_user("Alice");
         store.save_user(&me).unwrap();
 
-        let allowed = DirectMessage::new(me.id, Uuid::new_v4(), "allowed".into(), 1);
-        let forbidden = DirectMessage::new(me.id, Uuid::new_v4(), "forbidden".into(), 2);
+        let allowed = DirectMessage::new(me.id, Uuid::new_v4(), "allowed".into(), crate::now());
+        let forbidden = DirectMessage::new(me.id, Uuid::new_v4(), "forbidden".into(), crate::now());
         store.save_direct_message(&allowed).unwrap();
         store.save_direct_message(&forbidden).unwrap();
 
@@ -2407,6 +2924,80 @@ mod tests {
 
         assert_eq!(references.len(), 1);
         assert_eq!(references[0].frame_id, allowed.id);
+    }
+
+    #[test]
+    fn an_undeliverable_message_is_only_offered_to_our_own_devices() {
+        // A message nobody has taken in four weeks is one nobody is going to
+        // take. Offering it forever grows the offer without bound; our own
+        // devices are the exception, because a second device joining an old
+        // profile is entitled to the whole history.
+        let store = store();
+        let (me, my_key) = profile_user("Alice");
+        store.save_user(&me).unwrap();
+
+        let ancient = DirectMessage::new(
+            me.id,
+            Uuid::new_v4(),
+            "sent into the void".into(),
+            crate::now() - crate::UNDELIVERABLE_AFTER_SECONDS - 1,
+        );
+        let recent = DirectMessage::new(me.id, Uuid::new_v4(), "fresh".into(), crate::now());
+        store.save_direct_message(&ancient).unwrap();
+        store.save_direct_message(&recent).unwrap();
+
+        let ids = |peer: &str| -> Vec<Uuid> {
+            store
+                .references_not_delivered_to(peer, |_, _| true)
+                .unwrap()
+                .into_iter()
+                .map(|reference| reference.frame_id)
+                .collect()
+        };
+
+        let stranger = ids("some-other-device");
+        assert!(stranger.contains(&recent.id));
+        assert!(!stranger.contains(&ancient.id));
+
+        // Our own device: no floor at all.
+        let mine = ids(&my_key.address());
+        assert!(mine.contains(&recent.id));
+        assert!(mine.contains(&ancient.id));
+    }
+
+    #[test]
+    fn a_message_nobody_ever_received_is_marked_undeliverable() {
+        let store = store();
+        let (me, _) = profile_user("Alice");
+        store.save_user(&me).unwrap();
+
+        let cutoff = crate::now() - crate::UNDELIVERABLE_AFTER_SECONDS;
+        let stale = DirectMessage::new(me.id, Uuid::new_v4(), "never landed".into(), cutoff - 1);
+        let delivered = DirectMessage::new(me.id, Uuid::new_v4(), "landed".into(), cutoff - 1);
+        let recent = DirectMessage::new(me.id, Uuid::new_v4(), "too soon to say".into(), crate::now());
+        for message in [&stale, &delivered, &recent] {
+            store.save_direct_message(message).unwrap();
+        }
+        store
+            .record_delivery(&DeliveryRecord::new(
+                "peer".into(),
+                delivered.id,
+                FrameType::DirectMessage,
+                0,
+            ))
+            .unwrap();
+
+        let marked = store.mark_stale_messages_undeliverable(cutoff).unwrap();
+        assert_eq!(marked, vec![stale.id]);
+        assert!(store.direct_message(stale.id).unwrap().unwrap().undeliverable);
+        assert!(!store.direct_message(delivered.id).unwrap().unwrap().undeliverable);
+        assert!(!store.direct_message(recent.id).unwrap().unwrap().undeliverable);
+
+        // Idempotent: a second pass has nothing left to say.
+        assert!(store
+            .mark_stale_messages_undeliverable(cutoff)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -2544,6 +3135,100 @@ mod tests {
         draft.text = "   ".into();
         store.save_draft(&draft).unwrap();
         assert!(store.all_drafts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_draft_keeps_the_bytes_it_was_signed_as() {
+        // Without them a stored draft cannot be relayed: `all_drafts` would be
+        // synthesising an empty signature, and a device that was offline for
+        // the keystroke has nothing to verify.
+        let store = store();
+        let (me, key) = profile_user("Alice");
+        store.save_user(&me).unwrap();
+
+        let mut draft = Draft {
+            signed: SignedFrame::default(),
+            id: Uuid::new_v4(),
+            thread: Uuid::new_v4(),
+            text: "half written".into(),
+            timestamp: 100,
+            saved: false,
+            saved_at: 7,
+        };
+        let body = crate::msgpack::to_vec(&draft).unwrap();
+        draft.signed =
+            SignedFrame::from_container(&crate::signed::SignedContainer::create(&key, body));
+        store.save_draft(&draft).unwrap();
+
+        let stored = store.draft(draft.id).unwrap().expect("the draft is stored");
+        assert_eq!(stored.signed.signer, key.address());
+        assert!(stored.signed.to_container().is_valid());
+        assert_eq!(store.frame_saved_at(draft.id, FrameType::Draft).unwrap(), Some(7));
+        assert!(store.frame_payload(draft.id, FrameType::Draft).unwrap().is_some());
+
+        // Replacing it retires the old id, because that id is what a peer
+        // acknowledged: editing in place would sync the first keystroke and
+        // nothing after it.
+        let mut replacement = draft.clone();
+        replacement.id = Uuid::new_v4();
+        replacement.text = "rewritten".into();
+        store.save_draft(&replacement).unwrap();
+
+        assert!(store.draft(draft.id).unwrap().is_none());
+        assert_eq!(store.all_drafts().unwrap().len(), 1);
+        assert_eq!(
+            store.draft_for_thread(draft.thread).unwrap().unwrap().text,
+            "rewritten"
+        );
+    }
+
+    #[test]
+    fn profile_updates_are_stored_and_replayable_in_order() {
+        let store = store();
+        let (me, key) = profile_user("Alice");
+        store.save_user(&me).unwrap();
+
+        let other = Uuid::new_v4();
+        let mut updates = Vec::new();
+        for (target, name, timestamp) in [
+            (me.id, "Alice Cooper", 200),
+            (me.id, "Alice C", 100),
+            (other, "Somebody Else", 150),
+        ] {
+            let mut update = crate::frames::update::UpdateUser::new(
+                target,
+                crate::frames::update::UpdateUserType::UpdateName,
+                name.as_bytes().to_vec(),
+                timestamp,
+            );
+            update.saved_at = timestamp;
+            update.previous_data = b"Alice".to_vec();
+            let body = crate::msgpack::to_vec(&update).unwrap();
+            update.signed =
+                SignedFrame::from_container(&crate::signed::SignedContainer::create(&key, body));
+            store.save_update_user(&update).unwrap();
+            updates.push(update);
+        }
+
+        // Oldest first, and only the one user's: the replay applies them in
+        // this order, so it is the order that decides the final name.
+        let mine = store.updates_for_user(me.id).unwrap();
+        assert_eq!(mine.len(), 2);
+        assert_eq!(mine[0].data, b"Alice C".to_vec());
+        assert_eq!(mine[1].data, b"Alice Cooper".to_vec());
+        assert_eq!(mine[0].previous_data, b"Alice".to_vec());
+        assert!(mine[0].signed.to_container().is_valid());
+
+        assert_eq!(store.all_update_users().unwrap().len(), 3);
+        assert!(store.has_frame(updates[0].id, FrameType::UpdateUser).unwrap());
+        assert!(store
+            .frame_payload(updates[0].id, FrameType::UpdateUser)
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            store.frame_saved_at(updates[0].id, FrameType::UpdateUser).unwrap(),
+            Some(200)
+        );
     }
 
     #[test]

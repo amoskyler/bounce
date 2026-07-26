@@ -11,6 +11,8 @@
 
 import * as React from 'react';
 
+import { encodeQr } from './qrcode';
+
 type IconProps = {
   size?: number;
   className?: string;
@@ -175,6 +177,16 @@ export function UndeliverableIcon({ size = 12, className }: IconProps) {
   );
 }
 
+/** The floating control that returns the timeline to its newest message. */
+export function JumpToBottomIcon({ size = 20, className }: IconProps) {
+  return (
+    <svg {...svgProps(size)} className={className}>
+      <path d="M10 4.2v11" />
+      <path d="M5.4 10.6 10 15.2l4.6-4.6" />
+    </svg>
+  );
+}
+
 /** The disappearing-messages timer shown on expiring messages. */
 export function TimerIcon({ size = 12, className }: IconProps) {
   return (
@@ -186,25 +198,153 @@ export function TimerIcon({ size = 12, className }: IconProps) {
   );
 }
 
-/** The wordmark shown in the empty state. */
-export function BounceLogo({ size = 64, className }: IconProps) {
+/** Modules of light space around a symbol. Four is the specified minimum. */
+const QUIET_ZONE = 4;
+
+/**
+ * A string as a QR code, drawn inline.
+ *
+ * The Fyne client shows the pairing code this way so the person beside you can
+ * point a phone at it. The colours are fixed rather than themed: a reader
+ * expects dark modules on a light field, and an inverted code is one more thing
+ * for a camera to get wrong in a dim room.
+ *
+ * The whole symbol is one path — a run of adjacent dark modules becomes a
+ * single rectangle — because a few thousand sibling `<rect>` elements is a real
+ * cost to lay out, and this is drawn inside a dialog that opens instantly.
+ */
+export function QrCode({
+  text,
+  size = 200,
+  className,
+}: {
+  text: string;
+  size?: number;
+  className?: string;
+}) {
+  const symbol = React.useMemo(() => {
+    if (!text) return null;
+    try {
+      return encodeQr(text);
+    } catch {
+      // Nothing a pairing code can hit — it is 89 characters against a limit of
+      // 2,331 — and a missing square is better than a broken dialog.
+      return null;
+    }
+  }, [text]);
+
+  if (!symbol) return null;
+
+  const side = symbol.size + QUIET_ZONE * 2;
+  const parts: string[] = [];
+
+  for (let y = 0; y < symbol.size; y += 1) {
+    const row = symbol.modules[y];
+    let x = 0;
+    while (x < symbol.size) {
+      if (!row[x]) {
+        x += 1;
+        continue;
+      }
+      let run = 1;
+      while (x + run < symbol.size && row[x + run]) run += 1;
+      parts.push(`M${x + QUIET_ZONE} ${y + QUIET_ZONE}h${run}v1h-${run}z`);
+      x += run;
+    }
+  }
+
   return (
     <svg
       width={size}
       height={size}
-      viewBox="0 0 64 64"
-      fill="none"
+      viewBox={`0 0 ${side} ${side}`}
+      className={className}
+      role="img"
+      aria-label="Pairing code as a QR code"
+    >
+      <rect width={side} height={side} fill="#ffffff" />
+      <path d={parts.join('')} fill="#000000" shapeRendering="crispEdges" />
+    </svg>
+  );
+}
+
+/**
+ * The Bounce mark.
+ *
+ * Taken verbatim from `ui/assets/icon.svg` — the same artwork the Fyne client
+ * and the application icon use — rather than redrawn. Two builds of the same
+ * product showing two different logos is the kind of divergence nobody files
+ * and everybody notices.
+ *
+ * Unlike every other icon in this file it ignores `currentColor`: it is a
+ * three-colour mark built from gradients, and recolouring it would make it
+ * something else.
+ */
+export function BounceLogo({ size = 64, className }: IconProps) {
+  // The gradients are referenced by id and the mark can appear more than once
+  // on a page — the empty state and the first-run screen both use it. Fixed
+  // ids would collide, and every reference in the document would resolve to
+  // whichever definition happened to be parsed first.
+  const id = React.useId().replace(/:/g, '');
+
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 400 381.737"
       className={className}
       aria-hidden
     >
-      <circle cx="32" cy="32" r="30" stroke="currentColor" strokeWidth="2.5" />
+      <defs>
+        {/* The arc. */}
+        <linearGradient
+          id={`${id}-arc`}
+          gradientUnits="userSpaceOnUse"
+          x1="165.1056"
+          y1="220.5238"
+          x2="165.1056"
+          y2="0"
+        >
+          <stop offset="0" stopColor="#40937C" />
+          <stop offset="1" stopColor="#41D26F" />
+        </linearGradient>
+
+        {/* The bowl it falls into. */}
+        <linearGradient
+          id={`${id}-bowl`}
+          gradientUnits="userSpaceOnUse"
+          x1="190.8685"
+          y1="381.7371"
+          x2="190.8685"
+          y2="122.1453"
+        >
+          <stop offset="0" stopColor="#3260E6" />
+          <stop offset="1" stopColor="#4D82FF" />
+        </linearGradient>
+
+        {/* The ball. */}
+        <linearGradient
+          id={`${id}-ball`}
+          gradientUnits="userSpaceOnUse"
+          x1="320.4202"
+          y1="129.3371"
+          x2="386.3282"
+          y2="63.4291"
+        >
+          <stop offset="0" stopColor="#F19A23" />
+          <stop offset="1" stopColor="#FFC41C" />
+        </linearGradient>
+      </defs>
+
       <path
-        d="M20 40.5V23.5h9.6c3.6 0 5.9 1.9 5.9 4.7 0 2-1.2 3.5-3 4.1 2.2.5 3.7 2.2 3.7 4.5 0 3.1-2.5 5.2-6.4 5.2H20z"
-        stroke="currentColor"
-        strokeWidth="2.5"
-        strokeLinejoin="round"
+        fill={`url(#${id}-arc)`}
+        d="M185.395,216.223c0.761,2.573,3.075,4.301,5.756,4.301c2.657,0,4.948-1.712,5.701-4.259 c12.063-40.796,38.377-76.309,74.093-99.999l2.135-1.416l-0.496-2.514c-1.038-5.268-1.565-10.635-1.565-15.953 c0-22.45,8.925-43.452,25.13-59.138l3.433-3.323l-3.992-2.626C264.462,10.822,228.249,0,190.868,0 c-31.292,0-62.328,7.746-89.753,22.401C74.574,36.583,51.43,57.164,34.185,81.918l-3.558,5.107l6.163,0.871 C106.933,97.814,165.264,148.185,185.395,216.223z"
       />
-      <path d="M40 27.5c3.5 0 6 2.8 6 6.3s-2.5 6.2-6 6.2" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" />
+      <path
+        fill={`url(#${id}-bowl)`}
+        d="M381.737,190.869c0-3.851-0.137-7.895-0.408-12.019l-0.313-4.762l-4.581,1.339 c-7.516,2.197-15.275,3.311-23.061,3.311c-23.881,0-46.583-10.414-62.285-28.573l-2.292-2.651l-2.843,2.05 c-28.468,20.534-48.567,50.545-56.594,84.503c-4.142,17.524-19.863,29.762-38.229,29.762c-18.374,0-34.091-12.221-38.221-29.719 c-15.105-63.994-71.616-110.003-137.424-111.886l-2.748-0.079l-0.953,2.578C4.1,145.526,0.136,167.393,0.003,189.715 c-0.299,50.299,19.449,98.03,55.605,134.401c17.906,18.013,38.787,32.185,62.063,42.124c24.081,10.283,49.539,15.496,75.666,15.496 h177.574h9.242l-6.535-6.535l-48.617-48.617c17.273-17.058,30.957-36.918,40.701-59.085 C376.342,243.295,381.737,217.513,381.737,190.869z"
+      />
+      <circle fill={`url(#${id}-ball)`} cx="353.374" cy="96.383" r="46.626" />
     </svg>
   );
 }

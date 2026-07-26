@@ -45,7 +45,35 @@ export interface User {
   accepted: boolean;
   introductionTime: number;
   lastActivity: number;
+  /** When this conversation was last displayed. Local; never sent. */
+  lastOpened: number;
   mutedUntil: number;
+  /** How long this conversation's messages are kept, in seconds; 0 forever. */
+  retention: number;
+  /** Messages written before this timestamp were cleared for everyone. */
+  clearBefore: number;
+  /**
+   * Whether this contact has an open conversation.
+   *
+   * The contact list and the conversation list are two lists, and this is what
+   * separates them: someone met through a group invitation is a contact
+   * without a thread until one of you writes. Hiding a conversation clears it
+   * and loses nothing.
+   */
+  openDm: boolean;
+  /** Private notes, never sent to the contact — only to your own devices. */
+  notes: string;
+  /**
+   * Per-conversation overrides of the profile-wide privacy defaults.
+   *
+   * Two fields rather than a nullable one, because that is the shape on the
+   * wire: Go encodes `[overridden, value]`. `overridden` false means the
+   * profile default applies and the `enabled` flag is not to be read.
+   */
+  readReceiptsOverridden: boolean;
+  readReceiptsEnabled: boolean;
+  typingIndicatorsOverridden: boolean;
+  typingIndicatorsEnabled: boolean;
   online: boolean;
 }
 
@@ -59,6 +87,8 @@ export interface Group {
   createdBy: string;
   createdAt: number;
   lastActivity: number;
+  /** When this conversation was last displayed. Local; never sent. */
+  lastOpened: number;
   mutedUntil: number;
   retention: number;
   restrictPosting: boolean;
@@ -286,11 +316,45 @@ const api = {
   reachFor: (conversation: string): Promise<void> =>
     ipcRenderer.invoke('bounce:reachFor', conversation),
 
+  /**
+   * A code another device can use to join this profile.
+   *
+   * Distinct from `createPairingCode` on purpose: that one invites a contact,
+   * this one hands over the profile's private keys. They look identical on
+   * screen and are not interchangeable — the engine keeps their secrets in
+   * separate tables so one cannot be redeemed for the other.
+   */
+  createSyncCode: (): Promise<string> => ipcRenderer.invoke('bounce:createSyncCode'),
+
+  /** Join an existing profile using a code from one of its devices. */
+  requestToSync: (code: string): Promise<void> =>
+    ipcRenderer.invoke('bounce:requestToSync', code),
+
+  /** Take a device out of this profile's device group. */
+  revokeDevice: (deviceId: string): Promise<void> =>
+    ipcRenderer.invoke('bounce:revokeDevice', deviceId),
+
+  setProfileImage: (image: OutgoingAttachment): Promise<void> =>
+    ipcRenderer.invoke('bounce:setProfileImage', image),
+
+  setGroupImage: (groupId: string, image: OutgoingAttachment): Promise<void> =>
+    ipcRenderer.invoke('bounce:setGroupImage', groupId, image),
+
   setMutedUntil: (conversation: string, until: number): Promise<void> =>
     ipcRenderer.invoke('bounce:setMutedUntil', conversation, until),
 
   setUserBlocked: (userId: string, blocked: boolean): Promise<void> =>
     ipcRenderer.invoke('bounce:setUserBlocked', userId, blocked),
+
+  /**
+   * Show or hide a direct conversation.
+   *
+   * Sync-scoped, so hiding a conversation hides it on this profile's other
+   * devices too. Nothing is deleted: the contact, the history and the device
+   * group all stay, and setting this back to true restores the thread.
+   */
+  setOpenDm: (userId: string, open: boolean): Promise<void> =>
+    ipcRenderer.invoke('bounce:setOpenDm', userId, open),
 
   setUserAlias: (userId: string, alias: string): Promise<void> =>
     ipcRenderer.invoke('bounce:setUserAlias', userId, alias),
@@ -309,6 +373,16 @@ const api = {
 
   setTypingIndicators: (conversation: string, setting: boolean | null): Promise<void> =>
     ipcRenderer.invoke('bounce:setTypingIndicators', conversation, setting),
+
+  /**
+   * Stamp a conversation as opened, now.
+   *
+   * Local: the timestamp never leaves the device. It exists so a thread with
+   * an unsent draft keeps its place near the top of the list instead of
+   * sinking to the age of its last message.
+   */
+  setLastOpened: (conversation: string): Promise<void> =>
+    ipcRenderer.invoke('bounce:setLastOpened', conversation),
 
   removeFromGroup: (groupId: string, userId: string): Promise<void> =>
     ipcRenderer.invoke('bounce:removeFromGroup', groupId, userId),

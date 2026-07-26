@@ -92,6 +92,17 @@ impl CanonicalStack {
             .collect()
     }
 
+    /// Every accepted update paired with the state it produced.
+    ///
+    /// Deciding whether this device owes a confirmation needs both halves: the
+    /// update itself, and whether we were a member of the group at the point it
+    /// landed — we attest only to what we were there to see.
+    pub fn accepted_history(&self) -> impl Iterator<Item = (&UpdateGroup, &GroupState)> {
+        self.history
+            .iter()
+            .filter_map(|state| state.update.as_deref().map(|update| (update, state)))
+    }
+
     /// Register a device so its signatures can be attributed and checked.
     pub fn register_device(&mut self, address: String, user_id: Uuid, revoked_at: i64) {
         self.address_map.insert(address.clone(), user_id);
