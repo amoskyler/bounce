@@ -22,7 +22,7 @@ import {
 } from './Attachments';
 import type { BubbleAttachment, PendingAttachment } from './Attachments';
 import { cachedFileUrl, fileUrl } from './attachment-data';
-import { Avatar } from './Avatar';
+import { Avatar, colorsForId } from './Avatar';
 import {
   completeShortcodeAtCaret,
   findShortcodeQuery,
@@ -30,7 +30,19 @@ import {
   type Emoji,
   type ShortcodeQuery,
 } from './emoji';
-import { EmojiPicker, EmojiSuggestions, useEmojiSuggestions } from './EmojiPicker';
+import {
+  EmojiPicker,
+  EmojiSuggestions,
+  SlashSuggestions,
+  useEmojiSuggestions,
+} from './EmojiPicker';
+import { ExpireTimer } from './ExpireTimer';
+import {
+  findSlashQuery,
+  runSlashCommand,
+  searchSlashCommands,
+  type SlashCommand,
+} from './slash';
 import {
   BounceLogo,
   DeliveredIcon,
@@ -43,7 +55,6 @@ import {
   PlusIcon,
   SendingIcon,
   SentIcon,
-  TimerIcon,
   UndeliverableIcon,
 } from './icons';
 import {
@@ -482,7 +493,7 @@ function Timeline({
     if (atBottomRef.current) {
       element.scrollTop = element.scrollHeight;
     }
-  }, [entries.length, typing.length, range.start, range.end]);
+  }, [entries.length, range.start, range.end]);
 
   // Go's jump-to-bottom does three things: scrolls down, zeroes the unread
   // counter, and marks the thread read (`ui/chat_history.go:89-110`). The last
@@ -549,8 +560,8 @@ function Timeline({
               No messages yet. Say something to start the conversation.
             </div>
           </div>
-          {typingIndicator}
         </div>
+        {typingIndicator}
       </div>
     );
   }
@@ -619,8 +630,9 @@ function Timeline({
         {range.bottomSpacer > 0 && (
           <div style={{ height: range.bottomSpacer, flexShrink: 0 }} aria-hidden="true" />
         )}
-        {typingIndicator}
       </div>
+
+      {typingIndicator}
 
       {farFromBottom && (
         <button
@@ -755,6 +767,9 @@ function MessageRow({
   const bubbleClassName = [
     'bubble',
     message.outgoing ? 'bubble--outgoing' : 'bubble--incoming',
+    // Both edges of a run are marked, so each bubble flattens the corners that
+    // actually face a neighbour rather than assuming one.
+    grouped && 'bubble--grouped',
     continuesAfter && 'bubble--continued',
   ]
     .filter(Boolean)
@@ -770,12 +785,6 @@ function MessageRow({
       </div>
 
       <div className="message-group__stack">
-        {isGroup && !message.outgoing && !grouped && (
-          <div className="message-group__author" style={{ color: 'var(--text-secondary)' }}>
-            {authorName}
-          </div>
-        )}
-
         <div
           className={bubbleClassName}
           // Right-click opens the same menu Signal's does. Bound on the bubble
@@ -786,12 +795,34 @@ function MessageRow({
             setMenuAt({ x: event.clientX, y: event.clientY });
           }}
         >
+          {/* Inside the bubble and in the sender's own colour, as Signal has
+              it. Above the bubble in grey it was a caption; in here it is part
+              of the message, and the colour matches their avatar so a group
+              can be skimmed without reading a single name. */}
+          {isGroup && !message.outgoing && !grouped && (
+            <div
+              className="bubble__author"
+              style={
+                {
+                  '--author-light': colorsForId(message.author).light,
+                  '--author-dark': colorsForId(message.author).dark,
+                } as React.CSSProperties
+              }
+            >
+              {authorName}
+            </div>
+          )}
+
           {/* Ahead of the footer, so the floated timestamp wraps around the
               text rather than around the pictures. */}
           <AttachmentList attachments={attachments} onOpenImage={onOpenImage} />
           <span className="bubble__footer">
-            {message.expiresAt > 0 && <TimerIcon />}
             <span>{messageTimestamp(message.writtenAt)}</span>
+            {/* After the time, as Signal has it: the clock reads as a note on
+                the timestamp rather than a second glyph competing with it. */}
+            {message.expiresAt > 0 && (
+              <ExpireTimer expiresAt={message.expiresAt} writtenAt={message.writtenAt} />
+            )}
             {message.outgoing && <DeliveryStatus message={message} />}
           </span>
           <MessageText text={message.text} />
@@ -1059,6 +1090,16 @@ export function Composer({
   const [shortcode, setShortcode] = React.useState<ShortcodeQuery | null>(null);
   const [selected, setSelected] = React.useState(0);
 
+  // The `/command` being typed, if the draft is one. Separate state rather than
+  // a variant of the shortcode query: the two lists never coexist — a draft
+  // either starts with a slash or it does not — but they are chosen by
+  // different rules and applied in completely different ways.
+  const [slash, setSlash] = React.useState<string | null>(null);
+  const commands = React.useMemo(
+    () => (slash === null ? [] : searchSlashCommands(slash)),
+    [slash],
+  );
+
   const textareaRef = React.useRef<HTMLTextAreaElement>(null);
   const emojiButtonRef = React.useRef<HTMLButtonElement>(null);
   const attachButtonRef = React.useRef<HTMLButtonElement>(null);
@@ -1094,6 +1135,10 @@ export function Composer({
   React.useEffect(() => {
     if (selected >= suggestions.length) setSelected(0);
   }, [suggestions.length, selected]);
+
+  React.useEffect(() => {
+    if (commands.length > 0 && selected >= commands.length) setSelected(0);
+  }, [commands.length, selected]);
 
   /*
    * Put the caret back in the box once a file has been staged.
@@ -1132,6 +1177,10 @@ export function Composer({
     setText(next);
     onChange(next);
 
+    const command = findSlashQuery(next, caret);
+    setSlash(command ? command.query : null);
+    if (command?.query !== slash) setSelected(0);
+
     const query = findShortcodeQuery(next, caret);
     setShortcode(query);
     if (query?.query !== shortcode?.query) setSelected(0);
@@ -1159,6 +1208,9 @@ export function Composer({
       return;
     }
 
+    const command = findSlashQuery(element.value, element.selectionStart);
+    setSlash(command ? command.query : null);
+
     const query = findShortcodeQuery(element.value, element.selectionStart);
     setShortcode(query);
     if (query?.query !== shortcode?.query) setSelected(0);
@@ -1172,20 +1224,66 @@ export function Composer({
     element?.focus();
   };
 
+  /** Complete a command name, leaving the caret ready for its arguments. */
+  const chooseCommand = (command: SlashCommand) => {
+    const next = `/${command.name} `;
+    pendingCaret.current = next.length;
+    setText(next);
+    onChange(next);
+    setSlash(null);
+    textareaRef.current?.focus();
+  };
+
   const submit = () => {
     const trimmed = text.trim();
     // An attachment on its own is a message; text is not required.
     if (!trimmed && intake.attachments.length === 0) return;
-    onSend(trimmed, intake.attachments);
+
+    // A command rewrites the message on its way out. An unknown one is left
+    // exactly as typed, so a message that happens to open with a slash still
+    // sends rather than disappearing into a command that does not exist.
+    const expanded = runSlashCommand(trimmed) ?? trimmed;
+    if (!expanded && intake.attachments.length === 0) return;
+
+    onSend(expanded, intake.attachments);
     // Clearing revokes every preview object URL, which is why it happens here
     // rather than being left to the next render.
     intake.clear();
     setText('');
     onChange('');
     setShortcode(null);
+    setSlash(null);
   };
 
   const handleKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    // The command list owns the keys first: a draft that starts with a slash
+    // cannot also contain a shortcode being typed, and checking it first keeps
+    // that impossible rather than merely unlikely.
+    if (slash !== null && commands.length > 0) {
+      if (event.key === 'ArrowDown') {
+        event.preventDefault();
+        setSelected((current) => (current + 1) % commands.length);
+        return;
+      }
+      if (event.key === 'ArrowUp') {
+        event.preventDefault();
+        setSelected((current) => (current - 1 + commands.length) % commands.length);
+        return;
+      }
+      if (event.key === 'Tab') {
+        event.preventDefault();
+        chooseCommand(commands[selected]);
+        return;
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        setSlash(null);
+        return;
+      }
+      // Enter deliberately falls through to send. Typing `/shrug` and pressing
+      // return should send the shrug, not complete the word you just finished.
+    }
+
     // While suggestions are up they own the keys that would otherwise send,
     // exactly as they do in Signal: Enter and Tab take the highlighted emoji.
     if (shortcode && suggestions.length > 0) {
@@ -1264,6 +1362,15 @@ export function Composer({
         </div>
 
         <div className="composer__input-wrapper">
+          {slash !== null && commands.length > 0 && (
+            <SlashSuggestions
+              commands={commands}
+              selected={Math.min(selected, commands.length - 1)}
+              onChoose={chooseCommand}
+              onDismiss={() => setSlash(null)}
+            />
+          )}
+
           {shortcode && suggestions.length > 0 && (
             <EmojiSuggestions
               query={shortcode.query}

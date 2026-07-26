@@ -188,6 +188,23 @@ const state = {
     }),
     message('g4', bookClub, ada, 'I will bring the second volume.', now - 40 * 60),
 
+    // Disappearing messages at several points around the dial, so a capture
+    // shows the whole sweep at once rather than one frame of it.
+    ...(process.env.BOUNCE_PREVIEW_TIMERS === '1'
+      ? [0, 1, 3, 6, 9, 11, 12].map((twelfths, index) =>
+          message(
+            `t${index}`,
+            bookClub,
+            index % 2 ? ada : me,
+            `${twelfths}/12 left`,
+            // Written one hour before it expires, so the dial's length is an
+            // hour and the fraction remaining is exactly `twelfths`.
+            now - 3600 + Math.round((3600 * twelfths) / 12),
+            { expiresAt: now + Math.round((3600 * twelfths) / 12) },
+          ),
+        )
+      : []),
+
     message('d1', grace, grace, 'Sending the compiler notes over shortly.', now - 5 * HOUR),
     message('d2', alan, alan, 'Thanks for the paper.', now - 30 * HOUR),
   ],
@@ -325,8 +342,14 @@ const api = {
   hasProfile: async () => true,
   initialState: async () => state,
   createProfile: async () => me,
-  sendDirectMessage: async () => state.messages[0],
-  sendGroupMessage: async () => state.messages[0],
+  sendDirectMessage: async (_to, text) => {
+    lastSend = { text, attachments: [] };
+    return state.messages[0];
+  },
+  sendGroupMessage: async (_group, text) => {
+    lastSend = { text, attachments: [] };
+    return state.messages[0];
+  },
   // Records the shape the composer hands over, which is the only way to see
   // what the engine would have been given.
   sendDirectMessageWithAttachments: async (_to, text, attachments) => {

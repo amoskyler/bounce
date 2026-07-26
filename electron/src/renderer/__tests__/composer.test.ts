@@ -26,7 +26,14 @@ import { Composer } from '../Conversation';
 import { EMBEDDED_FILE_LIMIT, stageFile } from '../Attachments';
 import { partition } from '../MessageInfo';
 import type { MessageInfo } from '../../preload';
-import { EmojiPicker, EmojiSuggestions } from '../EmojiPicker';
+import { EmojiPicker, EmojiSuggestions, SlashSuggestions } from '../EmojiPicker';
+import {
+  findSlashQuery,
+  runSlashCommand,
+  searchSlashCommands,
+  SHRUG,
+  SLASH_COMMANDS,
+} from '../slash';
 import { emojiForShortcode } from '../emoji';
 import {
   clampLeftPaneWidth,
@@ -356,4 +363,94 @@ test('a direct message has no audience, so nobody is ever pending', () => {
 
   assert.deepEqual(split.delivered.map((r) => r.userId), ['ada']);
   assert.deepEqual(split.pending, []);
+});
+
+/* --------------------------------------------------------------------------
+ * Slash commands
+ * -------------------------------------------------------------------------- */
+
+test('/shrug appends the shrug', () => {
+  assert.equal(runSlashCommand('/shrug'), SHRUG);
+  assert.equal(runSlashCommand('/shrug well then'), `well then ${SHRUG}`);
+});
+
+test('a bare command is not sent with a leading space', () => {
+  // Joining unconditionally would produce " ¯\\_(ツ)_/¯", which renders as an
+  // odd indent inside the bubble.
+  assert.equal(runSlashCommand('/shrug')?.startsWith(' '), false);
+});
+
+test('the command name is matched case insensitively', () => {
+  assert.equal(runSlashCommand('/SHRUG'), SHRUG);
+});
+
+test('an unknown command is left exactly as typed', () => {
+  // Otherwise a message that happens to open with a slash vanishes into a
+  // command that does not exist.
+  assert.equal(runSlashCommand('/nope'), null);
+  assert.equal(runSlashCommand('/not a command'), null);
+});
+
+test('text that is not a command is left alone', () => {
+  assert.equal(runSlashCommand('and/or'), null);
+  assert.equal(runSlashCommand('https://example.com'), null);
+  assert.equal(runSlashCommand('hello'), null);
+});
+
+test('arguments keep their internal spacing but lose the outer padding', () => {
+  assert.equal(runSlashCommand('/shrug  who   knows  '), `who   knows ${SHRUG}`);
+});
+
+test('a command is only offered at the very start of the draft', () => {
+  // A slash mid-sentence is a slash: a date, a URL, "and/or".
+  assert.equal(findSlashQuery('/sh', 3)?.query, 'sh');
+  assert.equal(findSlashQuery('hey /sh', 7), null);
+  assert.equal(findSlashQuery('and/or', 6), null);
+});
+
+test('the list closes once the name is finished', () => {
+  // Past the first space the user is typing arguments, and the list has
+  // nothing left to offer.
+  assert.equal(findSlashQuery('/shrug ', 7), null);
+  assert.equal(findSlashQuery('/shrug hello', 12), null);
+});
+
+test('a lone slash offers every command', () => {
+  assert.equal(findSlashQuery('/', 1)?.query, '');
+  assert.equal(searchSlashCommands('').length, SLASH_COMMANDS.length);
+});
+
+test('commands are searched by prefix, exact first', () => {
+  assert.deepEqual(searchSlashCommands('shrug').map((c) => c.name), ['shrug']);
+  assert.deepEqual(searchSlashCommands('sh').map((c) => c.name), ['shrug']);
+  assert.deepEqual(searchSlashCommands('zzz'), []);
+
+  // "flip" appears inside both tableflip and unflip.
+  assert.deepEqual(searchSlashCommands('flip').map((c) => c.name), ['tableflip', 'unflip']);
+});
+
+test('every command in the table has a name, a description and no clashes', () => {
+  const names = new Set<string>();
+  for (const command of SLASH_COMMANDS) {
+    assert.match(command.name, /^[a-z0-9-]+$/, `${command.name} is not typeable`);
+    assert.ok(command.description.length > 0, `${command.name} has no description`);
+    for (const name of [command.name, ...(command.aliases ?? [])]) {
+      assert.equal(names.has(name), false, `two commands answer to /${name}`);
+      names.add(name);
+    }
+  }
+});
+
+test('the suggestion list renders the command and what it does', () => {
+  const html = renderToStaticMarkup(
+    React.createElement(SlashSuggestions, {
+      commands: searchSlashCommands('shrug'),
+      selected: 0,
+      onChoose: () => {},
+      onDismiss: () => {},
+    }),
+  );
+
+  assert.ok(html.includes('/shrug'));
+  assert.ok(html.includes('emoji-suggestion--selected'));
 });

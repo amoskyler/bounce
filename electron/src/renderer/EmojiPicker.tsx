@@ -16,6 +16,7 @@ import * as React from 'react';
 import { EMOJI, EMOJI_CATEGORIES, searchEmoji, type Emoji } from './emoji';
 import { loadRecentEmoji, noteRecentEmoji } from './preferences';
 import { SearchIcon } from './icons';
+import type { SlashCommand } from './slash';
 import './emoji.css';
 
 /** Cells per row. Fixed, so a section's height can be worked out arithmetically. */
@@ -330,4 +331,60 @@ export function EmojiSuggestions({
  */
 export function useEmojiSuggestions(query: string): Emoji[] {
   return React.useMemo(() => (query ? searchEmoji(query, SUGGESTION_LIMIT) : []), [query]);
+}
+
+/**
+ * The list shown while a `/command` is being typed.
+ *
+ * Shares the suggestion styling with the emoji typeahead deliberately: they
+ * appear in the same place, are driven by the same keys, and differ only in
+ * what they are listing. Two lists that looked different would read as two
+ * features.
+ */
+export function SlashSuggestions({
+  commands,
+  selected,
+  onChoose,
+  onDismiss,
+}: {
+  commands: readonly SlashCommand[];
+  selected: number;
+  onChoose: (command: SlashCommand) => void;
+  onDismiss: () => void;
+}) {
+  const listRef = React.useRef<HTMLDivElement>(null);
+
+  useDismiss(listRef, onDismiss);
+
+  React.useEffect(() => {
+    listRef.current
+      ?.querySelector('.emoji-suggestion--selected')
+      ?.scrollIntoView({ block: 'nearest' });
+  }, [selected]);
+
+  if (commands.length === 0) return null;
+
+  return (
+    <div
+      className="emoji-suggestions slash-suggestions"
+      ref={listRef}
+      role="listbox"
+      aria-label="Commands"
+    >
+      {commands.map((command, index) => (
+        <button
+          key={command.name}
+          className={`emoji-suggestion${index === selected ? ' emoji-suggestion--selected' : ''}`}
+          onMouseDown={(event) => event.preventDefault()}
+          onClick={() => onChoose(command)}
+          role="option"
+          aria-selected={index === selected}
+          type="button"
+        >
+          <span className="slash-suggestion__name">/{command.name}</span>
+          <span className="emoji-suggestion__name">{command.description}</span>
+        </button>
+      ))}
+    </div>
+  );
 }

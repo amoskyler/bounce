@@ -236,6 +236,38 @@ export function computeVisibleRange({
 }
 
 /**
+ * Hold a window inside a list that may have shrunk since it was computed.
+ *
+ * The range lives in state and is recomputed in a layout effect — after the
+ * render. So the render that first carries a shorter list still has the window
+ * from the longer one, and a caller looping from `start` to `end` walks off the
+ * end of the array. That is not a subtle failure: a message deleting itself
+ * took the whole conversation down with it, because `entries[index]` came back
+ * undefined and the crash unmounted the tree.
+ *
+ * Clamping here rather than in the caller means every consumer is safe by
+ * construction instead of by remembering. The spacers are recomputed from the
+ * current heights so the scroller still adds up; the effect that follows will
+ * settle it properly a moment later.
+ */
+export function clampRange(range: VisibleRange, metrics: RowMetrics): VisibleRange {
+  const rows = metrics.known.length;
+  const end = Math.min(range.end, rows);
+  const start = Math.min(range.start, end);
+
+  // The common case by far. Returning the same object keeps the identity that
+  // memoised children downstream depend on.
+  if (start === range.start && end === range.end) return range;
+
+  return {
+    start,
+    end,
+    topSpacer: offsetOf(metrics, start),
+    bottomSpacer: Math.max(0, totalHeight(metrics) - offsetOf(metrics, end)),
+  };
+}
+
+/**
  * Window a scrollable list down to the rows near the viewport.
  *
  * The caller renders `messages.slice(start, end)` between two spacer elements
@@ -408,7 +440,10 @@ export function useVisibleRange(
     };
   }, [containerRef]);
 
-  return range;
+  // Clamped on the way out, not on the way in: `metricsRef` was resized for the
+  // new count above, during this same render, so this is the window the caller
+  // can safely index right now.
+  return clampRange(range, metricsRef.current);
 }
 
 function clamp(value: number, low: number, high: number): number {

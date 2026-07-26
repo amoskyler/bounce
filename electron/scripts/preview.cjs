@@ -43,8 +43,8 @@ const failsafe = setTimeout(() => {
 
 app.whenReady().then(async () => {
   const window = new BrowserWindow({
-    width: 1100,
-    height: 760,
+    width: Number(process.env.BOUNCE_PREVIEW_WIDTH || '1100'),
+    height: Number(process.env.BOUNCE_PREVIEW_HEIGHT || '760'),
     show: false,
     backgroundColor: theme === 'dark' ? '#1b1b1b' : '#ffffff',
     webPreferences: {
@@ -211,7 +211,23 @@ app.whenReady().then(async () => {
     console.log(`probe: ${probed}`);
   }
 
-  const image = await window.webContents.capturePage();
+  /*
+   * Capture only part of the page, and at a higher scale.
+   *
+   *     BOUNCE_PREVIEW_RECT='x,y,w,h'
+   *
+   * A 12px dial in a 1100px screenshot is a smudge. The window is reopened at
+   * a device scale factor so the crop is captured at real resolution rather
+   * than enlarged afterwards.
+   */
+  const rectSpec = process.env.BOUNCE_PREVIEW_RECT;
+  const image = rectSpec
+    ? await window.webContents.capturePage(
+        (([x, y, w, h]) => ({ x, y, width: w, height: h }))(
+          rectSpec.split(',').map(Number),
+        ),
+      )
+    : await window.webContents.capturePage();
   writeFileSync(output, image.toPNG());
   console.log(`wrote ${output}`);
 

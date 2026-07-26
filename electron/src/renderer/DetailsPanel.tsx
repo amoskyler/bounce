@@ -21,8 +21,19 @@ import type { Group, Settings, User } from '../preload';
 import type { Conversation, State } from './state';
 
 /** Retention choices, matching what the Fyne client offers. */
+/**
+ * How long a message survives before it deletes itself, everywhere.
+ *
+ * The short end exists because the clock on a message is only interesting when
+ * you can watch it move: thirty seconds is a dial that sweeps while you read
+ * it, and a year is one that never visibly changes. Ordered shortest to
+ * longest, with "Off" first because it is the default rather than the least.
+ */
 const RETENTION_OPTIONS: ReadonlyArray<{ label: string; seconds: number }> = [
   { label: 'Off', seconds: 0 },
+  { label: '30 seconds', seconds: 30 },
+  { label: '5 minutes', seconds: 5 * 60 },
+  { label: '1 hour', seconds: 60 * 60 },
   { label: '1 day', seconds: 24 * 60 * 60 },
   { label: '1 week', seconds: 7 * 24 * 60 * 60 },
   { label: '4 weeks', seconds: 4 * 7 * 24 * 60 * 60 },

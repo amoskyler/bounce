@@ -33,6 +33,25 @@ const PALETTE: ReadonlyArray<{ background: string; foreground: string }> = [
 ];
 
 /**
+ * The colour a person is known by, for text set in their name.
+ *
+ * The same palette entry their avatar uses, so a name and the circle beside it
+ * agree — which is what lets a reader skim a group by colour rather than by
+ * reading every name.
+ *
+ * Both ends are returned because the palette is built for one job and asked to
+ * do two. Each entry is a pale tint carrying a saturated companion, sized for
+ * dark-on-light initials; used as text on a dark bubble the saturated end is
+ * far too dark to read, so the pair swaps over. The caller hands both to CSS
+ * and lets the stylesheet choose, which keeps this correct across a theme
+ * change without re-rendering a single message.
+ */
+export function colorsForId(identifier: string): { light: string; dark: string } {
+  const entry = paletteFor(identifier);
+  return { light: entry.foreground, dark: entry.background };
+}
+
+/**
  * Pick a palette entry from an identifier.
  *
  * Any stable hash works; this one is FNV-1a, chosen because it is short,

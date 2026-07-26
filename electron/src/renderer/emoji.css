@@ -205,3 +205,23 @@
 .emoji-suggestion--selected .emoji-suggestion__name {
   color: var(--text-primary);
 }
+
+/* --------------------------------------------------------------------------
+ * Slash commands
+ * -------------------------------------------------------------------------- */
+
+/*
+ * Wider than the emoji list, because a command carries a sentence describing
+ * it rather than a single name.
+ */
+.slash-suggestions {
+  min-width: 300px;
+}
+
+.slash-suggestion__name {
+  flex-shrink: 0;
+  font-size: 13px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-primary);
+}

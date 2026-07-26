@@ -1252,6 +1252,30 @@ impl Store {
     ///
     /// Zero means "kept indefinitely" rather than "expired at the epoch", which
     /// is why the predicate is on `delete_at != 0` as well as the cutoff.
+    /// When the next message is due to delete itself, if any is.
+    ///
+    /// The retention sweep uses this to decide how long to sleep. Without it
+    /// the sweep runs on a fixed cadence, and a message set to disappear in
+    /// thirty seconds can sit there for another thirty after its clock reaches
+    /// zero — which is not a rounding error at that length, it is double.
+    pub fn next_expiry(&self) -> Result<Option<i64>> {
+        self.with(|connection| {
+            let mut earliest: Option<i64> = None;
+            for table in ["direct_messages", "group_messages"] {
+                let found: Option<i64> = connection.query_row(
+                    &format!("SELECT MIN(delete_at) FROM {table} WHERE delete_at != 0"),
+                    [],
+                    |row| row.get(0),
+                )?;
+                earliest = match (earliest, found) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
+            }
+            Ok(earliest)
+        })
+    }
+
     pub fn delete_expired_messages(&self, now: i64) -> Result<Vec<Uuid>> {
         self.with(|connection| {
             let mut removed = Vec::new();
@@ -3104,6 +3128,32 @@ mod tests {
         assert_eq!(thread.len(), 1);
         assert_eq!(thread[0].image_attachments.len(), 1, "the picture was lost on reload");
         assert_eq!(thread[0].file_attachments.len(), 1);
+    }
+
+    #[test]
+    fn the_earliest_expiry_is_found_across_both_kinds_of_message() {
+        // What the retention sweep sleeps until. Reading only one table would
+        // let a group message with a short timer sit past its deadline until
+        // some direct message happened to come due.
+        let store = store();
+        assert_eq!(store.next_expiry().unwrap(), None, "nothing is pending yet");
+
+        let mut direct = DirectMessage::new(Uuid::new_v4(), Uuid::new_v4(), "a".into(), 100);
+        direct.delete_at = 900;
+        store.save_direct_message(&direct).unwrap();
+        assert_eq!(store.next_expiry().unwrap(), Some(900));
+
+        // A group message due sooner takes over.
+        let mut group = GroupMessage::new(Uuid::new_v4(), Uuid::new_v4(), "b".into(), 100);
+        group.delete_at = 400;
+        store.save_group_message(&group).unwrap();
+        assert_eq!(store.next_expiry().unwrap(), Some(400));
+
+        // A message that never expires is not a deadline.
+        let mut forever = DirectMessage::new(Uuid::new_v4(), Uuid::new_v4(), "c".into(), 100);
+        forever.delete_at = 0;
+        store.save_direct_message(&forever).unwrap();
+        assert_eq!(store.next_expiry().unwrap(), Some(400), "zero is not a deadline");
     }
 
     #[test]

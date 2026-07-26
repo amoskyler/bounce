@@ -50,13 +50,15 @@ use crate::net::Network;
 
 use super::{Engine, Event};
 
-/// How often expired content is swept.
+/// The longest the sweep will sleep when nothing is due sooner.
 ///
-/// The floor on retention is one hour, so this is two orders of magnitude
-/// finer than anything the user can ask for; the cost is two scans of the
-/// message tables a minute at the very most, against a database whose write
-/// volume is a chat application's.
+/// Also the cadence for the undeliverable pass, which is measured in weeks and
+/// does not care. The cost is two scans of the message tables a minute at the
+/// very most, against a database whose write volume is a chat application's.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The shortest, so a burst of expiries cannot turn the sweep into a spin.
+const MINIMUM_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
 impl<N: Network + 'static> Engine<N> {
     /// Sweep, then keep sweeping, for as long as the engine runs.
@@ -75,8 +77,30 @@ impl<N: Network + 'static> Engine<N> {
             if let Err(error) = self.sweep_undeliverable() {
                 tracing::warn!(%error, "could not mark undeliverable messages");
             }
-            tokio::time::sleep(SWEEP_INTERVAL).await;
+            tokio::time::sleep(self.until_next_sweep()).await;
         }
+    }
+
+    /// How long to wait before sweeping again.
+    ///
+    /// Long by default, but never past the next message due to disappear. A
+    /// thirty-second timer that is only noticed on a thirty-second cadence
+    /// spends up to half its visible life reading zero, which makes the clock
+    /// on the message a lie at exactly the lengths where somebody is watching
+    /// it. Bounded below so a thread full of simultaneous expiries settles at
+    /// one pass a second rather than spinning.
+    fn until_next_sweep(&self) -> Duration {
+        let Ok(Some(next)) = self.store.next_expiry() else {
+            return SWEEP_INTERVAL;
+        };
+
+        let remaining = next - crate::now();
+        if remaining <= 0 {
+            return MINIMUM_SWEEP_INTERVAL;
+        }
+
+        Duration::from_secs(remaining as u64)
+            .clamp(MINIMUM_SWEEP_INTERVAL, SWEEP_INTERVAL)
     }
 
     /// Give up on messages nobody has acknowledged.

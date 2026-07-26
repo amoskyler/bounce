@@ -27,6 +27,7 @@ import {
   type NotificationContext,
 } from '../notifications';
 import {
+  clampRange,
   computeVisibleRange,
   createMetrics,
   offsetOf,
@@ -436,4 +437,74 @@ test('a mixed thread settles: measuring twice changes nothing the second time', 
   assert.equal(again, metrics, 'a second measurement of the same rows changed the table');
   assert.equal(totalHeight(again), total);
   assert.deepEqual(window(again, 2_000), settled);
+});
+
+/* -------------------------------------------------------------------------
+ * Shrinking under the window
+ * ---------------------------------------------------------------------- */
+
+test('a window is never wider than the list it is for', () => {
+  // The crash this prevents: the range lives in state and is recomputed after
+  // the render, so the first render carrying a shorter list still holds the
+  // window from the longer one. A caller looping start..end then reads past
+  // the end of the array — and a message deleting itself on its timer took the
+  // whole conversation down with it.
+  const before = measureAll(fresh(100), 0, 100, 50);
+  const window = computeVisibleRange({
+    scrollTop: 4_000,
+    viewportHeight: VIEWPORT,
+    metrics: before,
+    overscanRows: 10,
+  });
+
+  // Everything from row 40 on disappears.
+  const after = resizeMetrics(before, 40, ROW);
+  const held = clampRange(window, after);
+
+  assert.ok(held.end <= 40, `window still reaches row ${held.end} of 40`);
+  assert.ok(held.start <= held.end, 'the window inverted');
+});
+
+test('clamping keeps the scroller adding up', () => {
+  const before = measureAll(fresh(100), 0, 100, 50);
+  const window = computeVisibleRange({
+    scrollTop: 4_000,
+    viewportHeight: VIEWPORT,
+    metrics: before,
+    overscanRows: 10,
+  });
+
+  const after = resizeMetrics(before, 40, ROW);
+  const held = clampRange(window, after);
+  const rendered = offsetOf(after, held.end) - offsetOf(after, held.start);
+
+  assert.equal(held.topSpacer + rendered + held.bottomSpacer, totalHeight(after));
+  assert.equal(held.bottomSpacer, 0, 'nothing is left below the last row');
+});
+
+test('a window that already fits is returned untouched', () => {
+  // Identity matters: memoised children downstream compare on it, and a new
+  // object every render would defeat them.
+  const metrics = measureAll(fresh(100), 0, 100, 50);
+  const window = computeVisibleRange({
+    scrollTop: 1_000,
+    viewportHeight: VIEWPORT,
+    metrics,
+    overscanRows: 10,
+  });
+
+  assert.equal(clampRange(window, metrics), window);
+});
+
+test('a list emptied entirely leaves an empty window rather than a negative one', () => {
+  const metrics = measureAll(fresh(50), 0, 50, 50);
+  const window = computeVisibleRange({
+    scrollTop: 0,
+    viewportHeight: VIEWPORT,
+    metrics,
+    overscanRows: 10,
+  });
+
+  const held = clampRange(window, resizeMetrics(metrics, 0, ROW));
+  assert.deepEqual(held, { start: 0, end: 0, topSpacer: 0, bottomSpacer: 0 });
 });

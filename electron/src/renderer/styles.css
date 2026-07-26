@@ -650,10 +650,19 @@ textarea {
   flex: 1;
   overflow-y: auto;
   overflow-x: hidden;
-  padding: 16px 16px 8px;
+  /* The bottom padding is the typing indicator's reserved strip. */
+  padding: 16px 16px 46px;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  /*
+   * No `gap`: the rows carry their own margins, and a gap on top of them adds
+   * a constant that has to be subtracted from every spacing decision — which
+   * is how 2px between grouped messages quietly became 4px.
+   */
+
+  /* The measure a bubble is allowed is a question about this box, not the
+     window: the sidebar is resizable and a panel may be open beside it. */
+  container: timeline / inline-size;
 }
 
 .timeline__date {
@@ -672,11 +681,16 @@ textarea {
 }
 
 /* Successive messages from the same author sit closer together. */
+/*
+ * Signal separates messages by 12px and members of a run by 2px — a `6px`
+ * margin above and below each container, collapsing to `1px` within a run.
+ * The ratio is what does the work: a run has to read as one utterance.
+ */
 .message-group {
   display: flex;
   gap: 8px;
   align-items: flex-end;
-  margin-top: 8px;
+  margin-top: 12px;
 }
 
 .message-group--continued {
@@ -692,34 +706,85 @@ textarea {
   flex-shrink: 0;
 }
 
+/*
+ * Signal's `.module-message__container-outer`: 306px, widening in two steps as
+ * the window grows.
+ *
+ * This was the largest single departure. At `min(480px, 70%)` a paragraph ran
+ * nearly twice as wide as Signal's, which changes where every line breaks and
+ * is most of why the timeline read as a different application even where the
+ * colours matched. A container query rather than a viewport one, because what
+ * decides the measure is how much room the timeline has — the sidebar is
+ * resizable and either right-hand panel can be open.
+ */
 .message-group__stack {
   display: flex;
   flex-direction: column;
   gap: 2px;
   min-width: 0;
-  max-width: min(480px, 70%);
+  max-width: min(306px, calc(100% - 38px));
+}
+
+@container timeline (min-width: 689px) {
+  .message-group__stack {
+    max-width: 370px;
+  }
+}
+
+@container timeline (min-width: 1000px) {
+  .message-group__stack {
+    max-width: 50%;
+  }
 }
 
 .message-group--outgoing .message-group__stack {
   align-items: flex-end;
 }
 
-.message-group__author {
-  padding: 0 12px 2px;
+/* Signal's `font-body-small-bold`, with its 3px of space below. */
+.bubble__author {
+  color: var(--author-light);
+  margin-bottom: 3px;
   font-size: 12px;
+  line-height: 16px;
   font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/*
+ * The palette's saturated end is meant for initials on a pale tint; several of
+ * its entries are all but unreadable as text on a dark bubble. The pale end
+ * takes over, which is legible and still unmistakably the same person.
+ */
+:root[data-theme='dark'] .bubble__author {
+  color: var(--author-dark);
 }
 
 /* --------------------------------------------------------------------------
  * Message bubbles
  * -------------------------------------------------------------------------- */
 
+/*
+ * Signal's geometry, to the pixel: `$message-padding-vertical: 8px`,
+ * `$message-padding-horizontal: 12px`, an 18px radius, and `font-body-1`.
+ *
+ * A standalone bubble is round on all four corners. It is worth being explicit
+ * about that because the obvious embellishment — flattening the bottom corner
+ * nearest the sender, so the bubble points at them — is iMessage's convention,
+ * not Signal's, and having it on every bubble is what made these read as
+ * neither one thing nor the other. Here the flattened corner means something:
+ * it only appears between consecutive messages from the same person, where it
+ * joins them into a run.
+ */
 .bubble {
   position: relative;
-  padding: 9px 12px 8px;
+  padding: 8px 12px;
   border-radius: var(--bubble-radius);
   font-size: 14px;
-  line-height: 19px;
+  line-height: 20px;
+  letter-spacing: -0.08px;
   word-break: break-word;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
@@ -730,24 +795,32 @@ textarea {
 .bubble--incoming {
   background: var(--bubble-incoming-background);
   color: var(--bubble-incoming-text);
-  border-bottom-left-radius: var(--bubble-radius-tight);
 }
 
 .bubble--outgoing {
   background: var(--bubble-outgoing-background);
   color: var(--bubble-outgoing-text);
-  border-bottom-right-radius: var(--bubble-radius-tight);
 }
 
-/* Only the last bubble in a run gets the tail. */
-.bubble--continued.bubble--incoming {
-  border-bottom-left-radius: var(--bubble-radius);
+/*
+ * Within a run, the corners that face a neighbour flatten — always on the
+ * sender's own side, so the run reads as one column of messages with a
+ * straight edge down it.
+ */
+.bubble--grouped.bubble--incoming {
   border-top-left-radius: var(--bubble-radius-tight);
 }
 
-.bubble--continued.bubble--outgoing {
-  border-bottom-right-radius: var(--bubble-radius);
+.bubble--continued.bubble--incoming {
+  border-bottom-left-radius: var(--bubble-radius-tight);
+}
+
+.bubble--grouped.bubble--outgoing {
   border-top-right-radius: var(--bubble-radius-tight);
+}
+
+.bubble--continued.bubble--outgoing {
+  border-bottom-right-radius: var(--bubble-radius-tight);
 }
 
 .bubble__footer {
@@ -1215,7 +1288,25 @@ textarea {
  * Typing indicator
  * -------------------------------------------------------------------------- */
 
+/*
+ * The typing indicator floats over the foot of the timeline rather than sitting
+ * at the end of it.
+ *
+ * In the flow it is a row like any other, so it changes the height of the
+ * content every time somebody starts or stops — and in a group, where people
+ * drop in and out of typing constantly, the conversation twitches under the
+ * reader for reasons that have nothing to do with what they are reading.
+ *
+ * Out of the flow it costs nothing to appear or disappear. The scroller carries
+ * a permanent strip of padding the same height, so the newest message is never
+ * covered by it: a fixed amount of quiet space above the composer, rather than
+ * a variable amount of movement.
+ */
 .typing {
+  position: absolute;
+  inset-inline-start: 16px;
+  bottom: 6px;
+  z-index: 2;
   display: flex;
   align-items: center;
   gap: 4px;
@@ -1223,7 +1314,23 @@ textarea {
   border-radius: var(--bubble-radius);
   background: var(--bubble-incoming-background);
   width: fit-content;
-  margin-top: 8px;
+  max-width: calc(100% - 32px);
+  /* Long enough to register as arriving, short enough not to be a transition
+     the reader waits on. */
+  animation: typing-appear 0.12s ease-out;
+}
+
+@keyframes typing-appear {
+  from {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .typing {
+    animation: none;
+  }
 }
 
 .typing__dot {
@@ -1662,4 +1769,24 @@ textarea {
 .modal__button--destructive:disabled {
   opacity: 0.6;
   cursor: default;
+}
+
+/* --------------------------------------------------------------------------
+ * Disappearing-message clock
+ * -------------------------------------------------------------------------- */
+
+/*
+ * Sized and spaced to match Signal's `.module-expire-timer`: 12px square, 6px
+ * of space before it, nudged down 2px so it sits on the timestamp's baseline
+ * rather than its box.
+ */
+.expire-timer {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  margin-bottom: 2px;
+}
+
+.expire-timer__dial {
+  display: block;
 }

@@ -217,17 +217,6 @@ export function JumpToBottomIcon({ size = 20, className }: IconProps) {
   );
 }
 
-/** The disappearing-messages timer shown on expiring messages. */
-export function TimerIcon({ size = 12, className }: IconProps) {
-  return (
-    <svg {...svgProps(size)} className={className} strokeWidth={1.6}>
-      <circle cx="10" cy="10.8" r="6.6" />
-      <path d="M10 7.4v3.4l2.3 1.4" />
-      <path d="M7.8 2.6h4.4" />
-    </svg>
-  );
-}
-
 /** Modules of light space around a symbol. Four is the specified minimum. */
 const QUIET_ZONE = 4;
 
