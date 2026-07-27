@@ -158,6 +158,16 @@ impl<N: Network + 'static> Engine<N> {
                 });
             }
         }
+
+        // A reply outlives what it quoted, so the excerpt has to be swept on
+        // the original's clock rather than the reply's. Without this, replying
+        // to a thirty-second message keeps a copy of it for as long as the
+        // reply lives — the quote would outlive the thing it quoted, which is
+        // the one outcome disappearing messages exist to prevent.
+        for message_id in self.store.blank_expired_quotes(crate::now())? {
+            self.emit(Event::QuoteExpired { message_id });
+        }
+
         Ok(deleted)
     }
 

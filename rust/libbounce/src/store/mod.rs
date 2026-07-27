@@ -12,6 +12,7 @@
 
 pub mod schema;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -22,8 +23,9 @@ use crate::error::{Error, Result};
 use crate::frames::file::File;
 use crate::frames::group::{Confirmation, Group, GroupCreation, UpdateGroup};
 use crate::frames::identity::{Device, IntroductionSignature, ProfileSettings, User};
+use crate::frames::interaction::{DeleteMessage, Reaction};
 use crate::frames::message::{
-    DirectMessage, Draft, FileAttachment, GroupMessage, ImageAttachment, ReadReceipt,
+    DirectMessage, Draft, FileAttachment, GroupMessage, ImageAttachment, Quote, ReadReceipt,
 };
 use crate::frames::pairing::{AddUser, SyncDeviceOffer};
 use crate::frames::transport::{CustomScope, DeliveryRecord, FrameReference};
@@ -413,11 +415,14 @@ impl Store {
             connection.execute(
                 r#"INSERT INTO devices (
                     id, user_id, name, address, timestamp, saved_at, last_seen,
-                    revoked_at, ecdh_public_key, ecdh_private_key
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                    revoked_at, ecdh_public_key, ecdh_private_key, capabilities
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                 ON CONFLICT (address) DO UPDATE SET
                     name = excluded.name,
                     last_seen = excluded.last_seen,
+                    -- Adopted on every announcement, so a peer that upgrades
+                    -- starts receiving extension frames without re-pairing.
+                    capabilities = excluded.capabilities,
                     -- A revocation is permanent: never un-revoke, and keep the
                     -- earliest time, since it decides which historic frames
                     -- remain valid.
@@ -438,6 +443,7 @@ impl Store {
                     device.revoked_at,
                     device.ecdh_public_key,
                     device.ecdh_private_key,
+                    encode_capabilities(&device.capabilities),
                 ],
             )?;
 
@@ -729,8 +735,11 @@ impl Store {
             connection.execute(
                 r#"INSERT INTO direct_messages (
                     id, saved_at, written_at, delete_at, seen, undeliverable,
-                    author, xor, text, signer, original_payload, signature
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                    author, xor, text, signer, original_payload, signature,
+                    deleted_at, deleted_by,
+                    quote_target, quote_author, quote_text, quote_kind, quote_expires_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                          ?13, ?14, ?15, ?16, ?17, ?18, ?19)
                 ON CONFLICT (id) DO NOTHING"#,
                 params![
                     uuid_bytes(message.id),
@@ -745,6 +754,13 @@ impl Store {
                     message.signed.signer,
                     message.signed.original_payload,
                     message.signed.signature,
+                    message.deleted_at,
+                    optional_uuid_bytes(message.deleted_by),
+                    message.quote.as_ref().map(|quote| uuid_bytes(quote.target)),
+                    message.quote.as_ref().map(|quote| uuid_bytes(quote.author)),
+                    message.quote.as_ref().map(|quote| quote.text.clone()).unwrap_or_default(),
+                    message.quote.as_ref().map(|quote| quote.kind).unwrap_or(0),
+                    message.quote.as_ref().map(|quote| quote.expires_at).unwrap_or(0),
                 ],
             )?;
             save_attachments(
@@ -877,8 +893,11 @@ impl Store {
             connection.execute(
                 r#"INSERT INTO group_messages (
                     id, saved_at, written_at, delete_at, seen, undeliverable,
-                    author, destination, text, signer, original_payload, signature
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                    author, destination, text, signer, original_payload, signature,
+                    deleted_at, deleted_by,
+                    quote_target, quote_author, quote_text, quote_kind, quote_expires_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                          ?13, ?14, ?15, ?16, ?17, ?18, ?19)
                 ON CONFLICT (id) DO NOTHING"#,
                 params![
                     uuid_bytes(message.id),
@@ -893,6 +912,13 @@ impl Store {
                     message.signed.signer,
                     message.signed.original_payload,
                     message.signed.signature,
+                    message.deleted_at,
+                    optional_uuid_bytes(message.deleted_by),
+                    message.quote.as_ref().map(|quote| uuid_bytes(quote.target)),
+                    message.quote.as_ref().map(|quote| uuid_bytes(quote.author)),
+                    message.quote.as_ref().map(|quote| quote.text.clone()).unwrap_or_default(),
+                    message.quote.as_ref().map(|quote| quote.kind).unwrap_or(0),
+                    message.quote.as_ref().map(|quote| quote.expires_at).unwrap_or(0),
                 ],
             )?;
             save_attachments(
@@ -1118,6 +1144,269 @@ impl Store {
     }
 
     // ---------------------------------------------------------------------
+    // Reactions
+    // ---------------------------------------------------------------------
+
+    /// Store a reaction frame, whether it sets a reaction or withdraws one.
+    ///
+    /// Returns whether it was new, so a caller can skip emitting an event for
+    /// something it has already applied — which happens on every catch-up
+    /// replay, not only on a duplicate.
+    ///
+    /// **Every frame is kept, including withdrawals.** One reaction per person
+    /// is still the rule, but it is applied when reading rather than by
+    /// throwing frames away: a withdrawal that overwrote the reaction it
+    /// withdraws would destroy that frame's id, `has_frame` would start
+    /// answering false for it, and the peer still holding it would offer it
+    /// back — resurrecting a reaction that had been taken back. That is the
+    /// same trap the message tombstone exists to avoid, and it is why this
+    /// looks like every other frame table rather than like a state table.
+    pub fn save_reaction(&self, reaction: &Reaction) -> Result<bool> {
+        self.with(|connection| {
+            let inserted = connection.execute(
+                r#"INSERT INTO reactions (
+                    id, actor, target, target_type, emoji, timestamp, delete_at,
+                    destination, scope, saved_at, signer, original_payload, signature
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                ON CONFLICT (id) DO NOTHING"#,
+                params![
+                    uuid_bytes(reaction.id),
+                    uuid_bytes(reaction.actor),
+                    uuid_bytes(reaction.target),
+                    reaction.target_type,
+                    reaction.emoji,
+                    reaction.timestamp,
+                    reaction.delete_at,
+                    optional_uuid_bytes(reaction.destination),
+                    reaction.scope,
+                    reaction.saved_at,
+                    reaction.signed.signer,
+                    reaction.signed.original_payload,
+                    reaction.signed.signature,
+                ],
+            )?;
+            Ok(inserted > 0)
+        })
+    }
+
+    /// Give a parked reaction the scope its target implies.
+    ///
+    /// A separate statement rather than a second `save_reaction`, because that
+    /// one refuses to touch a frame it already holds — which is right for a
+    /// replayed frame and wrong here, where the frame is the same one and only
+    /// our knowledge of where it belongs has changed.
+    pub fn rescope_reaction(
+        &self,
+        id: Uuid,
+        destination: Uuid,
+        scope: i64,
+        delete_at: i64,
+    ) -> Result<()> {
+        self.with(|connection| {
+            connection.execute(
+                "UPDATE reactions SET destination = ?2, scope = ?3, delete_at = ?4
+                 WHERE id = ?1",
+                params![uuid_bytes(id), optional_uuid_bytes(destination), scope, delete_at],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Drop a reaction outright.
+    ///
+    /// Used when a parked reaction turns out to be from somebody who was never
+    /// in the conversation, which cannot be known until its target arrives.
+    pub fn discard_reaction(&self, id: Uuid) -> Result<()> {
+        self.with(|connection| {
+            connection.execute("DELETE FROM reactions WHERE id = ?1", params![uuid_bytes(id)])?;
+            Ok(())
+        })
+    }
+
+    /// One reaction by its frame id, for the reference flow.
+    pub fn reaction(&self, id: Uuid) -> Result<Option<Reaction>> {
+        self.with(|connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT * FROM reactions WHERE id = ?1",
+                    params![uuid_bytes(id)],
+                    row_to_reaction,
+                )
+                .optional()?)
+        })
+    }
+
+    /// Every reaction to a message, oldest first.
+    pub fn reactions_for(&self, target: Uuid) -> Result<Vec<Reaction>> {
+        self.with(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT * FROM reactions WHERE target = ?1 ORDER BY timestamp, id",
+            )?;
+            let reactions = statement
+                .query_map(params![uuid_bytes(target)], row_to_reaction)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(reactions)
+        })
+    }
+
+    /// Reactions to a set of messages, grouped by target.
+    ///
+    /// One statement for the whole timeline rather than one per message. The
+    /// boot snapshot builds thousands of message views, and a query apiece is
+    /// how a cold start turns into a visible pause.
+    pub fn reactions_for_all(&self, targets: &[Uuid]) -> Result<HashMap<Uuid, Vec<Reaction>>> {
+        if targets.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        self.with(|connection| {
+            let placeholders = vec!["?"; targets.len()].join(",");
+            let mut statement = connection.prepare(&format!(
+                "SELECT * FROM reactions WHERE target IN ({placeholders}) ORDER BY timestamp, id",
+            ))?;
+
+            let keys: Vec<Vec<u8>> = targets.iter().copied().map(uuid_bytes).collect();
+            let rows = statement.query_map(rusqlite::params_from_iter(keys), row_to_reaction)?;
+
+            let mut grouped: HashMap<Uuid, Vec<Reaction>> = HashMap::new();
+            for reaction in rows {
+                let reaction = reaction?;
+                grouped.entry(reaction.target).or_default().push(reaction);
+            }
+            Ok(grouped)
+        })
+    }
+
+    // ---------------------------------------------------------------------
+    // Deletion
+    // ---------------------------------------------------------------------
+
+    /// Store a delete frame.
+    ///
+    /// Kept as a frame in its own right, separately from the tombstone it
+    /// produces, because the reference flow works in frames: this is what lets
+    /// the deletion be re-offered to a peer who was offline when it happened.
+    pub fn save_delete_message(&self, delete: &DeleteMessage) -> Result<()> {
+        self.with(|connection| {
+            connection.execute(
+                r#"INSERT INTO delete_messages (
+                    id, actor, target, target_type, admin_delete, timestamp,
+                    destination, scope, saved_at, signer, original_payload, signature
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                ON CONFLICT (id) DO NOTHING"#,
+                params![
+                    uuid_bytes(delete.id),
+                    uuid_bytes(delete.actor),
+                    uuid_bytes(delete.target),
+                    delete.target_type,
+                    delete.admin_delete,
+                    delete.timestamp,
+                    optional_uuid_bytes(delete.destination),
+                    delete.scope,
+                    delete.saved_at,
+                    delete.signed.signer,
+                    delete.signed.original_payload,
+                    delete.signed.signature,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn delete_message_frame(&self, id: Uuid) -> Result<Option<DeleteMessage>> {
+        self.with(|connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT * FROM delete_messages WHERE id = ?1",
+                    params![uuid_bytes(id)],
+                    row_to_delete_message,
+                )
+                .optional()?)
+        })
+    }
+
+    /// The delete frame that withdrew a message, if one did.
+    ///
+    /// Consulted when a message arrives, because the two can land in either
+    /// order: a peer catching up can be handed the deletion before the message
+    /// it withdraws, and applying it only forwards would leave the message
+    /// visible forever.
+    pub fn deletion_of(&self, target: Uuid) -> Result<Option<DeleteMessage>> {
+        self.with(|connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT * FROM delete_messages WHERE target = ?1
+                     ORDER BY timestamp LIMIT 1",
+                    params![uuid_bytes(target)],
+                    row_to_delete_message,
+                )
+                .optional()?)
+        })
+    }
+
+    /// Empty a message in place, leaving a tombstone.
+    ///
+    /// Returns whether a message was actually there to empty.
+    ///
+    /// **The row survives on purpose.** Removing it would make the deletion undo
+    /// itself: `has_frame` starts answering false, the peer classifies the
+    /// original as wanted, offers it back through the reference flow, and the
+    /// message returns. The tombstone is what makes the deletion permanent, and
+    /// it is also what lets us keep acknowledging the original so the offer
+    /// stops coming.
+    ///
+    /// What does go is everything the message carried — the text, the
+    /// attachment rows, the `files` rows they point at, and through the chunk
+    /// cascade the bytes themselves — along with any reaction to it, which has
+    /// nothing left to be attached to.
+    pub fn delete_message_for_everyone(
+        &self,
+        target: Uuid,
+        target_type: FrameType,
+        actor: Uuid,
+        at: i64,
+    ) -> Result<bool> {
+        let table = match target_type {
+            FrameType::DirectMessage => "direct_messages",
+            FrameType::GroupMessage => "group_messages",
+            other => {
+                return Err(Error::InvalidFrame(format!(
+                    "cannot delete a frame of type {other:?}"
+                )))
+            }
+        };
+
+        self.with(|connection| {
+            let emptied = connection.execute(
+                &format!(
+                    "UPDATE {table} SET
+                        text = '',
+                        deleted_at = ?2,
+                        deleted_by = ?3,
+                        quote_target = NULL,
+                        quote_author = NULL,
+                        quote_text = '',
+                        quote_kind = 0,
+                        quote_expires_at = 0
+                     WHERE id = ?1 AND deleted_at = 0"
+                ),
+                params![uuid_bytes(target), at, optional_uuid_bytes(actor)],
+            )?;
+
+            // Attachments and their bytes, whether or not the row was already a
+            // tombstone — a partially applied deletion must converge rather
+            // than leave the payload behind.
+            delete_attachments_of(connection, &[target])?;
+            connection.execute(
+                "DELETE FROM reactions WHERE target = ?1",
+                params![uuid_bytes(target)],
+            )?;
+
+            Ok(emptied > 0)
+        })
+    }
+
+    // ---------------------------------------------------------------------
     // Read receipts
     // ---------------------------------------------------------------------
 
@@ -1288,7 +1577,11 @@ impl Store {
     pub fn next_expiry(&self) -> Result<Option<i64>> {
         self.with(|connection| {
             let mut earliest: Option<i64> = None;
-            for table in ["direct_messages", "group_messages"] {
+            // Reactions carry their target's expiry, so they come due at the
+            // same moment — but a reaction to a message that was itself deleted
+            // is gone already, so including the table costs a `MIN` and covers
+            // the case where the two have drifted apart.
+            for table in ["direct_messages", "group_messages", "reactions"] {
                 let found: Option<i64> = connection.query_row(
                     &format!("SELECT MIN(delete_at) FROM {table} WHERE delete_at != 0"),
                     [],
@@ -1325,12 +1618,116 @@ impl Store {
             }
 
             delete_attachments_of(connection, &removed)?;
+
+            // Reactions on their own clock, plus any orphaned by a message that
+            // has just gone. A tombstone expires the same way — its `delete_at`
+            // is the original's, untouched by the deletion — so a deleted
+            // message eventually leaves nothing at all behind.
+            connection.execute(
+                "DELETE FROM reactions WHERE delete_at != 0 AND delete_at <= ?1",
+                params![now],
+            )?;
+            connection.execute(
+                "DELETE FROM reactions WHERE target NOT IN (
+                    SELECT id FROM direct_messages UNION SELECT id FROM group_messages
+                 )",
+                [],
+            )?;
+
             // Hand the freed pages back, so the bytes are gone from the file
             // and not merely unreferenced inside it.
             if !removed.is_empty() {
                 connection.execute_batch("PRAGMA incremental_vacuum;")?;
             }
             Ok(removed)
+        })
+    }
+
+    /// Change when a message expires.
+    ///
+    /// The engine sets this once, at send time, from the thread's retention.
+    /// Exposed because a test that wants to observe a sweep should not have to
+    /// wait an hour for the shortest retention the product offers.
+    pub fn set_message_delete_at(&self, target: Uuid, delete_at: i64) -> Result<()> {
+        self.with(|connection| {
+            for table in ["direct_messages", "group_messages"] {
+                connection.execute(
+                    &format!("UPDATE {table} SET delete_at = ?2 WHERE id = ?1"),
+                    params![uuid_bytes(target), delete_at],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Remove a message from this device only.
+    ///
+    /// Nothing is broadcast and no frame is stored, so this really is local —
+    /// with one consequence worth being clear about: the reference flow will
+    /// offer the message back the next time a peer that still has it connects.
+    /// Nothing marks it as unwanted, because a tombstone would be a record of
+    /// what was hidden, which is the opposite of what hiding is for.
+    pub fn delete_message_locally(&self, target: Uuid, target_type: FrameType) -> Result<bool> {
+        let table = match target_type {
+            FrameType::DirectMessage => "direct_messages",
+            FrameType::GroupMessage => "group_messages",
+            other => {
+                return Err(Error::InvalidFrame(format!(
+                    "cannot delete a frame of type {other:?}"
+                )))
+            }
+        };
+
+        self.with(|connection| {
+            let removed = connection.execute(
+                &format!("DELETE FROM {table} WHERE id = ?1"),
+                params![uuid_bytes(target)],
+            )?;
+
+            delete_attachments_of(connection, &[target])?;
+            connection.execute(
+                "DELETE FROM reactions WHERE target = ?1",
+                params![uuid_bytes(target)],
+            )?;
+            if removed > 0 {
+                connection.execute_batch("PRAGMA incremental_vacuum;")?;
+            }
+            Ok(removed > 0)
+        })
+    }
+
+    /// Blank the excerpt on any quote whose original has expired.
+    ///
+    /// Returns the messages changed, so the interface can redraw them.
+    ///
+    /// The reply survives; only the quoted text goes. Without this a reply to a
+    /// thirty-second message keeps a copy of it under the *reply's* retention,
+    /// which may be unlimited — the quote would outlive the thing it quoted,
+    /// which is the one outcome disappearing messages exist to prevent.
+    pub fn blank_expired_quotes(&self, now: i64) -> Result<Vec<Uuid>> {
+        self.with(|connection| {
+            let mut changed = Vec::new();
+
+            for table in ["direct_messages", "group_messages"] {
+                let condition = "quote_target IS NOT NULL AND quote_text != ''
+                                 AND quote_expires_at != 0 AND quote_expires_at <= ?1";
+
+                let mut statement =
+                    connection.prepare(&format!("SELECT id FROM {table} WHERE {condition}"))?;
+                let rows = statement.query_map(params![now], |row| row.get::<_, Vec<u8>>(0))?;
+                for bytes in rows {
+                    if let Ok(id) = Uuid::from_slice(&bytes?) {
+                        changed.push(id);
+                    }
+                }
+
+                connection.execute(
+                    &format!("UPDATE {table} SET quote_text = '' WHERE {condition}"),
+                    params![now],
+                )?;
+            }
+
+            Ok(changed)
         })
     }
 
@@ -1768,6 +2165,12 @@ impl Store {
             crate::now() - crate::UNDELIVERABLE_AFTER_SECONDS
         };
 
+        // What this peer has said it can handle. An unknown device gets nothing
+        // beyond the base protocol — offering an extension to a build that
+        // cannot take one is how the connection dies, and an offer is the first
+        // step towards sending it.
+        let peer_device = self.device_by_address(peer)?;
+
         let candidates = self.with(|connection| {
             // The frame types that participate in the reference flow, each
             // paired with the table it lives in and with whether that table
@@ -1782,10 +2185,19 @@ impl Store {
                 ("update_dms", FrameType::UpdateDm, false),
                 ("update_users", FrameType::UpdateUser, false),
                 ("drafts", FrameType::Draft, false),
+                ("reactions", FrameType::Reaction, false),
+                // The one that matters most. A deletion that is never
+                // re-offered is a deletion that reached whoever happened to be
+                // online and nobody else — which is the case the person doing
+                // the deleting is least able to check.
+                ("delete_messages", FrameType::DeleteMessage, false),
             ];
 
             let mut references = Vec::new();
             for (table, frame_type, ages_out) in sources {
+                if !accepts(peer_device.as_ref(), frame_type) {
+                    continue;
+                }
                 let floor = if ages_out { "AND t.written_at >= ?3" } else { "" };
                 let sql = format!(
                     "SELECT t.id FROM {table} AS t
@@ -1836,6 +2248,8 @@ impl Store {
             FrameType::UpdateDm => "update_dms",
             FrameType::UpdateUser => "update_users",
             FrameType::Draft => "drafts",
+            FrameType::Reaction => "reactions",
+            FrameType::DeleteMessage => "delete_messages",
             _ => return Ok(false),
         };
 
@@ -1896,6 +2310,14 @@ impl Store {
                 .map(|update| update.payload())
                 .transpose()?,
             FrameType::Draft => self.draft(frame_id)?.map(|draft| draft.payload()).transpose()?,
+            FrameType::Reaction => self
+                .reaction(frame_id)?
+                .map(|reaction| reaction.payload())
+                .transpose()?,
+            FrameType::DeleteMessage => self
+                .delete_message_frame(frame_id)?
+                .map(|delete| delete.payload())
+                .transpose()?,
             _ => None,
         })
     }
@@ -1912,6 +2334,8 @@ impl Store {
             FrameType::UpdateDm => "update_dms",
             FrameType::UpdateUser => "update_users",
             FrameType::Draft => "drafts",
+            FrameType::Reaction => "reactions",
+            FrameType::DeleteMessage => "delete_messages",
             _ => return Ok(None),
         };
 
@@ -2455,6 +2879,28 @@ fn uuid_bytes(id: Uuid) -> Vec<u8> {
     id.as_bytes().to_vec()
 }
 
+/// Whether a frame type may be sent to, or even offered to, a device.
+///
+/// The unknown-device case is the one that matters: a peer we have no record
+/// for gets the base protocol only. Offering an extension is the first step
+/// towards sending it, and sending one to a build that cannot decode it closes
+/// the connection rather than being ignored.
+pub(crate) fn accepts(device: Option<&Device>, frame_type: FrameType) -> bool {
+    match device {
+        Some(device) => device.accepts(frame_type),
+        None => !frame_type.is_extension(),
+    }
+}
+
+/// A nullable UUID column: nil is stored as `NULL` rather than sixteen zeroes.
+///
+/// The distinction matters where the column is a foreign key or is read as
+/// "was this ever set" — `deleted_by` alongside `deleted_at`, for instance —
+/// and it keeps a nil from looking like a real id that happens to be zero.
+fn optional_uuid_bytes(id: Uuid) -> Option<Vec<u8>> {
+    (!id.is_nil()).then(|| uuid_bytes(id))
+}
+
 fn row_uuid(row: &Row, column: &str) -> rusqlite::Result<Uuid> {
     let bytes: Option<Vec<u8>> = row.get(column)?;
     Ok(bytes
@@ -2686,7 +3132,26 @@ fn row_to_device(row: &Row) -> rusqlite::Result<Device> {
             .get::<_, Option<Vec<u8>>>("ecdh_private_key")?
             .unwrap_or_default(),
         signature: None,
+        capabilities: decode_capabilities(&row.get::<_, String>("capabilities")?),
     })
+}
+
+/// Capabilities are stored as one comma-separated column rather than a table.
+///
+/// There are a handful of them, they are only ever read whole, and nothing
+/// joins against them — the same reasoning that put `admins` and `invites` in a
+/// column on `groups`.
+fn decode_capabilities(stored: &str) -> Vec<String> {
+    stored
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn encode_capabilities(capabilities: &[String]) -> String {
+    capabilities.join(",")
 }
 
 fn load_signature(connection: &Connection, device_id: Uuid) -> Result<Option<IntroductionSignature>> {
@@ -2707,6 +3172,25 @@ fn load_signature(connection: &Connection, device_id: Uuid) -> Result<Option<Int
         .optional()?)
 }
 
+/// The quote columns, if this row carries one.
+///
+/// A quote is present exactly when `quote_target` is set. The excerpt can be
+/// empty on a present quote — that is what an expired original looks like once
+/// the sweep has blanked it — so emptiness of the text is not the test.
+fn row_to_quote(row: &Row) -> rusqlite::Result<Option<Quote>> {
+    let target = row_uuid(row, "quote_target")?;
+    if target.is_nil() {
+        return Ok(None);
+    }
+    Ok(Some(Quote {
+        target,
+        author: row_uuid(row, "quote_author")?,
+        text: row.get("quote_text")?,
+        kind: row.get("quote_kind")?,
+        expires_at: row.get("quote_expires_at")?,
+    }))
+}
+
 fn row_to_direct_message(row: &Row) -> rusqlite::Result<DirectMessage> {
     Ok(DirectMessage {
         signed: row_to_signed_frame(row)?,
@@ -2721,6 +3205,9 @@ fn row_to_direct_message(row: &Row) -> rusqlite::Result<DirectMessage> {
         text: row.get("text")?,
         file_attachments: Vec::new(),
         image_attachments: Vec::new(),
+        quote: row_to_quote(row)?,
+        deleted_at: row.get("deleted_at")?,
+        deleted_by: row_uuid(row, "deleted_by")?,
     })
 }
 
@@ -2738,6 +3225,43 @@ fn row_to_group_message(row: &Row) -> rusqlite::Result<GroupMessage> {
         text: row.get("text")?,
         file_attachments: Vec::new(),
         image_attachments: Vec::new(),
+        quote: row_to_quote(row)?,
+        deleted_at: row.get("deleted_at")?,
+        deleted_by: row_uuid(row, "deleted_by")?,
+    })
+}
+
+fn row_to_reaction(row: &Row) -> rusqlite::Result<Reaction> {
+    Ok(Reaction {
+        signed: row_to_signed_frame(row)?,
+        id: row_uuid(row, "id")?,
+        actor: row_uuid(row, "actor")?,
+        target: row_uuid(row, "target")?,
+        target_type: row.get("target_type")?,
+        emoji: row.get("emoji")?,
+        // An empty emoji is a withdrawal that has been kept so the reference
+        // flow can carry it — see `save_reaction`.
+        remove: row.get::<_, String>("emoji")?.is_empty(),
+        timestamp: row.get("timestamp")?,
+        destination: row_uuid(row, "destination")?,
+        scope: row.get("scope")?,
+        delete_at: row.get("delete_at")?,
+        saved_at: row.get("saved_at")?,
+    })
+}
+
+fn row_to_delete_message(row: &Row) -> rusqlite::Result<DeleteMessage> {
+    Ok(DeleteMessage {
+        signed: row_to_signed_frame(row)?,
+        id: row_uuid(row, "id")?,
+        actor: row_uuid(row, "actor")?,
+        target: row_uuid(row, "target")?,
+        target_type: row.get("target_type")?,
+        admin_delete: row.get("admin_delete")?,
+        timestamp: row.get("timestamp")?,
+        destination: row_uuid(row, "destination")?,
+        scope: row.get("scope")?,
+        saved_at: row.get("saved_at")?,
     })
 }
 

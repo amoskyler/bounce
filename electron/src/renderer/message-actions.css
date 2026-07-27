@@ -1,0 +1,672 @@
+/*
+ * Acting on a message: the hover row, reaction pills, quotes, and tombstones.
+ *
+ * The rule that shapes most of this: nothing here may change the height of a
+ * timeline row when it appears. The scroller measures rows and caches those
+ * measurements, so a control that grows a bubble on hover would move every
+ * message below it under the pointer.
+ */
+
+/* --------------------------------------------------------------------------
+ * The hover row
+ * -------------------------------------------------------------------------- */
+
+/*
+ * Bare icons, no surface.
+ *
+ * The obvious treatment is a little floating toolbar — a rounded panel with a
+ * shadow — and Signal deliberately does not do that: `.module-message__buttons`
+ * is `display: inline-flex; opacity: 0` and nothing else. The icons simply fade
+ * in beside the message. A panel announces itself and competes with the bubble;
+ * three grey glyphs appearing quietly do not.
+ *
+ * Absolutely positioned in the gutter, so revealing them costs nothing in
+ * layout and cannot reflow the timeline under the pointer.
+ */
+.hover-actions {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 3;
+  display: inline-flex;
+  flex-direction: row;
+  align-items: center;
+
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.1s ease;
+}
+
+.hover-actions--incoming {
+  inset-inline-start: 100%;
+  padding-inline-start: 8px;
+}
+
+.hover-actions--incoming > * {
+  margin-inline-start: 12px;
+}
+
+.hover-actions--incoming > *:first-child {
+  margin-inline-start: 0;
+}
+
+/* Mirrored, so the react button is always the one nearest the message. */
+.hover-actions--outgoing {
+  inset-inline-end: 100%;
+  padding-inline-end: 8px;
+  flex-direction: row-reverse;
+}
+
+.hover-actions--outgoing > * {
+  margin-inline-end: 12px;
+}
+
+.hover-actions--outgoing > *:first-child {
+  margin-inline-end: 0;
+}
+
+/*
+ * Revealed by hovering the row, held open while a popover it opened is still
+ * up, and kept while anything inside has keyboard focus — otherwise tabbing to
+ * React would move focus somewhere invisible.
+ */
+.message-group:hover .hover-actions,
+.hover-actions--active,
+.hover-actions:focus-within {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hover-actions {
+    transition: none;
+  }
+}
+
+/* The react button, and the strip that opens above it. */
+.hover-actions__anchor {
+  position: relative;
+  display: inline-flex;
+}
+
+.hover-actions__button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  color: var(--gray-45);
+  transition: color 0.08s ease;
+}
+
+.hover-actions__button:hover {
+  color: var(--gray-90);
+}
+
+:root[data-theme='dark'] .hover-actions__button:hover {
+  color: var(--gray-02);
+}
+
+/* --------------------------------------------------------------------------
+ * Choosing a reaction
+ * -------------------------------------------------------------------------- */
+
+/*
+ * Directly above the react button, which is where the pointer already is.
+ *
+ * Anchoring it to the bubble instead puts the strip somewhere the hand is not,
+ * and on a tall message that can be most of a screen away from the button that
+ * opened it.
+ */
+.reaction-picker {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 40;
+  display: inline-flex;
+  flex-direction: row;
+  align-items: center;
+  /* Signal's exact chrome: a hairline border under a two-part shadow, one tight
+     and one broad, which is what lifts it off the timeline without a hard edge. */
+  padding-block: 3px;
+  padding-inline: 7px;
+  border: 1px solid rgba(0, 0, 0, 0.05);
+  border-radius: 9999px;
+  background: #ffffff;
+  box-shadow:
+    0 1px 4px rgba(0, 0, 0, 0.05),
+    0 10px 16px rgba(0, 0, 0, 0.2);
+  user-select: none;
+  animation: reaction-picker-appear 400ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+:root[data-theme='dark'] .reaction-picker {
+  background: var(--gray-75);
+  border-color: var(--gray-80);
+}
+
+@keyframes reaction-picker-appear {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(6px) scale(0.94);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0) scale(1);
+  }
+}
+
+/* The full picker brings its own surface, so this becomes a positioner only. */
+.reaction-picker--expanded {
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+  animation: none;
+}
+
+/*
+ * 40px targets holding a 28px glyph.
+ *
+ * The gap is deliberate: the emoji grows to 42px and lifts 16px on hover, and
+ * the extra space is what it grows into. A button sized to its glyph would make
+ * that a layout change rather than a flourish.
+ */
+.reaction-picker__emoji {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 100%;
+  font-size: 28px;
+  line-height: 1;
+  transition:
+    transform 400ms cubic-bezier(0.16, 1, 0.3, 1),
+    background 200ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.reaction-picker__emoji:hover {
+  transform: scale(1.5) translateY(-11px);
+}
+
+.reaction-picker__emoji--chosen {
+  background: var(--gray-05);
+}
+
+:root[data-theme='dark'] .reaction-picker__emoji--chosen {
+  background: var(--gray-60);
+}
+
+/* Smaller than the emoji buttons but margined to occupy the same width, so the
+   strip stays evenly spaced. Signal's arithmetic exactly. */
+.reaction-picker__more {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  margin: 6px;
+  border-radius: 100%;
+  color: var(--gray-45);
+  background: var(--gray-02);
+  transition: background 200ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.reaction-picker__more:hover {
+  background: var(--gray-05);
+}
+
+:root[data-theme='dark'] .reaction-picker__more {
+  color: var(--gray-15);
+  background: var(--gray-60);
+}
+
+:root[data-theme='dark'] .reaction-picker__more:hover {
+  background: var(--gray-45);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .reaction-picker,
+  .reaction-picker__emoji {
+    animation: none;
+    transition: none;
+  }
+  .reaction-picker__emoji:hover {
+    transform: none;
+  }
+}
+
+/* --------------------------------------------------------------------------
+ * Reaction pills
+ * -------------------------------------------------------------------------- */
+
+/*
+ * Signal's arrangement, read out of `_modules.scss` at v8.20.0 rather than
+ * guessed — and it is the opposite of the obvious one.
+ *
+ * Reactions hang off the bubble's **inside** edge: `align-self: flex-end` on an
+ * incoming message, `flex-start` on an outgoing one. Aligning them with the
+ * bubble's outer edge, which is what "they belong to this message" suggests,
+ * puts them against the window margin where there is nothing to read them
+ * against. Inside, they sit over the empty half of the timeline.
+ */
+/*
+ * `z-index` here is a stacking context, and that is the point to be careful of.
+ *
+ * The pills need to sit above the bubble they overlap, which is what the 2 is
+ * for — but it also traps everything inside: a card at `z-index: 30` within a
+ * context established at 2 still paints below a sibling at 3, so the hover
+ * action row showed straight through the reactions card. Raising the *cluster*
+ * while its card is open is what actually moves it forward, because that is
+ * the number the outside world compares against.
+ */
+.reactions {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  height: 22px;
+  gap: 4px;
+  user-select: none;
+}
+
+/*
+ * Above every hover row in the timeline, not just this message's.
+ *
+ * Message groups do not establish stacking contexts of their own, so a later
+ * message's controls would otherwise paint over an earlier message's card
+ * purely by document order — and the card that is open is always the thing the
+ * reader is looking at.
+ */
+.reactions--open {
+  z-index: 50;
+}
+
+.reactions--incoming {
+  align-self: flex-end;
+  padding-inline-end: 8px;
+  margin-inline-start: 8px;
+}
+
+.reactions--outgoing {
+  align-self: flex-start;
+  padding-inline-start: 8px;
+  margin-inline-end: 8px;
+}
+
+/* Signal's `--with-reactions`: the bubble gives up six pixels so the pills
+   overlap its lower edge rather than sitting under it. */
+.bubble--with-reactions {
+  margin-bottom: -6px;
+}
+
+/*
+ * The border is the *page* colour, not a tint of the pill.
+ *
+ * That is what cuts the pill out of the bubble it overlaps, and it is why this
+ * is a border rather than the ring a floating control would use: a shadow would
+ * read as hovering above the message instead of being punched into it.
+ */
+.reaction-pill {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 28px;
+  height: 22px;
+  border: 1px solid var(--timeline-background);
+  border-radius: 33px;
+  background: var(--gray-05);
+  font-size: 12px;
+  line-height: 1;
+  color: var(--text-secondary);
+}
+
+:root[data-theme='dark'] .reaction-pill {
+  border-color: var(--gray-95);
+  background: var(--gray-90);
+}
+
+.reaction-pill--with-count {
+  min-width: 40px;
+  padding-block: 0;
+  padding-inline: 6px;
+}
+
+/* Ours is a heavier fill, not a coloured outline — Signal's `--is-me`. An
+   outline competes with the bubble's own edge at this size. */
+.reaction-pill--mine {
+  background: var(--gray-25);
+  color: var(--text-primary);
+}
+
+:root[data-theme='dark'] .reaction-pill--mine {
+  background: var(--gray-60);
+  color: #ffffff;
+}
+
+.reaction-pill__emoji {
+  font-size: 14px;
+  line-height: 1;
+}
+
+.reaction-pill__count {
+  /* Signal's `font-caption-bold`. */
+  font-size: 11px;
+  line-height: 14px;
+  letter-spacing: 0.06px;
+  font-weight: 600;
+  margin-inline-start: 4px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* --------------------------------------------------------------------------
+ * Quotes
+ * -------------------------------------------------------------------------- */
+
+/*
+ * The bar down the leading edge takes the quoted author's colour, which is the
+ * same signal the author name inside a bubble uses — a run of replies in a
+ * group can be told apart without reading a name.
+ */
+.quote {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 1px;
+  width: 100%;
+  margin-bottom: 5px;
+  padding: 5px 8px;
+  border-radius: 4px;
+  border-inline-start: 4px solid var(--quote-light);
+  background: rgba(0, 0, 0, 0.07);
+  text-align: start;
+  cursor: pointer;
+}
+
+:root[data-theme='dark'] .quote {
+  border-inline-start-color: var(--quote-dark);
+  background: rgba(255, 255, 255, 0.09);
+}
+
+.bubble--outgoing .quote {
+  background: rgba(255, 255, 255, 0.16);
+  border-inline-start-color: rgba(255, 255, 255, 0.9);
+}
+
+.quote--static {
+  cursor: default;
+}
+
+.quote__author {
+  font-size: 12px;
+  line-height: 16px;
+  font-weight: 600;
+  color: var(--quote-light);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+:root[data-theme='dark'] .quote__author {
+  color: var(--quote-dark);
+}
+
+.bubble--outgoing .quote__author {
+  color: #ffffff;
+}
+
+.quote__text {
+  /* Signal's `font-body-2`, clamped to two lines. */
+  font-size: 13px;
+  line-height: 18px;
+  letter-spacing: -0.03px;
+  color: var(--text-secondary);
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+}
+
+.bubble--outgoing .quote__text {
+  color: rgba(255, 255, 255, 0.85);
+}
+
+/* What is left when the quoted message has expired: the attribution, and a
+   note that the words are gone. */
+.quote__unavailable,
+.quote__kind {
+  font-style: italic;
+  opacity: 0.75;
+}
+
+/* --------------------------------------------------------------------------
+ * The reply strip above the composer
+ * -------------------------------------------------------------------------- */
+
+.reply-preview {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 16px 6px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  border-inline-start: 4px solid var(--quote-light);
+  background: var(--input-background);
+}
+
+:root[data-theme='dark'] .reply-preview {
+  border-inline-start-color: var(--quote-dark);
+}
+
+.reply-preview__body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.reply-preview .quote__text {
+  /* One line here: the composer is where you look at what you are writing, not
+     at what you are answering. */
+  -webkit-line-clamp: 1;
+}
+
+.reply-preview__cancel {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 13px;
+  color: var(--text-secondary);
+}
+
+.reply-preview__cancel:hover {
+  background: var(--row-hover);
+  color: var(--text-primary);
+}
+
+/* --------------------------------------------------------------------------
+ * Deleted messages
+ * -------------------------------------------------------------------------- */
+
+/*
+ * A tombstone keeps its place in the conversation. Signal draws it as italic
+ * text beside a slashed icon, and the row staying put is the point — a message
+ * that vanished entirely would leave the two around it looking like a reply to
+ * something that never happened.
+ */
+.bubble__deleted {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-style: italic;
+  opacity: 0.8;
+}
+
+.bubble--incoming .bubble__deleted {
+  color: var(--text-secondary);
+}
+
+/* --------------------------------------------------------------------------
+ * Menu additions
+ * -------------------------------------------------------------------------- */
+
+.menu__divider {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--divider);
+}
+
+.menu__item--danger {
+  color: var(--red);
+}
+
+/* --------------------------------------------------------------------------
+ * Who reacted
+ * -------------------------------------------------------------------------- */
+
+/*
+ * Anchored to the row of pills, not to one of them.
+ *
+ * Hanging it off the pill that was clicked meant switching tabs re-parented the
+ * card into a different pill's box, so it jumped sideways on every tab — the
+ * one interaction the tabs exist to make easy.
+ */
+.reactions {
+  position: relative;
+}
+
+.reaction-viewer {
+  position: absolute;
+  top: calc(100% + 6px);
+  z-index: 30;
+  min-width: 200px;
+  max-width: 280px;
+  padding: 4px;
+  border-radius: 10px;
+  background: var(--panel-background);
+  box-shadow: var(--shadow);
+}
+
+/* Opened inward, so a card near either edge of the timeline has somewhere to
+   go. `useKeptInView` catches whatever is left. */
+.reaction-viewer--incoming {
+  inset-inline-start: 0;
+}
+
+.reaction-viewer--outgoing {
+  inset-inline-end: 0;
+}
+
+.reaction-viewer__tabs {
+  display: flex;
+  gap: 2px;
+  padding-bottom: 4px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid var(--divider);
+  overflow-x: auto;
+}
+
+.reaction-viewer__tab {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  padding: 3px 8px;
+  border-radius: 12px;
+  font-size: 13px;
+  line-height: 18px;
+  color: var(--text-secondary);
+}
+
+.reaction-viewer__tab:hover {
+  background: var(--row-hover);
+}
+
+.reaction-viewer__tab--active {
+  background: var(--row-selected);
+  color: var(--text-primary);
+}
+
+/* "All" is a word where the others are a glyph, so it takes the weight the
+   emoji carry on their own. */
+.reaction-viewer__tab-all {
+  font-weight: 600;
+}
+
+.reaction-viewer__tab-count {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.reaction-viewer__list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.reaction-viewer__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 5px 8px;
+  border-radius: 6px;
+}
+
+.reaction-viewer__name {
+  /* Signal's `font-body-2`. */
+  font-size: 13px;
+  line-height: 18px;
+  letter-spacing: -0.03px;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.reaction-viewer__emoji {
+  flex-shrink: 0;
+  font-size: 15px;
+  line-height: 1;
+}
+
+/* --------------------------------------------------------------------------
+ * Jumping to a quoted message
+ * -------------------------------------------------------------------------- */
+
+/*
+ * A moment, not a mode.
+ *
+ * The bubble is scrolled to the middle of the view, which on its own tells you
+ * nothing about *which* of the messages there you were sent to. The flash is
+ * what answers that, and it fades on a timer so it does not become a selection
+ * you then have to clear.
+ */
+@keyframes bubble-flash {
+  0%,
+  55% {
+    box-shadow: 0 0 0 3px var(--ultramarine);
+  }
+  100% {
+    box-shadow: 0 0 0 3px rgba(44, 107, 237, 0);
+  }
+}
+
+.bubble--flashed {
+  animation: bubble-flash 1.2s ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bubble--flashed {
+    animation: none;
+    box-shadow: 0 0 0 3px var(--ultramarine);
+  }
+}

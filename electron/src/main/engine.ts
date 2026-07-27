@@ -27,18 +27,25 @@ interface NativeNode {
   requestToAddUser(code: string): Promise<void>;
   markAsRead(messageId: string, isGroup: boolean): Promise<void>;
   typingIn(thread: string, isGroup: boolean): Promise<void>;
-  sendDirectMessage(recipient: string, text: string): Promise<string>;
-  sendGroupMessage(groupId: string, text: string): Promise<string>;
+  sendDirectMessage(recipient: string, text: string, replyTo?: string): Promise<string>;
+  sendGroupMessage(groupId: string, text: string, replyTo?: string): Promise<string>;
   sendDirectMessageWithAttachments(
     recipient: string,
     text: string,
     attachments: NativeAttachment[],
+    replyTo?: string,
   ): Promise<string>;
   sendGroupMessageWithAttachments(
     groupId: string,
     text: string,
     attachments: NativeAttachment[],
+    replyTo?: string,
   ): Promise<string>;
+  react(target: string, targetType: number, emoji: string): Promise<void>;
+  removeReaction(target: string, targetType: number): Promise<void>;
+  deleteForMe(target: string, targetType: number): void;
+  deleteForEveryone(target: string, targetType: number): Promise<void>;
+  mayDeleteForEveryone(target: string, targetType: number): boolean;
   fileData(fileId: string): Buffer | null;
   messageInfo(messageId: string): string | null;
   createGroup(name: string, invites: string[]): Promise<string>;
@@ -200,21 +207,59 @@ export class BounceEngine extends EventEmitter {
     return JSON.parse(this.node.initialState());
   }
 
-  async sendDirectMessage(recipient: string, text: string): Promise<unknown> {
-    return JSON.parse(await this.node.sendDirectMessage(recipient, text));
+  async sendDirectMessage(
+    recipient: string,
+    text: string,
+    replyTo?: string,
+  ): Promise<unknown> {
+    return JSON.parse(await this.node.sendDirectMessage(recipient, text, replyTo));
   }
 
-  async sendGroupMessage(groupId: string, text: string): Promise<unknown> {
-    return JSON.parse(await this.node.sendGroupMessage(groupId, text));
+  async sendGroupMessage(groupId: string, text: string, replyTo?: string): Promise<unknown> {
+    return JSON.parse(await this.node.sendGroupMessage(groupId, text, replyTo));
+  }
+
+  /*
+   * Reacting, replying, and withdrawing.
+   *
+   * `targetType` is the frame type of the message being acted on — 0 for a
+   * direct message, 1 for a group message — matching `FrameType` in the core.
+   * The renderer knows which thread it is in, so passing it is cheaper than a
+   * lookup on the other side of the boundary.
+   */
+  react(target: string, targetType: number, emoji: string): Promise<void> {
+    return this.node.react(target, targetType, emoji);
+  }
+
+  removeReaction(target: string, targetType: number): Promise<void> {
+    return this.node.removeReaction(target, targetType);
+  }
+
+  deleteForMe(target: string, targetType: number): void {
+    this.node.deleteForMe(target, targetType);
+  }
+
+  deleteForEveryone(target: string, targetType: number): Promise<void> {
+    return this.node.deleteForEveryone(target, targetType);
+  }
+
+  mayDeleteForEveryone(target: string, targetType: number): boolean {
+    return this.node.mayDeleteForEveryone(target, targetType);
   }
 
   async sendDirectMessageWithAttachments(
     recipient: string,
     text: string,
     attachments: OutgoingAttachment[],
+    replyTo?: string,
   ): Promise<unknown> {
     return JSON.parse(
-      await this.node.sendDirectMessageWithAttachments(recipient, text, attachments.map(toNative)),
+      await this.node.sendDirectMessageWithAttachments(
+        recipient,
+        text,
+        attachments.map(toNative),
+        replyTo,
+      ),
     );
   }
 
@@ -222,9 +267,15 @@ export class BounceEngine extends EventEmitter {
     groupId: string,
     text: string,
     attachments: OutgoingAttachment[],
+    replyTo?: string,
   ): Promise<unknown> {
     return JSON.parse(
-      await this.node.sendGroupMessageWithAttachments(groupId, text, attachments.map(toNative)),
+      await this.node.sendGroupMessageWithAttachments(
+        groupId,
+        text,
+        attachments.map(toNative),
+        replyTo,
+      ),
     );
   }
 

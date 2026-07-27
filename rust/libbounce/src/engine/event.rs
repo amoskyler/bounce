@@ -136,6 +136,52 @@ pub struct MessageView {
     pub attachments: Vec<AttachmentView>,
     /// Whether this device's owner wrote it.
     pub outgoing: bool,
+    /// Reactions, grouped so the client renders pills rather than a list.
+    pub reactions: Vec<ReactionView>,
+    /// The message this one replies to, if it is a reply.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quote: Option<QuoteView>,
+    /// When this message was deleted for everyone; zero if it was not.
+    ///
+    /// A message with this set is a tombstone: the text and attachments are
+    /// gone and the row survives so the deletion cannot be undone by a peer
+    /// re-offering the original.
+    pub deleted_at: i64,
+    /// Who deleted it, and whether they did so as a group admin.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted_by: Option<Uuid>,
+    pub deleted_by_admin: bool,
+}
+
+/// One emoji and everybody who chose it.
+///
+/// Grouped here rather than in the client because the grouping is the same
+/// everywhere and doing it once is cheaper than doing it on every render.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReactionView {
+    pub emoji: String,
+    /// Who reacted, oldest first.
+    pub users: Vec<Uuid>,
+    /// Whether this device's owner is one of them, so the pill can be
+    /// highlighted and clicking it can mean "withdraw" without a second lookup.
+    pub mine: bool,
+}
+
+/// The excerpt a reply shows of the message it answers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuoteView {
+    pub target: Uuid,
+    pub author: Uuid,
+    /// Empty when the original has expired, which is not the same as the
+    /// original having had no text — see `kind`.
+    pub text: String,
+    /// "text", "image" or "file".
+    pub kind: String,
+    /// Whether the quoted message has expired, so the block renders as
+    /// unavailable rather than as an empty quote.
+    pub expired: bool,
 }
 
 /// A status change in a conversation: a rename, an invitation, a departure.
@@ -219,8 +265,38 @@ pub enum Event {
     MessageSeen { message_id: Uuid },
     /// Delivery was abandoned.
     MessageUndeliverable { message_id: Uuid },
-    /// A message expired or was deleted.
+    /// A message expired, or was removed from this device alone.
+    ///
+    /// The message is gone. Compare [`Event::MessageWithdrawn`], where the row
+    /// survives as a tombstone and the timeline still has a place to draw.
     MessageDeleted { message_id: Uuid },
+
+    /// A message was deleted for everyone, and is now a tombstone.
+    ///
+    /// `by` is who did it and `admin` whether they did it as a group admin
+    /// rather than as the author, because the interface says three different
+    /// things and cannot tell them apart from the row.
+    MessageWithdrawn {
+        message_id: Uuid,
+        by: Uuid,
+        admin: bool,
+    },
+
+    /// Somebody reacted to a message, or withdrew their reaction.
+    ///
+    /// An empty `emoji` is a withdrawal. One event for both, because they are
+    /// one state change from the reader's side: this person's reaction to this
+    /// message is now *this*, where "nothing" is a legitimate value.
+    MessageReacted {
+        message_id: Uuid,
+        user_id: Uuid,
+        emoji: String,
+    },
+
+    /// A reply's quote was blanked because the message it quoted expired.
+    ///
+    /// The reply itself is untouched; only the excerpt is gone.
+    QuoteExpired { message_id: Uuid },
 
     /// Someone is composing a message.
     TypingStarted { user_id: Uuid, thread: Uuid },
@@ -326,10 +402,15 @@ mod tests {
             read_by: vec![],
             attachments: vec![],
             outgoing: true,
+            reactions: vec![],
+            quote: None,
+            deleted_at: 0,
+            deleted_by: None,
+            deleted_by_admin: false,
         };
         let json = serde_json::to_value(&view).unwrap();
 
-        for field in ["writtenAt", "expiresAt", "deliveredTo", "readBy"] {
+        for field in ["writtenAt", "expiresAt", "deliveredTo", "readBy", "deletedAt", "deletedByAdmin"] {
             assert!(json.get(field).is_some(), "missing {field} in {json}");
         }
         assert!(json.get("written_at").is_none());

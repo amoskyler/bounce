@@ -170,7 +170,10 @@ impl<N: Network + 'static> Engine<N> {
     /// from a peer that went away — the next audit would dial again, sixty
     /// seconds later, having lost everything in between.
     async fn run_keep_alive(self: Arc<Self>) {
-        let Ok(payload) = KeepAlive {}.encode() else {
+        // Carries this build's capability list, which is what lets a contact
+        // paired before the extensions existed start receiving them without
+        // re-pairing — see `KeepAlive`.
+        let Ok(payload) = KeepAlive::advertising().encode() else {
             return;
         };
 

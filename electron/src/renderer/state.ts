@@ -14,6 +14,7 @@ import type {
   Group,
   InitialState,
   Message,
+  Reaction,
   Settings,
   SystemMessage,
   User,
@@ -198,6 +199,44 @@ function addUnique(list: string[], value: string): string[] {
   return list.includes(value) ? list : [...list, value];
 }
 
+/**
+ * Apply one person's reaction to a message's grouped pills.
+ *
+ * An empty `emoji` is a withdrawal, which is why this is one function rather
+ * than two: setting and clearing are the same state change from the reader's
+ * side — this person's reaction is now *this*, where nothing is a value.
+ *
+ * One reaction per person, so the actor is removed from wherever they were
+ * before being added. Missing that is how somebody who changes their mind ends
+ * up counted twice, under two different emoji.
+ */
+export function withReaction(
+  reactions: readonly Reaction[],
+  userId: string,
+  emoji: string,
+  myId: string | undefined,
+): Reaction[] {
+  const next = reactions
+    .map((entry) => {
+      const users = entry.users.filter((id) => id !== userId);
+      return { ...entry, users, mine: entry.mine && userId !== myId };
+    })
+    .filter((entry) => entry.users.length > 0);
+
+  if (emoji === '') return next;
+
+  const existing = next.find((entry) => entry.emoji === emoji);
+  if (existing) {
+    existing.users = [...existing.users, userId];
+    existing.mine ||= userId === myId;
+    return next;
+  }
+
+  // Appended, so the pills keep first-use order and an established reaction
+  // does not jump position because somebody else joined it.
+  return [...next, { emoji, users: [userId], mine: userId === myId }];
+}
+
 export function reducer(state: State, action: Action): State {
   switch (action.type) {
     case 'loaded': {
@@ -316,6 +355,49 @@ function applyEvent(state: State, event: EngineEvent): State {
           ...message,
           readBy: addUnique(message.readBy, userId),
         })),
+      };
+    }
+
+    case 'messageReacted': {
+      const { messageId, userId, emoji } = event;
+      return {
+        ...state,
+        messagesByThread: mapMessage(state.messagesByThread, messageId, (message) => ({
+          ...message,
+          reactions: withReaction(message.reactions, userId, emoji, state.profile?.id),
+        })),
+      };
+    }
+
+    case 'messageWithdrawn': {
+      const { messageId, by, admin } = event;
+      return {
+        ...state,
+        // Emptied, not removed. The engine keeps a tombstone so a peer cannot
+        // resurrect the message by re-offering it, and the timeline keeps a row
+        // so the conversation does not silently close up around the gap.
+        messagesByThread: mapMessage(state.messagesByThread, messageId, (message) => ({
+          ...message,
+          text: '',
+          attachments: [],
+          reactions: [],
+          quote: undefined,
+          deletedAt: message.deletedAt || Math.floor(Date.now() / 1000),
+          deletedBy: by,
+          deletedByAdmin: admin,
+        })),
+      };
+    }
+
+    case 'quoteExpired': {
+      const { messageId } = event;
+      return {
+        ...state,
+        messagesByThread: mapMessage(state.messagesByThread, messageId, (message) =>
+          message.quote
+            ? { ...message, quote: { ...message.quote, text: '', expired: true } }
+            : message,
+        ),
       };
     }
 

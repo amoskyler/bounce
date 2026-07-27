@@ -162,6 +162,10 @@ impl<N: Network + 'static> Engine<N> {
             // to encrypt to it yet, and we hold none of its private material.
             ecdh_public_key: Vec::new(),
             ecdh_private_key: Vec::new(),
+            // We are recording a device we have only just met, and it has not
+            // told us what it speaks. Empty means legacy, so we send it nothing
+            // it might not survive until it announces itself.
+            capabilities: Vec::new(),
             signature: Some(IntroductionSignature {
                 id: Uuid::new_v4(),
                 device_id: Uuid::nil(),

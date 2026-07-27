@@ -342,63 +342,102 @@ textarea {
   outline: none;
 }
 
+/*
+ * Two rows: identity and actions above, search across the full width below.
+ *
+ * On one line the search box was the only elastic thing between two
+ * fixed-width clusters, so it absorbed every change in pane width and was
+ * cramped at all of them. Signal splits the two, and the split is also what
+ * lets the row above breathe.
+ */
 .left-pane__header {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  height: var(--header-height);
-  padding: 0 16px;
   flex-shrink: 0;
-  /* Leave room for the macOS traffic lights under the hidden title bar. */
+  display: flex;
+  flex-direction: column;
+  /* Only the empty space drags; the controls below opt back out. */
   -webkit-app-region: drag;
 }
 
-.left-pane__header > * {
-  -webkit-app-region: no-drag;
+.left-pane__header-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: var(--header-height);
+  /* No bottom padding on either platform. The gap below belongs to the search
+     field's own margin, so it is one number rather than two that have to be
+     kept in step across a platform rule. */
+  padding: 10px 16px 0;
 }
 
 /*
- * Every pane's header sits under the traffic lights, so all of them reserve
- * the same band and centre their content in what is left. Sharing one rule is
- * what keeps the headers aligned across the dividers — they drifted apart when
- * each carried its own padding.
+ * The left pane's first row has its own reserve rule.
+ *
+ * It shares the traffic-light band with the other headers but not their
+ * geometry: they are a single row that ends at the header, this one has a
+ * search field under it, and folding it into the shared rule meant inheriting
+ * `padding-bottom: 0` — which left the avatar sitting directly on top of the
+ * search box.
  */
-.platform-darwin .left-pane__header,
+.platform-darwin .left-pane__header-top {
+  min-height: calc(var(--titlebar-reserve) + 40px);
+  padding-top: var(--titlebar-reserve);
+  align-items: center;
+}
+
+/*
+ * Every pane's header sits under the traffic lights, so all of them reserve the
+ * same band and centre their content in what is left. Sharing one rule is what
+ * keeps the headers aligned across the dividers — they drifted apart when each
+ * carried its own padding. For the left pane it is the *first row* that has to
+ * clear them, not the header as a whole, which is now taller than the others.
+ */
 .platform-darwin .conversation__header,
 .platform-darwin .details__header,
 .platform-darwin .settings__header {
-  height: calc(var(--titlebar-reserve) + 36px);
+  min-height: calc(var(--titlebar-reserve) + 36px);
   padding-top: var(--titlebar-reserve);
   padding-bottom: 0;
   align-items: center;
+}
+
+.left-pane__profile,
+.left-pane__actions,
+.left-pane__search {
+  -webkit-app-region: no-drag;
+}
+
+.left-pane__profile {
+  display: flex;
+  flex-shrink: 0;
 }
 
 .left-pane__actions {
   display: flex;
   align-items: center;
   gap: 4px;
-  margin-left: auto;
-  /* The buttons are a fixed size; it is the search box that gives way. */
+  /* The buttons are a fixed size and the row has room for them now, so nothing
+     here has to give. */
   flex-shrink: 0;
 }
 
 /*
- * `min-width: 0` is what lets this shrink at all.
+ * Signal's search field: a 28px rounded rectangle, not a pill.
  *
- * A flex item's automatic minimum size is its content, and the content here is
- * an `<input>`, whose intrinsic width is around 170px whatever you put in it.
- * Without the override the header simply overflows once the pane is dragged
- * narrow — the buttons keep their size and slide out past the divider.
+ * `min-width: 0` is what lets it shrink at all — a flex item's automatic
+ * minimum size is its content, and the content is an `<input>` whose intrinsic
+ * width is around 170px whatever you put in it.
  */
 .left-pane__search {
   display: flex;
   align-items: center;
   gap: 8px;
-  flex: 1;
   min-width: 0;
-  height: 32px;
+  height: 28px;
+  /* The whole of the gap between the row above and the field. */
+  margin: 16px 16px 12px;
   padding: 0 10px;
-  border-radius: 16px;
+  border-radius: 8px;
   background: var(--input-background);
   color: var(--text-secondary);
   transition: background 0.1s ease;
@@ -412,7 +451,10 @@ textarea {
 .left-pane__search input {
   flex: 1;
   min-width: 0;
-  font-size: 14px;
+  /* Signal's `font-body-2`. */
+  font-size: 13px;
+  line-height: 18px;
+  letter-spacing: -0.03px;
   color: var(--text-primary);
 }
 
@@ -573,6 +615,12 @@ textarea {
   -webkit-line-clamp: 2;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* Matches the tombstone in the timeline, so the two read as the same thing. */
+.conversation-row__snippet--deleted {
+  font-style: italic;
+  color: var(--text-tertiary);
 }
 
 .conversation-row__snippet--draft::before {
@@ -782,6 +830,13 @@ textarea {
   gap: 2px;
   min-width: 0;
   max-width: min(306px, calc(100% - 38px));
+  /*
+   * The hover action row is positioned against this rather than against the
+   * group, because the group is a full-width flex row: anchoring to it would
+   * put the buttons at the far edge of the timeline instead of beside the
+   * bubble they act on.
+   */
+  position: relative;
 }
 
 @container timeline (min-width: 689px) {

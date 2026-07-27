@@ -31,6 +31,7 @@
 
 pub mod event;
 pub mod files;
+pub mod interaction;
 pub mod pairing;
 pub mod peering;
 pub mod retention;
@@ -45,9 +46,10 @@ use uuid::Uuid;
 
 pub use event::{
     AttachmentView, DeviceView, DraftView, Event, GroupView, InitialState, MessageInfo,
-    MessageView, Receipt, SystemMessageView, UserView,
+    MessageView, QuoteView, ReactionView, Receipt, SystemMessageView, UserView,
 };
 pub use files::OutgoingAttachment;
+use interaction::quote_view;
 pub use settings::{auto_join, SettingsView};
 
 use crate::consensus;
@@ -430,7 +432,12 @@ impl<N: Network + 'static> Engine<N> {
     // ---------------------------------------------------------------------
 
     /// Write and broadcast a direct message.
-    pub async fn send_direct_message(&self, recipient: Uuid, text: &str) -> Result<MessageView> {
+    pub async fn send_direct_message(
+        &self,
+        recipient: Uuid,
+        text: &str,
+        reply_to: Option<Uuid>,
+    ) -> Result<MessageView> {
         let my_id = self.store.my_user_id()?;
 
         if text.chars().count() > crate::MAXIMUM_MESSAGE_CHARACTERS {
@@ -438,6 +445,7 @@ impl<N: Network + 'static> Engine<N> {
         }
 
         let mut message = DirectMessage::new(my_id, recipient, text.to_string(), crate::now());
+        message.quote = self.quote_of(reply_to)?;
         if message.is_empty() {
             return Err(Error::InvalidFrame("refusing to send an empty message".into()));
         }
@@ -467,7 +475,12 @@ impl<N: Network + 'static> Engine<N> {
     }
 
     /// Write and broadcast a group message.
-    pub async fn send_group_message(&self, group_id: Uuid, text: &str) -> Result<MessageView> {
+    pub async fn send_group_message(
+        &self,
+        group_id: Uuid,
+        text: &str,
+        reply_to: Option<Uuid>,
+    ) -> Result<MessageView> {
         let my_id = self.store.my_user_id()?;
 
         let group = self
@@ -481,6 +494,7 @@ impl<N: Network + 'static> Engine<N> {
         }
 
         let mut message = GroupMessage::new(my_id, group_id, text.to_string(), crate::now());
+        message.quote = self.quote_of(reply_to)?;
         if message.is_empty() {
             return Err(Error::InvalidFrame("refusing to send an empty message".into()));
         }
@@ -2643,8 +2657,25 @@ impl<N: Network + 'static> Engine<N> {
         let in_scope = targets.len();
         let mut written = 0usize;
         let mut offline = 0usize;
+        let mut unsupported = 0usize;
 
         for address in targets {
+            // A device that has not said it understands this frame type does
+            // not get it. The cost of guessing wrong is not a dropped frame:
+            // the Go implementation closes the connection on an unknown type
+            // (`chat/remote_device.go:224`), and the reference flow would then
+            // re-offer this frame on every reconnection, so the peer
+            // relationship would fail rather than the feature.
+            if frame.frame_type().is_extension()
+                && !crate::store::accepts(
+                    self.store.device_by_address(&address).ok().flatten().as_ref(),
+                    frame.frame_type(),
+                )
+            {
+                unsupported += 1;
+                continue;
+            }
+
             // Skip anything the peer already told us it has.
             if self
                 .store
@@ -2669,7 +2700,7 @@ impl<N: Network + 'static> Engine<N> {
         // scope was connected, which is invisible from the outside.
         tracing::debug!(
             frame = ?frame.frame_type(), id = %frame.id(),
-            in_scope, written, offline,
+            in_scope, written, offline, unsupported,
             "broadcast",
         );
 
@@ -2859,7 +2890,7 @@ impl<N: Network + 'static> Engine<N> {
         let frame_type = FrameType::from_u16(frame.frame_type)?;
 
         match frame_type {
-            FrameType::KeepAlive => Ok(()),
+            FrameType::KeepAlive => self.handle_keep_alive(peer, &frame.payload),
             FrameType::Ack => self.handle_ack(peer, &frame.payload),
             FrameType::DirectMessage => self.handle_direct_message(peer, &frame.payload).await,
             FrameType::GroupMessage => self.handle_group_message(peer, &frame.payload).await,
@@ -2894,6 +2925,8 @@ impl<N: Network + 'static> Engine<N> {
             FrameType::File => self.handle_file(peer, &frame.payload).await,
             FrameType::ChunkOffer => self.handle_chunk_offer(peer, &frame.payload).await,
             FrameType::ChunkRequest => self.handle_chunk_request(peer, &frame.payload).await,
+            FrameType::Reaction => self.handle_reaction(peer, &frame.payload).await,
+            FrameType::DeleteMessage => self.handle_delete_message(peer, &frame.payload).await,
             FrameType::Chunk => self.handle_chunk(peer, &frame.payload).await,
             FrameType::ChunkUnavailable => {
                 self.handle_chunk_unavailable(peer, &frame.payload).await
@@ -2992,9 +3025,13 @@ impl<N: Network + 'static> Engine<N> {
         });
 
         // A receipt may have arrived before the message did; now it can be
-        // scoped.
+        // scoped. The same is true of a deletion and of reactions — all three
+        // are independent frames, and a catch up replays them in whatever order
+        // they were saved.
         self.resolve_early_read_receipts(message.id, FrameType::DirectMessage)
             .await?;
+        self.apply_pending_deletion(message.id, FrameType::DirectMessage)?;
+        self.resolve_parked_reactions(message.id, FrameType::DirectMessage)?;
 
         // Gossip onward to anyone else in scope who has not acknowledged it.
         self.broadcast(&message).await?;
@@ -3055,6 +3092,8 @@ impl<N: Network + 'static> Engine<N> {
 
         self.resolve_early_read_receipts(message.id, FrameType::GroupMessage)
             .await?;
+        self.apply_pending_deletion(message.id, FrameType::GroupMessage)?;
+        self.resolve_parked_reactions(message.id, FrameType::GroupMessage)?;
 
         self.broadcast(&message).await?;
         Ok(())
@@ -3389,6 +3428,36 @@ impl<N: Network + 'static> Engine<N> {
                 None => false,
             },
 
+            // Both follow their target's audience, the way a read receipt does:
+            // a reaction to a group message reaches the group, a deletion of a
+            // direct message reaches the counterparty, and a frame we parked
+            // because its target never arrived reaches nobody, because there is
+            // nothing to judge it against.
+            FrameType::Reaction => match self.store.reaction(frame_id)? {
+                Some(reaction) => {
+                    if reaction.scope == Scope::Sync.as_i64() {
+                        return Ok(peer_user == my_id);
+                    }
+                    let target_type = FrameType::from_u16(reaction.target_type)?;
+                    self.peer_may_have(peer_user, my_id, reaction.target, target_type)?
+                }
+                None => false,
+            },
+
+            FrameType::DeleteMessage => match self.store.delete_message_frame(frame_id)? {
+                Some(delete) => {
+                    if delete.scope == Scope::Sync.as_i64() {
+                        return Ok(peer_user == my_id);
+                    }
+                    let target_type = FrameType::from_u16(delete.target_type)?;
+                    // Deliberately judged against the *tombstone*, which is
+                    // still there. Judging against a removed row would answer
+                    // "nobody", and the deletion would never be offered on.
+                    self.peer_may_have(peer_user, my_id, delete.target, target_type)?
+                }
+                None => false,
+            },
+
             FrameType::File => match self.store.file(frame_id)? {
                 // A file reaches whoever the message it hangs off reaches, so
                 // the scope it declares is what decides — not the attachment,
@@ -3560,6 +3629,12 @@ impl<N: Network + 'static> Engine<N> {
             FrameType::Confirmation => self.handle_confirmation(peer, &frame.payload).await,
             FrameType::UpdateDevice => self.handle_update_device(peer, &frame.payload).await,
             FrameType::UpdateSettings => self.handle_update_settings(peer, &frame.payload).await,
+            // Both arms matter more here than in the live dispatcher: a
+            // deletion replayed on catch-up is the only way it reaches a peer
+            // who was offline when the message was withdrawn, which is exactly
+            // the peer the person deleting it cannot check on.
+            FrameType::Reaction => self.handle_reaction(peer, &frame.payload).await,
+            FrameType::DeleteMessage => self.handle_delete_message(peer, &frame.payload).await,
             other => {
                 // Loud, because this is what the omission above looked like:
                 // a frame accepted into catch-up, counted towards progress,
@@ -3710,6 +3785,13 @@ impl<N: Network + 'static> Engine<N> {
             attachments: self
                 .attachment_views(&message.image_attachments, &message.file_attachments),
             outgoing: message.author == my_id,
+            reactions: self.reaction_views(message.id, my_id),
+            quote: quote_view(message.quote.as_ref()),
+            deleted_at: message.deleted_at,
+            deleted_by: (!message.deleted_by.is_nil()).then_some(message.deleted_by),
+            deleted_by_admin: message.deleted_at != 0
+                && message.deleted_by != message.author
+                && !message.deleted_by.is_nil(),
         })
     }
 
@@ -3744,6 +3826,13 @@ impl<N: Network + 'static> Engine<N> {
             attachments: self
                 .attachment_views(&message.image_attachments, &message.file_attachments),
             outgoing: Some(message.author) == my_id,
+            reactions: self.reaction_views(message.id, my_id.unwrap_or_else(Uuid::nil)),
+            quote: quote_view(message.quote.as_ref()),
+            deleted_at: message.deleted_at,
+            deleted_by: (!message.deleted_by.is_nil()).then_some(message.deleted_by),
+            deleted_by_admin: message.deleted_at != 0
+                && message.deleted_by != message.author
+                && !message.deleted_by.is_nil(),
         })
     }
 }

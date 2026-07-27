@@ -18,7 +18,7 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::error::{Error, Result};
 
 /// Bumped whenever the schema changes in a way that needs a migration.
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// Create every table and index, if they do not already exist.
 pub fn create(connection: &Connection) -> Result<()> {
@@ -78,6 +78,11 @@ pub fn create(connection: &Connection) -> Result<()> {
             revoked_at         INTEGER NOT NULL DEFAULT 0,
             ecdh_public_key    BLOB,
             ecdh_private_key   BLOB,
+            -- Protocol extensions this device advertises, comma separated.
+            -- Empty means legacy, which is the correct reading of a device that
+            -- predates the column: those are exactly the builds that cannot
+            -- handle the frames it gates.
+            capabilities       TEXT NOT NULL DEFAULT '',
             FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_devices_user ON devices (user_id);
@@ -197,7 +202,24 @@ pub fn create(connection: &Connection) -> Result<()> {
             text              TEXT NOT NULL DEFAULT '',
             signer            TEXT NOT NULL DEFAULT '',
             original_payload  BLOB NOT NULL,
-            signature         BLOB NOT NULL
+            signature         BLOB NOT NULL,
+
+            -- Deleted for everyone. A tombstone, never a removal: delete the
+            -- row and `has_frame` answers false, the peer classifies the
+            -- original as wanted, offers it back, and the message returns.
+            deleted_at        INTEGER NOT NULL DEFAULT 0,
+            -- The author, or the admin who removed it. Kept because the three
+            -- sentences the interface shows cannot be told apart without it.
+            deleted_by        BLOB,
+
+            -- The reply's quote of the message it answers. `quote_expires_at`
+            -- is the *original's* expiry, so the excerpt can be blanked on
+            -- schedule without touching the reply.
+            quote_target      BLOB,
+            quote_author      BLOB,
+            quote_text        TEXT NOT NULL DEFAULT '',
+            quote_kind        INTEGER NOT NULL DEFAULT 0,
+            quote_expires_at  INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_direct_messages_xor
             ON direct_messages (xor, written_at);
@@ -214,7 +236,24 @@ pub fn create(connection: &Connection) -> Result<()> {
             text              TEXT NOT NULL DEFAULT '',
             signer            TEXT NOT NULL DEFAULT '',
             original_payload  BLOB NOT NULL,
-            signature         BLOB NOT NULL
+            signature         BLOB NOT NULL,
+
+            -- Deleted for everyone. A tombstone, never a removal: delete the
+            -- row and `has_frame` answers false, the peer classifies the
+            -- original as wanted, offers it back, and the message returns.
+            deleted_at        INTEGER NOT NULL DEFAULT 0,
+            -- The author, or the admin who removed it. Kept because the three
+            -- sentences the interface shows cannot be told apart without it.
+            deleted_by        BLOB,
+
+            -- The reply's quote of the message it answers. `quote_expires_at`
+            -- is the *original's* expiry, so the excerpt can be blanked on
+            -- schedule without touching the reply.
+            quote_target      BLOB,
+            quote_author      BLOB,
+            quote_text        TEXT NOT NULL DEFAULT '',
+            quote_kind        INTEGER NOT NULL DEFAULT 0,
+            quote_expires_at  INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_group_messages_destination
             ON group_messages (destination, written_at);
@@ -256,6 +295,70 @@ pub fn create(connection: &Connection) -> Result<()> {
             signature         BLOB NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_read_receipts_target ON read_receipts (target);
+
+        -- Emoji reactions. One per person per message, which is the unique
+        -- index below rather than a rule the engine has to remember: an upsert
+        -- on (target, actor) gated on a newer timestamp gives last-write-wins
+        -- for free, and makes two reactions from one person unrepresentable.
+        --
+        -- `delete_at` is copied from the target so a reaction cannot outlive
+        -- what it is attached to, and so the existing retention sweep collects
+        -- it with no new machinery.
+        CREATE TABLE IF NOT EXISTS reactions (
+            id                BLOB PRIMARY KEY NOT NULL,
+            actor             BLOB NOT NULL,
+            target            BLOB NOT NULL,
+            target_type       INTEGER NOT NULL DEFAULT 0,
+            emoji             TEXT NOT NULL DEFAULT '',
+            timestamp         INTEGER NOT NULL DEFAULT 0,
+            delete_at         INTEGER NOT NULL DEFAULT 0,
+            destination       BLOB,
+            scope             INTEGER NOT NULL DEFAULT 0,
+            saved_at          INTEGER NOT NULL DEFAULT 0,
+            signer            TEXT NOT NULL DEFAULT '',
+            original_payload  BLOB NOT NULL,
+            signature         BLOB NOT NULL
+        );
+        -- Every reaction frame is kept, including the withdrawals.
+        --
+        -- A unique index on (target, actor) was the obvious shape — one
+        -- reaction per person is the rule, so make it unrepresentable — and it
+        -- was wrong for the same reason deleting a message row is wrong. A
+        -- withdrawal replacing the row destroys the id of the frame it
+        -- withdraws, so `has_frame` starts answering false for it, the peer
+        -- re-offers the original, and the reaction we took back comes back.
+        --
+        -- The rule still holds; it is applied on read instead. `resolve` folds
+        -- the log to one standing reaction per person, which is what the rest
+        -- of this engine does with every other frame.
+        DROP INDEX IF EXISTS idx_reactions_one_per_actor;
+        CREATE INDEX IF NOT EXISTS idx_reactions_target ON reactions (target);
+        CREATE INDEX IF NOT EXISTS idx_reactions_actor ON reactions (target, actor);
+
+        -- Withdrawals of sent messages.
+        --
+        -- Stored as frames in their own right, and not merely applied, because
+        -- everything that gets a deletion to a peer who was offline runs
+        -- through storage: `has_frame`, `frame_payload`,
+        -- `references_not_delivered_to` and `peer_may_have` all consult a
+        -- table. A delete that is not stored is a delete that is never
+        -- re-offered, which is a deletion that silently did not happen.
+        CREATE TABLE IF NOT EXISTS delete_messages (
+            id                BLOB PRIMARY KEY NOT NULL,
+            actor             BLOB NOT NULL,
+            target            BLOB NOT NULL,
+            target_type       INTEGER NOT NULL DEFAULT 0,
+            admin_delete      INTEGER NOT NULL DEFAULT 0,
+            timestamp         INTEGER NOT NULL DEFAULT 0,
+            destination       BLOB,
+            scope             INTEGER NOT NULL DEFAULT 0,
+            saved_at          INTEGER NOT NULL DEFAULT 0,
+            signer            TEXT NOT NULL DEFAULT '',
+            original_payload  BLOB NOT NULL,
+            signature         BLOB NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_delete_messages_target
+            ON delete_messages (target);
 
         -- Proof that a specific frame reached a specific device. This is the
         -- only source of delivery knowledge; nothing is ever inferred.

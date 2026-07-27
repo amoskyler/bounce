@@ -74,6 +74,15 @@ export function saveLeftPaneWidth(width: number): void {
  * -------------------------------------------------------------------------- */
 
 const RECENT_KEY = 'bounce.recentEmoji';
+const PREFERRED_REACTIONS_KEY = 'bounce.preferredReactions';
+
+/**
+ * Signal's default six, in Signal's order.
+ *
+ * Heart first because it is far and away the commonest, and the two thumbs
+ * adjacent so agreeing and disagreeing are one place on the strip.
+ */
+export const DEFAULT_REACTIONS = ['❤️', '👍', '👎', '😂', '😮', '😢'] as const;
 
 /** One row in the picker, so the section never pushes the grid down. */
 export const MAX_RECENT_EMOJI = 8;
@@ -97,6 +106,46 @@ export function loadRecentEmoji(): string[] {
   } catch {
     return [];
   }
+}
+
+/**
+ * The six emoji on the reaction strip.
+ *
+ * Seeded from what you actually reach for, then topped up from Signal's
+ * defaults so the strip is always six wide. A strip that grew as you used it
+ * would move the buttons under the pointer, which is worse than showing an
+ * emoji you have not picked yet.
+ */
+export function loadPreferredReactions(): string[] {
+  const stored = read(PREFERRED_REACTIONS_KEY);
+  const saved = (() => {
+    if (!stored) return [];
+    try {
+      const parsed: unknown = JSON.parse(stored);
+      return Array.isArray(parsed)
+        ? parsed.filter((entry): entry is string => typeof entry === 'string')
+        : [];
+    } catch {
+      return [];
+    }
+  })();
+
+  const filled = [...saved];
+  for (const emoji of DEFAULT_REACTIONS) {
+    if (filled.length >= DEFAULT_REACTIONS.length) break;
+    if (!filled.includes(emoji)) filled.push(emoji);
+  }
+  return filled.slice(0, DEFAULT_REACTIONS.length);
+}
+
+/** Note a reaction, moving it to the front of the strip. */
+export function notePreferredReaction(character: string): string[] {
+  const next = [
+    character,
+    ...loadPreferredReactions().filter((entry) => entry !== character),
+  ].slice(0, DEFAULT_REACTIONS.length);
+  write(PREFERRED_REACTIONS_KEY, JSON.stringify(next));
+  return next;
 }
 
 /** Record a use, moving it to the front. Returns the new list. */

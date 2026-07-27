@@ -170,26 +170,47 @@ function registerHandlers(): void {
     engine!.createProfile(name, deviceName),
   );
 
-  handle('bounce:sendDirectMessage', (recipient: string, text: string) =>
-    engine!.sendDirectMessage(recipient, text),
+  handle('bounce:sendDirectMessage', (recipient: string, text: string, replyTo?: string) =>
+    engine!.sendDirectMessage(recipient, text, replyTo),
   );
-  handle('bounce:sendGroupMessage', (groupId: string, text: string) =>
-    engine!.sendGroupMessage(groupId, text),
+  handle('bounce:sendGroupMessage', (groupId: string, text: string, replyTo?: string) =>
+    engine!.sendGroupMessage(groupId, text, replyTo),
   );
 
   handle(
     'bounce:sendDirectMessageWithAttachments',
-    (recipient: string, text: string, attachments: OutgoingAttachment[]) => {
+    (
+      recipient: string,
+      text: string,
+      attachments: OutgoingAttachment[],
+      replyTo?: string,
+    ) => {
       checkAttachments(attachments);
-      return engine!.sendDirectMessageWithAttachments(recipient, text, attachments);
+      return engine!.sendDirectMessageWithAttachments(recipient, text, attachments, replyTo);
     },
   );
   handle(
     'bounce:sendGroupMessageWithAttachments',
-    (groupId: string, text: string, attachments: OutgoingAttachment[]) => {
+    (groupId: string, text: string, attachments: OutgoingAttachment[], replyTo?: string) => {
       checkAttachments(attachments);
-      return engine!.sendGroupMessageWithAttachments(groupId, text, attachments);
+      return engine!.sendGroupMessageWithAttachments(groupId, text, attachments, replyTo);
     },
+  );
+
+  handle('bounce:react', (target: string, targetType: number, emoji: string) =>
+    engine!.react(target, targetType, emoji),
+  );
+  handle('bounce:removeReaction', (target: string, targetType: number) =>
+    engine!.removeReaction(target, targetType),
+  );
+  handle('bounce:deleteForMe', (target: string, targetType: number) =>
+    engine!.deleteForMe(target, targetType),
+  );
+  handle('bounce:deleteForEveryone', (target: string, targetType: number) =>
+    engine!.deleteForEveryone(target, targetType),
+  );
+  handle('bounce:mayDeleteForEveryone', (target: string, targetType: number) =>
+    engine!.mayDeleteForEveryone(target, targetType),
   );
   handle('bounce:fileData', (fileId: string) => engine!.fileData(fileId));
   handle('bounce:messageInfo', (messageId: string) => engine!.messageInfo(messageId));

@@ -176,13 +176,66 @@ impl CatchUp {
     }
 }
 
-/// A no-op frame that keeps an idle socket from being reaped.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct KeepAlive {}
+/// A frame that keeps an idle socket from being reaped, and says what we speak.
+///
+/// ## Why the capability list rides here
+///
+/// A device advertises its protocol extensions in its [`super::Device`] record,
+/// which is right for a device we are meeting for the first time and useless for
+/// one we already know: those rows were written before the field existed, so
+/// every existing contact reads as legacy and never receives an extension frame
+/// again. Nothing in the protocol re-announces a device after pairing.
+///
+/// Keep-alives do run again — on every connection, forever — which makes this
+/// the one place the answer can be corrected without a new frame type or a
+/// migration. It costs nothing on the wire that was not already being sent, and
+/// the Go implementation's `handleKeepAlive` (`chat/keep_alive.go:14`) takes its
+/// payload and returns immediately without reading it, so a Go peer is
+/// unaffected in either direction.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeepAlive {
+    /// Extensions the sending device understands.
+    ///
+    /// Absent from a Go peer's keep-alive, which is not msgpack at all — it is
+    /// the literal bytes `keep-alive`. Read it through [`KeepAlive::announced`],
+    /// which separates "did not say" from "said nothing"; a frame whose whole
+    /// purpose is "still here" must never fail a connection, and must never be
+    /// mistaken for a peer withdrawing what it told us earlier.
+    #[serde(
+        rename = "Capabilities",
+        default,
+        deserialize_with = "crate::msgpack::nullable_seq"
+    )]
+    pub capabilities: Vec<String>,
+}
 
 impl KeepAlive {
+    /// A keep-alive announcing what this build speaks.
+    pub fn advertising() -> Self {
+        KeepAlive {
+            capabilities: crate::types::capability::SUPPORTED
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+        }
+    }
+
     pub fn encode(&self) -> Result<Vec<u8>> {
         msgpack::to_vec(self)
+    }
+
+    /// What a peer's keep-alive says it speaks, or `None` if it did not say.
+    ///
+    /// The distinction is the whole point. A Go peer's keep-alive payload is the
+    /// literal bytes `keep-alive` — not msgpack at all — and reading that as
+    /// "announces nothing" would be indistinguishable from a peer explicitly
+    /// downgrading, so a single unparseable frame would erase what we had
+    /// already learned. `None` means silence; `Some(vec![])` means a peer
+    /// telling us it now speaks nothing, which is a real thing to honour.
+    pub fn announced(payload: &[u8]) -> Option<Vec<String>> {
+        msgpack::from_slice::<Self>(payload)
+            .ok()
+            .map(|frame| frame.capabilities)
     }
 }
 
@@ -372,13 +425,36 @@ mod tests {
     fn empty_frames_encode_as_empty_maps() {
         // Go marshals an empty struct as a zero-length map; both sides must
         // accept it.
-        let encoded = KeepAlive {}.encode().unwrap();
-        assert_eq!(encoded, vec![0x80]);
-        assert_eq!(
-            msgpack::from_slice::<KeepAlive>(&encoded).unwrap(),
-            KeepAlive {}
-        );
-
         assert_eq!(ActiveDevice {}.encode().unwrap(), vec![0x80]);
+        assert_eq!(
+            msgpack::from_slice::<KeepAlive>(&[0x80]).unwrap(),
+            KeepAlive::default(),
+            "an empty map is a keep-alive that announces nothing",
+        );
+    }
+
+    #[test]
+    fn a_keep_alive_separates_silence_from_a_downgrade() {
+        // Go's keep-alive payload is the literal bytes `keep-alive` — not
+        // msgpack at all. Reading that as "announces nothing" would make one
+        // unparseable frame erase what a capable peer had already told us, and
+        // the symptom would be reactions quietly ceasing to arrive.
+        assert_eq!(KeepAlive::announced(b"keep-alive"), None);
+
+        // An explicit empty list is a peer saying it speaks nothing, which is a
+        // different claim and one worth honouring.
+        let empty = KeepAlive::default().encode().unwrap();
+        assert_eq!(KeepAlive::announced(&empty), Some(vec![]));
+
+        let ours = KeepAlive::advertising().encode().unwrap();
+        assert_eq!(
+            KeepAlive::announced(&ours),
+            Some(
+                crate::types::capability::SUPPORTED
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect()
+            ),
+        );
     }
 }

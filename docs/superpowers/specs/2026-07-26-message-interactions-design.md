@@ -1,6 +1,6 @@
 # Replies, reactions, and deleting a message
 
-**Status** — design, for review.
+**Status** — implemented, except where noted under [As built](#as-built).
 **Scope** — three message interactions the Bounce protocol does not have: replying
 to a specific message, reacting to one with an emoji, and deleting one after it
 has been sent. Engine, storage, and interface.
@@ -431,10 +431,82 @@ the ones that fail quietly:
 
 ---
 
-## Open questions
+## As built
 
-- **The capability amendment** — accept or drop. Everything else stands either
-  way; only the switch's default changes.
+Built as specified, with three decisions settled along the way and three pieces
+still outstanding.
+
+**Settled.**
+
+- **The capability amendment was taken.** `Device.Capabilities` is on the wire,
+  the broadcast path and the reference flow both filter on it, and a device with
+  no capabilities recorded — which is every build that exists today — is never
+  offered type 52 or 53. The switch below is therefore a kill switch rather than
+  the only defence.
+- **A tombstone expires on the message's own clock**, so a deleted message in a
+  disappearing thread eventually leaves nothing behind at all. That makes the
+  tombstone the permanent answer rather than a stopgap: nobody has to reason
+  about acknowledgement, because the row goes on its own schedule either way.
+  Delivery records for the delete frame exist regardless — it is an ordinary
+  broadcast — so "who has this deletion reached" is answerable if it is ever
+  wanted.
+- **Same-second reactions resolve by arrival, not by a strict timestamp
+  comparison.** Timestamps are whole seconds and changing your mind inside one
+  is ordinary; a strict `>` silently dropped the second tap. The trade is stated
+  where the SQL is.
+
+**Two defects the tests caught, both worth recording.**
+
+- The emoji validator admitted the whole of General Punctuation "for the
+  joiner", which also admitted **U+202E RIGHT-TO-LEFT OVERRIDE** — a character
+  whose only function is to reverse the display of the text around it, in a pill
+  rendered beside a message. Every non-pictographic character is now listed
+  individually.
+- The hover action row was anchored to the message group, which is a full-width
+  flex row, so the buttons appeared at the far edge of the timeline rather than
+  beside the bubble. It is anchored to the stack now.
+
+**The pause switch was deliberately not built.** With the capability gate in
+place it would only cover a device that advertises an extension its own build
+then fails to handle, and a global manual toggle is not the remedy for that — a
+bug in our own advertisement is. Building it would put a control in settings
+whose correct position is always "on".
+
+**The capability gap was not merely cosmetic, and it is closed.** A contact
+paired before `Device.Capabilities` existed has an empty list stored, and
+nothing in the protocol re-announces a device — so every existing contact read
+as legacy and every reaction and deletion was silently withheld from them. The
+gate fails towards sending less, so there was no error: reacting worked locally
+and simply never arrived.
+
+Capabilities now ride the **keep-alive**, which is the one frame that repeats on
+every connection forever. Go's `handleKeepAlive` (`chat/keep_alive.go:14`) takes
+its payload and returns without reading it, so this costs a Go peer nothing in
+either direction. `KeepAlive::announced` separates "did not say" — a Go peer
+sends the literal bytes `keep-alive`, which is not msgpack — from "said
+nothing", because conflating them would let one unparseable frame erase what a
+capable peer had already told us.
+
+**A third defect, found by the user rather than by a test.** The reaction strip
+was `position: fixed` at viewport coordinates, and `.timeline` sets
+`container-type: inline-size` — which makes it the containing block for fixed
+descendants. The strip landed off the side of the conversation where it could
+not be clicked, so reacting looked broken rather than misplaced. It is anchored
+to the bubble now, like every other popover here. The hover row is also centred
+against the bubble rather than pinned to its top, which only shows on tall
+messages: on an image, buttons floating by the first line read as belonging to
+whatever is above.
+
+**And a fourth: the reaction pills were on the wrong side.** Signal hangs them
+off the bubble's *inside* edge — `align-self: flex-end` on an incoming message,
+`flex-start` on an outgoing one (`_modules.scss:1704-1721` at v8.20.0). Aligning
+them with the bubble's outer edge, which is what "they belong to this message"
+suggests, puts them against the window margin. The fill, the page-coloured
+border that cuts the pill out of the bubble it overlaps, the `-6px` overlap and
+the heavier fill for one's own reaction are all Signal's, read out rather than
+guessed.
+
+## Open questions
 - **Admin delete** needs a decision on whether it uses Bounce's existing
   `restrictUserManagement` permission or a new one. Signal ties it to the plain
   admin role, which maps onto `Group::admins`, and that is the recommendation —

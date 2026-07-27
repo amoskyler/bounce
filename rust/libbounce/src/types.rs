@@ -61,6 +61,14 @@ pub enum FrameType {
     RequestEcro = 49,
     EncryptedClearBefore = 50,
     ChunkUnavailable = 51,
+
+    // Bounce extensions. Everything above this line exists in the Go
+    // implementation; these two do not, and Go disconnects on a frame type it
+    // does not know (`chat/remote_device.go:224`). They are only sent to devices
+    // that advertise support — see `Device::capabilities` and
+    // `docs/protocol-extensions.md`.
+    Reaction = 52,
+    DeleteMessage = 53,
 }
 
 impl FrameType {
@@ -123,8 +131,29 @@ impl FrameType {
             49 => RequestEcro,
             50 => EncryptedClearBefore,
             51 => ChunkUnavailable,
+            52 => Reaction,
+            53 => DeleteMessage,
             other => return Err(Error::UnknownFrameType(other)),
         })
+    }
+
+    /// Whether this type is a Bounce extension the Go implementation has no
+    /// handler for.
+    ///
+    /// A peer that has not advertised support must never be sent one: Go closes
+    /// the connection on an unknown type rather than ignoring it, and the
+    /// reference flow would then re-offer the frame on every reconnection.
+    pub fn is_extension(self) -> bool {
+        matches!(self, FrameType::Reaction | FrameType::DeleteMessage)
+    }
+
+    /// The capability a device advertises to receive this type.
+    pub fn capability(self) -> Option<&'static str> {
+        match self {
+            FrameType::Reaction => Some(capability::REACT),
+            FrameType::DeleteMessage => Some(capability::DELETE),
+            _ => None,
+        }
     }
 
     /// The relative order in which frame types are replayed during a catch up.
@@ -152,6 +181,12 @@ impl FrameType {
             ChunkOffer => 13,
             EncryptedChunkOffer => 14,
             Draft => 15,
+            // Appended rather than inserted: the table decides replay order
+            // within a second, and renumbering it would put our ordering out of
+            // step with Go's for the types they already have. Deletion sorts
+            // last on purpose, so it applies after anything it might target.
+            Reaction => 16,
+            DeleteMessage => 17,
             _ => return None,
         })
     }
@@ -263,6 +298,26 @@ impl UpdateGroupType {
     }
 }
 
+/// The protocol extensions a device can advertise understanding.
+///
+/// Strings rather than a bitset because they travel on the wire inside a device
+/// record that older builds decode without knowing the key exists — a list of
+/// names stays readable when the two ends disagree about what is defined, and a
+/// bitset does not.
+pub mod capability {
+    /// Emoji reactions: [`super::FrameType::Reaction`].
+    pub const REACT: &str = "react";
+    /// Deleting a sent message: [`super::FrameType::DeleteMessage`].
+    pub const DELETE: &str = "delete";
+
+    /// What this build understands, advertised on every device record it makes.
+    ///
+    /// Replies are absent deliberately. They ride an added key on an existing
+    /// frame, which every build already tolerates, so gating them would switch
+    /// off a feature that was never at risk.
+    pub const SUPPORTED: &[&str] = &[REACT, DELETE];
+}
+
 /// How a user came to be known to this device.
 pub mod introduction {
     /// This user is the profile that owns this device.
@@ -290,11 +345,31 @@ mod tests {
 
     #[test]
     fn frame_types_round_trip() {
-        for raw in 0u16..=51 {
+        for raw in 0u16..=53 {
             let ft = FrameType::from_u16(raw).expect("every id in range is known");
             assert_eq!(ft.as_u16(), raw);
         }
-        assert!(FrameType::from_u16(52).is_err());
+        assert!(FrameType::from_u16(54).is_err());
+    }
+
+    #[test]
+    fn only_the_two_new_types_are_extensions() {
+        // Everything Go already handles must stay ungated, or advertising a
+        // capability would become a precondition for ordinary messaging.
+        for raw in 0u16..=51 {
+            let ft = FrameType::from_u16(raw).unwrap();
+            assert!(!ft.is_extension(), "{ft:?} predates the extensions");
+            assert_eq!(ft.capability(), None, "{ft:?} needs no capability");
+        }
+
+        for ft in [FrameType::Reaction, FrameType::DeleteMessage] {
+            assert!(ft.is_extension());
+            let name = ft.capability().expect("an extension names its capability");
+            assert!(
+                crate::types::capability::SUPPORTED.contains(&name),
+                "{ft:?} advertises {name}, which this build does not claim to support",
+            );
+        }
     }
 
     #[test]

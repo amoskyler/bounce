@@ -181,7 +181,7 @@ async fn deleting_a_message_takes_its_attachment_bytes_with_it() {
     let (bytes, attachment) = photo();
     let sent = alice
         .engine
-        .send_direct_message_with_attachments(bob, "look at this", vec![attachment])
+        .send_direct_message_with_attachments(bob, "look at this", vec![attachment], None)
         .await
         .expect("sends");
 
@@ -233,7 +233,7 @@ async fn an_expiring_message_takes_its_attachment_bytes_with_it() {
     let (_, attachment) = photo();
     let sent = alice
         .engine
-        .send_direct_message_with_attachments(bob, "burn after reading", vec![attachment])
+        .send_direct_message_with_attachments(bob, "burn after reading", vec![attachment], None)
         .await
         .expect("sends");
     let file_id = sent.attachments[0].file_id;
@@ -266,7 +266,7 @@ async fn a_chunk_another_file_still_needs_is_not_taken_with_it() {
     let (bytes, attachment) = photo();
     let sent = alice
         .engine
-        .send_direct_message_with_attachments(bob, "the first copy", vec![attachment])
+        .send_direct_message_with_attachments(bob, "the first copy", vec![attachment], None)
         .await
         .expect("sends");
     let first_file = sent.attachments[0].file_id;
@@ -362,7 +362,7 @@ async fn a_message_that_expired_in_transit_is_refused() {
 
     alice
         .engine
-        .send_direct_message(bob.user.id, "should never be readable")
+        .send_direct_message(bob.user.id, "should never be readable", None)
         .await
         .expect("sends into the void");
     tokio::time::sleep(Duration::from_millis(2100)).await;
@@ -376,7 +376,7 @@ async fn a_message_that_expired_in_transit_is_refused() {
     alice.store.update_user_local_state(&policy).unwrap();
     alice
         .engine
-        .send_direct_message(bob.user.id, "this one keeps")
+        .send_direct_message(bob.user.id, "this one keeps", None)
         .await
         .expect("sends");
 

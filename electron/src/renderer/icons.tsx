@@ -62,6 +62,44 @@ export function NewGroupIcon({ size = 20, className }: IconProps) {
   );
 }
 
+/**
+ * React: a heart with a plus, which is Signal's `heart-plus.svg`.
+ *
+ * A smiley would be the obvious choice and is the wrong one — it is already the
+ * composer's emoji button, and the two mean different things a few centimetres
+ * apart.
+ */
+export function ReactIcon({ size = 20, className }: IconProps) {
+  return (
+    <svg {...svgProps(size)} className={className}>
+      <path d="M9.4 16.3 4.1 11a3.6 3.6 0 0 1 5.1-5.1l.5.5.5-.5a3.6 3.6 0 0 1 5 .1" />
+      <path d="M14.6 11.4v4.8M17 13.8h-4.8" />
+    </svg>
+  );
+}
+
+/** Reply: an arrow turning back on itself, as Signal draws it. */
+export function ReplyIcon({ size = 20, className }: IconProps) {
+  return (
+    <svg {...svgProps(size)} className={className}>
+      <path d="M8.2 5.4 3.6 9.9l4.6 4.5" />
+      <path d="M3.6 9.9h6.6a5.8 5.8 0 0 1 5.8 5.8v.9" />
+    </svg>
+  );
+}
+
+/** Delete. */
+export function TrashIcon({ size = 20, className }: IconProps) {
+  return (
+    <svg {...svgProps(size)} className={className}>
+      <path d="M3.8 5.6h12.4" />
+      <path d="M8.2 5.6V4.2a1.2 1.2 0 0 1 1.2-1.2h1.2a1.2 1.2 0 0 1 1.2 1.2v1.4" />
+      <path d="M5.4 5.6l.7 9.6a1.7 1.7 0 0 0 1.7 1.6h4.4a1.7 1.7 0 0 0 1.7-1.6l.7-9.6" />
+      <path d="M8.6 8.8v5M11.4 8.8v5" />
+    </svg>
+  );
+}
+
 export function MoreIcon({ size = 20, className }: IconProps) {
   return (
     <svg {...svgProps(size)} className={className} strokeWidth={0} fill="currentColor">

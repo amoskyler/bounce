@@ -121,6 +121,7 @@ async fn an_image_survives_the_flow_the_client_actually_uses() {
                 blur_hash: String::new(),
                 ..Default::default()
             }],
+            None,
         )
         .await
         .expect("sends");
@@ -196,6 +197,7 @@ async fn an_attachment_sent_while_offline_arrives_on_reconnection() {
                 blur_hash: String::new(),
                 ..Default::default()
             }],
+            None,
         )
         .await
         .expect("sends");
@@ -435,6 +437,7 @@ async fn a_large_file_can_be_attached_to_a_message_by_path() {
                 blur_hash: String::new(),
                 path: source.to_string_lossy().into_owned(),
             }],
+            None,
         )
         .await
         .expect("a file this size is sent, not refused");

@@ -101,6 +101,7 @@ impl<N: Network + 'static> Engine<N> {
         recipient: Uuid,
         text: &str,
         attachments: Vec<OutgoingAttachment>,
+        reply_to: Option<Uuid>,
     ) -> Result<MessageView> {
         let my_id = self.store.my_user_id()?;
 
@@ -109,6 +110,7 @@ impl<N: Network + 'static> Engine<N> {
         }
 
         let mut message = DirectMessage::new(my_id, recipient, text.to_string(), crate::now());
+        message.quote = self.quote_of(reply_to)?;
         message.saved_at = crate::now();
 
         if let Some(user) = self.store.user(recipient)? {
@@ -168,6 +170,7 @@ impl<N: Network + 'static> Engine<N> {
         group_id: Uuid,
         text: &str,
         attachments: Vec<OutgoingAttachment>,
+        reply_to: Option<Uuid>,
     ) -> Result<MessageView> {
         let my_id = self.store.my_user_id()?;
 
@@ -181,6 +184,7 @@ impl<N: Network + 'static> Engine<N> {
         }
 
         let mut message = GroupMessage::new(my_id, group_id, text.to_string(), crate::now());
+        message.quote = self.quote_of(reply_to)?;
         message.saved_at = crate::now();
         if group.retention > 0 {
             message.delete_at = crate::now() + group.retention;

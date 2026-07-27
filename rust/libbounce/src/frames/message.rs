@@ -50,6 +50,127 @@ pub struct ImageAttachment {
     pub blur_hash: String,
 }
 
+/// What kind of message a quote refers to, so a reply to a photo can say so
+/// rather than quoting an empty string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum QuoteKind {
+    Text = 0,
+    Image = 1,
+    File = 2,
+}
+
+impl QuoteKind {
+    pub fn as_u16(self) -> u16 {
+        self as u16
+    }
+
+    pub fn from_u16(value: u16) -> Self {
+        match value {
+            1 => QuoteKind::Image,
+            2 => QuoteKind::File,
+            // Anything unrecognised reads as text. A quote is decoration on a
+            // message that is itself perfectly valid, so an unknown kind must
+            // not cost the reply.
+            _ => QuoteKind::Text,
+        }
+    }
+}
+
+/// The excerpt a reply carries of the message it answers.
+///
+/// A snapshot rather than a bare id, for two reasons that both come up in
+/// ordinary use: a reply can arrive before its target on a catch up, and the
+/// target may have expired under a retention policy. Signal carries the snapshot
+/// for the first reason; the second is ours.
+///
+/// This is an added map key. Go decodes the frames it sits on without knowing it
+/// exists and relays the original bytes untouched, so it costs no coordination —
+/// see `docs/protocol-extensions.md`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Quote {
+    /// The message being replied to.
+    #[serde(rename = "Target")]
+    pub target: Uuid,
+
+    #[serde(rename = "Author")]
+    pub author: Uuid,
+
+    /// A bounded excerpt, truncated at the source so the renderer never has to
+    /// re-derive the limit.
+    #[serde(rename = "Text")]
+    pub text: String,
+
+    #[serde(rename = "Kind")]
+    pub kind: u16,
+
+    /// The **original's** expiry, not the reply's.
+    ///
+    /// Without this a reply to a thirty-second message re-publishes its text
+    /// under the reply's retention, which may be unlimited. Carrying it lets the
+    /// recipient blank the quote on schedule and keep the reply.
+    #[serde(rename = "ExpiresAt")]
+    pub expires_at: i64,
+}
+
+impl Quote {
+    /// Longest excerpt carried, in characters.
+    ///
+    /// Two lines of Signal's quote block at its metrics. Counted in characters
+    /// rather than bytes for the same reason [`crate::MAXIMUM_MESSAGE_CHARACTERS`]
+    /// is: a limit measured in bytes truncates a Japanese quote to a third of an
+    /// English one.
+    pub const MAXIMUM_TEXT_CHARACTERS: usize = 160;
+
+    /// Build a quote of a message, truncating the excerpt.
+    pub fn of(target: Uuid, author: Uuid, text: &str, kind: QuoteKind, expires_at: i64) -> Self {
+        Quote {
+            target,
+            author,
+            text: truncate_chars(text, Self::MAXIMUM_TEXT_CHARACTERS),
+            kind: kind.as_u16(),
+            expires_at,
+        }
+    }
+
+    pub fn kind(&self) -> QuoteKind {
+        QuoteKind::from_u16(self.kind)
+    }
+
+    /// Whether the quoted message has expired, so the excerpt must not be shown.
+    ///
+    /// A zero expiry means the original is kept indefinitely.
+    pub fn has_expired(&self, now: i64) -> bool {
+        self.expires_at != 0 && self.expires_at <= now
+    }
+
+    /// A quote with the excerpt removed, keeping enough to say what is missing.
+    ///
+    /// Applied in place when the original expires; the reply itself is
+    /// untouched.
+    pub fn blanked(&self) -> Self {
+        Quote {
+            target: self.target,
+            author: self.author,
+            text: String::new(),
+            kind: self.kind,
+            expires_at: self.expires_at,
+        }
+    }
+}
+
+/// Cut a string to `limit` characters, marking that it was cut.
+fn truncate_chars(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    // One character short, so the ellipsis lands inside the limit rather than
+    // pushing the result one over it.
+    let mut out: String = text.chars().take(limit.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
 /// A message from one user to another.
 ///
 /// The thread is identified by `xor`, the XOR of the two participants' user
@@ -101,6 +222,23 @@ pub struct DirectMessage {
     #[serde(rename = "ImageAttachments")]
     #[serde(default, deserialize_with = "crate::msgpack::nullable_seq")]
     pub image_attachments: Vec<ImageAttachment>,
+
+    /// Set when this message is a reply. See [`Quote`].
+    #[serde(rename = "Quote", default, skip_serializing_if = "Option::is_none")]
+    pub quote: Option<Quote>,
+
+    /// When this message was deleted for everyone, or zero.
+    ///
+    /// Local, and a tombstone rather than a removal: delete the row and
+    /// `has_frame` starts answering false, a peer re-offers the original
+    /// through the reference flow, and the message comes back.
+    #[serde(skip)]
+    pub deleted_at: i64,
+
+    /// Who deleted it — the author, or a group admin. Kept because the three
+    /// sentences the interface shows cannot be told apart from the row alone.
+    #[serde(skip)]
+    pub deleted_by: Uuid,
 }
 
 impl DirectMessage {
@@ -119,15 +257,26 @@ impl DirectMessage {
             text,
             file_attachments: Vec::new(),
             image_attachments: Vec::new(),
+            quote: None,
+            deleted_at: 0,
+            deleted_by: Uuid::nil(),
         }
     }
 
     /// A message with no text and no attachments carries nothing and is
     /// rejected on both send and receive.
+    ///
+    /// A quote does not rescue an otherwise empty message: replying with
+    /// nothing is not a message, and Go would refuse it anyway.
     pub fn is_empty(&self) -> bool {
         self.text.trim().is_empty()
             && self.image_attachments.is_empty()
             && self.file_attachments.is_empty()
+    }
+
+    /// Whether this message has been deleted for everyone.
+    pub fn is_deleted(&self) -> bool {
+        self.deleted_at != 0
     }
 
     /// Whether the body is within the protocol's length limit.
@@ -210,6 +359,16 @@ pub struct GroupMessage {
     #[serde(rename = "ImageAttachments")]
     #[serde(default, deserialize_with = "crate::msgpack::nullable_seq")]
     pub image_attachments: Vec<ImageAttachment>,
+
+    /// Set when this message is a reply. See [`Quote`].
+    #[serde(rename = "Quote", default, skip_serializing_if = "Option::is_none")]
+    pub quote: Option<Quote>,
+
+    #[serde(skip)]
+    pub deleted_at: i64,
+
+    #[serde(skip)]
+    pub deleted_by: Uuid,
 }
 
 impl GroupMessage {
@@ -227,6 +386,9 @@ impl GroupMessage {
             text,
             file_attachments: Vec::new(),
             image_attachments: Vec::new(),
+            quote: None,
+            deleted_at: 0,
+            deleted_by: Uuid::nil(),
         }
     }
 
@@ -234,6 +396,11 @@ impl GroupMessage {
         self.text.trim().is_empty()
             && self.image_attachments.is_empty()
             && self.file_attachments.is_empty()
+    }
+
+    /// Whether this message has been deleted for everyone.
+    pub fn is_deleted(&self) -> bool {
+        self.deleted_at != 0
     }
 
     pub fn text_within_limit(&self) -> bool {

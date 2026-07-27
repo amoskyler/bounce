@@ -2,11 +2,9 @@
 
 **For the maintainers of the Go implementation (`chat/`, `ui/`, `fyne/`, `android/`).**
 
-> **Draft, not yet sent.** One decision is still open on our side — whether we
-> gate sending on an advertised capability. If we do not, delete item 1 under
-> [What we are doing on our side](#what-we-are-doing-on-our-side-in-the-meantime),
-> and part one stops being belt-and-braces and becomes a prerequisite. Remove
-> this note before sending.
+> **Draft, not yet sent.** Everything described here is implemented on our side,
+> including the capability gate, so part one is belt-and-braces rather than a
+> prerequisite. Remove this note before sending.
 
 This document has two halves and they can be acted on independently.
 

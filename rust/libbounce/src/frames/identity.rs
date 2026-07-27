@@ -80,6 +80,22 @@ pub struct Device {
     /// Absent only on the founding device of a device group.
     #[serde(rename = "Signature")]
     pub signature: Option<IntroductionSignature>,
+
+    /// Protocol extensions this device understands.
+    ///
+    /// An added key, which every build that predates it decodes as absent — and
+    /// absent is exactly the right default, because those are the builds that
+    /// cannot handle the frames it gates. The Go implementation ignores the key
+    /// and relays the record byte for byte inside `User`, so a Rust device's
+    /// capabilities reach another Rust peer even through a Go intermediary.
+    ///
+    /// See [`crate::types::capability`] and `docs/protocol-extensions.md`.
+    #[serde(
+        rename = "Capabilities",
+        default,
+        deserialize_with = "crate::msgpack::nullable_seq"
+    )]
+    pub capabilities: Vec<String>,
 }
 
 impl Device {
@@ -96,6 +112,32 @@ impl Device {
             ecdh_public_key: Vec::new(),
             ecdh_private_key: Vec::new(),
             signature: None,
+            // Every device this build creates speaks everything this build
+            // speaks. Devices already in the database predate the field and
+            // read as legacy until they re-announce, which fails towards
+            // sending less rather than more.
+            capabilities: crate::types::capability::SUPPORTED
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+        }
+    }
+
+    /// Whether this device advertises understanding a protocol extension.
+    pub fn supports(&self, capability: &str) -> bool {
+        self.capabilities.iter().any(|held| held == capability)
+    }
+
+    /// Whether it is safe to send this frame type to this device.
+    ///
+    /// Types that predate the extensions are always safe. An extension is only
+    /// safe once the device has said so, because the cost of guessing wrong is
+    /// not a dropped frame — Go closes the connection, and the reference flow
+    /// then re-offers the frame on every reconnection.
+    pub fn accepts(&self, frame_type: FrameType) -> bool {
+        match frame_type.capability() {
+            None => true,
+            Some(capability) => self.supports(capability),
         }
     }
 
@@ -406,13 +448,28 @@ mod tests {
         );
         let encoded = msgpack::to_vec(&device).unwrap();
 
-        // Six keys: ID, UserID, Address, Timestamp, RevokedAt, Signature.
-        assert_eq!(encoded[0], 0x86);
+        // Seven keys: ID, UserID, Address, Timestamp, RevokedAt, Signature,
+        // Capabilities. The last is an added key that the Go implementation
+        // decodes and discards, which is what makes it safe to add at all —
+        // verified against `Basekick-Labs/msgpack/v6` in both directions.
+        assert_eq!(encoded[0], 0x87);
 
         let text = String::from_utf8_lossy(&encoded);
-        for wire_field in ["ID", "UserID", "Address", "Timestamp", "RevokedAt", "Signature"] {
+        for wire_field in [
+            "ID",
+            "UserID",
+            "Address",
+            "Timestamp",
+            "RevokedAt",
+            "Signature",
+            "Capabilities",
+        ] {
             assert!(text.contains(wire_field), "missing {wire_field}");
         }
+
+        // A fresh device advertises what this build speaks, so a peer knows
+        // without asking. Silence would read as legacy and cost us the feature.
+        assert_eq!(device.capabilities, crate::types::capability::SUPPORTED);
         for local_field in ["Name", "SavedAt", "LastSeen", "ECDHPublicKey"] {
             assert!(!text.contains(local_field), "leaked {local_field}");
         }

@@ -235,6 +235,31 @@ export function MessageInfoPanel({
 
         {!info && !failed && <div className="message-info__empty">Reading…</div>}
 
+        {/*
+          Reactions come from the message itself rather than from the info
+          fetch: the engine already groups them onto every `MessageView`, so
+          asking again would be a second source of the same truth — and a
+          reaction arriving while the panel is open updates the message, which
+          updates this, without another round trip.
+        */}
+        {message.reactions.length > 0 && (
+          <Section
+            title="Reactions"
+            count={message.reactions.reduce((total, reaction) => total + reaction.users.length, 0)}
+          >
+            {message.reactions.flatMap((reaction) =>
+              reaction.users.map((userId) => (
+                <PersonRow
+                  key={`${reaction.emoji}-${userId}`}
+                  state={state}
+                  userId={userId}
+                  detail={reaction.emoji}
+                />
+              )),
+            )}
+          </Section>
+        )}
+
         {split && (
           <>
             <Section title="Read by" count={split.read.length}>

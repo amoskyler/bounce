@@ -39,6 +39,9 @@ function message(options: { outgoing?: boolean; seen?: boolean } = {}): Entry {
     readBy: [],
     attachments: [],
     outgoing: options.outgoing ?? false,
+    reactions: [],
+    deletedAt: 0,
+    deletedByAdmin: false,
   };
   return { kind: 'message', at: value.writtenAt, id: value.id, message: value };
 }

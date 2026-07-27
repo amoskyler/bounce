@@ -92,7 +92,7 @@ async fn an_engine_that_is_not_peering_never_reaches_a_known_contact() {
 
     alice
         .engine
-        .send_direct_message(bob.user.id, "anyone there?")
+        .send_direct_message(bob.user.id, "anyone there?", None)
         .await
         .expect("the send itself succeeds — it just reaches nobody");
 
@@ -128,7 +128,7 @@ async fn wait_for(alice: &Instance, bob: &mut Instance, text: &str) -> Option<St
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    alice.engine.send_direct_message(bob.user.id, text).await.expect("sends");
+    alice.engine.send_direct_message(bob.user.id, text, None).await.expect("sends");
     wait_for_message(&mut bob.events, Duration::from_secs(5)).await
 }
 
@@ -144,7 +144,7 @@ async fn peering_restores_a_contact_after_a_restart() {
     // First session: they are connected, and a message crosses.
     Arc::clone(&alice.engine).connect(&bob.address).await.expect("dials");
     tokio::time::sleep(Duration::from_millis(100)).await;
-    alice.engine.send_direct_message(bob.user.id, "before").await.unwrap();
+    alice.engine.send_direct_message(bob.user.id, "before", None).await.unwrap();
     assert_eq!(
         wait_for_message(&mut bob.events, Duration::from_secs(5)).await.as_deref(),
         Some("before"),
@@ -169,7 +169,7 @@ async fn peering_restores_a_contact_after_a_restart() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    restarted.send_direct_message(bob.user.id, "after").await.unwrap();
+    restarted.send_direct_message(bob.user.id, "after", None).await.unwrap();
     assert_eq!(
         wait_for_message(&mut bob.events, Duration::from_secs(5)).await.as_deref(),
         Some("after"),
@@ -194,7 +194,7 @@ async fn sending_a_message_marks_a_conversation_active() {
         "the fixture starts dormant on purpose",
     );
 
-    alice.engine.send_direct_message(bob.user.id, "hello").await.unwrap();
+    alice.engine.send_direct_message(bob.user.id, "hello", None).await.unwrap();
 
     assert!(
         alice.store.user(bob.user.id).unwrap().unwrap().last_activity > 0,
@@ -213,7 +213,7 @@ async fn a_dormant_contact_is_still_dialled_when_we_owe_them_a_message() {
     introduce(&alice, &bob);
 
     // Written long ago, and never delivered — Bob was not connected.
-    alice.engine.send_direct_message(bob.user.id, "still waiting").await.unwrap();
+    alice.engine.send_direct_message(bob.user.id, "still waiting", None).await.unwrap();
 
     // Age the conversation past the four week horizon, as a restart weeks
     // later would leave it.

@@ -98,6 +98,9 @@ function message(thread: string, writtenAt: number): Message {
     readBy: [],
     attachments: [],
     outgoing: false,
+    reactions: [],
+    deletedAt: 0,
+    deletedByAdmin: false,
   };
 }
 

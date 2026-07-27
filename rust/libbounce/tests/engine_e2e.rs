@@ -121,7 +121,7 @@ async fn a_direct_message_travels_between_two_instances() {
 
     alice
         .engine
-        .send_direct_message(bob.user.id, "hello from Alice")
+        .send_direct_message(bob.user.id, "hello from Alice", None)
         .await
         .expect("sends the message");
 
@@ -164,7 +164,7 @@ async fn delivery_is_confirmed_by_an_acknowledgement() {
 
     let sent = alice
         .engine
-        .send_direct_message(bob.user.id, "did you get this?")
+        .send_direct_message(bob.user.id, "did you get this?", None)
         .await
         .unwrap();
 
@@ -206,7 +206,7 @@ async fn messages_written_while_offline_arrive_through_the_reference_flow() {
     for i in 0..3 {
         alice
             .engine
-            .send_direct_message(bob.user.id, &format!("message {i}"))
+            .send_direct_message(bob.user.id, &format!("message {i}"), None)
             .await
             .unwrap();
     }
@@ -289,7 +289,7 @@ async fn a_group_message_reaches_every_member() {
     // so posting now reaches nobody but Alice's own devices.
     alice
         .engine
-        .send_group_message(group.id, "members only")
+        .send_group_message(group.id, "members only", None)
         .await
         .expect("posts to the group");
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -333,7 +333,7 @@ async fn a_group_message_reaches_every_member() {
     // And new posts arrive live.
     alice
         .engine
-        .send_group_message(group.id, "first meeting is Tuesday")
+        .send_group_message(group.id, "first meeting is Tuesday", None)
         .await
         .expect("posts to the group");
 
@@ -515,7 +515,7 @@ async fn a_note_to_self_stays_within_the_device_group() {
 
     alice
         .engine
-        .send_direct_message(alice.user.id, "remember the milk")
+        .send_direct_message(alice.user.id, "remember the milk", None)
         .await
         .unwrap();
 
@@ -552,13 +552,13 @@ async fn initial_state_describes_everything_a_client_needs() {
 
     alice
         .engine
-        .send_direct_message(bob.user.id, "hello")
+        .send_direct_message(bob.user.id, "hello", None)
         .await
         .unwrap();
     let group = alice.engine.create_group("Planning", &[]).await.unwrap();
     alice
         .engine
-        .send_group_message(group.id, "kickoff")
+        .send_group_message(group.id, "kickoff", None)
         .await
         .unwrap();
     alice.engine.save_draft(bob.user.id, "unsent thought").await.unwrap();
@@ -644,7 +644,7 @@ async fn two_strangers_become_contacts_by_scanning_a_code() {
     // And they can now actually talk.
     alice
         .engine
-        .send_direct_message(bob.user.id, "nice to meet you")
+        .send_direct_message(bob.user.id, "nice to meet you", None)
         .await
         .expect("sends a message to the new contact");
 
@@ -834,7 +834,7 @@ async fn a_receipt_from_outside_the_conversation_is_refused() {
 
     let sent = alice
         .engine
-        .send_direct_message(bob.user.id, "for Bob only")
+        .send_direct_message(bob.user.id, "for Bob only", None)
         .await
         .unwrap();
 
@@ -885,7 +885,7 @@ async fn marking_a_message_read_twice_sends_one_receipt() {
 
     alice
         .engine
-        .send_direct_message(bob.user.id, "read me twice")
+        .send_direct_message(bob.user.id, "read me twice", None)
         .await
         .unwrap();
 
@@ -952,7 +952,7 @@ async fn reading_a_message_tells_its_author() {
 
     let sent = alice
         .engine
-        .send_direct_message(bob.user.id, "have you seen this?")
+        .send_direct_message(bob.user.id, "have you seen this?", None)
         .await
         .unwrap();
 
@@ -1003,7 +1003,7 @@ async fn a_delivered_message_is_still_delivered_after_a_restart() {
 
     let sent = alice
         .engine
-        .send_direct_message(bob.user.id, "did this land?")
+        .send_direct_message(bob.user.id, "did this land?", None)
         .await
         .unwrap();
 
@@ -1045,7 +1045,7 @@ async fn delivery_to_our_own_devices_does_not_tick_a_message_off() {
 
     let sent = alice
         .engine
-        .send_direct_message(alice.user.id, "remember this")
+        .send_direct_message(alice.user.id, "remember this", None)
         .await
         .unwrap();
 
@@ -1087,7 +1087,7 @@ async fn a_receipt_that_arrives_before_its_message_is_resolved_later() {
     // Alice writes while disconnected, so Bob has neither message nor receipt.
     let sent = alice
         .engine
-        .send_direct_message(bob.user.id, "read me")
+        .send_direct_message(bob.user.id, "read me", None)
         .await
         .unwrap();
 
@@ -1202,7 +1202,7 @@ async fn a_message_withdraws_the_senders_typing_indicator() {
 
     alice
         .engine
-        .send_direct_message(bob.user.id, "here it is")
+        .send_direct_message(bob.user.id, "here it is", None)
         .await
         .unwrap();
 
@@ -1374,6 +1374,7 @@ async fn an_image_reaches_the_other_side_byte_for_byte() {
             bob.user.id,
             "look at this",
             vec![image("photo.png", payload.clone())],
+            None,
         )
         .await
         .expect("sends the message");
@@ -1439,6 +1440,7 @@ async fn a_group_attachment_spreads_to_every_member() {
             group.id,
             "from the weekend",
             vec![image("weekend.jpg", payload.clone())],
+            None,
         )
         .await
         .expect("posts to the group");
@@ -1471,6 +1473,7 @@ async fn a_peer_that_lies_about_a_chunk_is_ignored() {
             bob.user.id,
             "here",
             vec![image("real.png", payload.clone())],
+            None,
         )
         .await
         .unwrap();
@@ -1522,7 +1525,7 @@ async fn an_attachment_larger_than_the_limit_is_refused() {
     let oversized = vec![0u8; (libbounce::EMBEDDED_FILE_LIMIT + 1) as usize];
     let result = alice
         .engine
-        .send_direct_message_with_attachments(bob.user.id, "", vec![image("huge.bin", oversized)])
+        .send_direct_message_with_attachments(bob.user.id, "", vec![image("huge.bin", oversized)], None)
         .await;
 
     assert!(
@@ -1791,7 +1794,7 @@ async fn two_members_who_met_through_a_group_can_talk_in_it() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     carol
         .engine
-        .send_group_message(group.id, "hello from a stranger")
+        .send_group_message(group.id, "hello from a stranger", None)
         .await
         .expect("posts to the group");
 
@@ -2132,7 +2135,7 @@ async fn a_message_nobody_ever_took_is_marked_undeliverable() {
 
     let recent = alice
         .engine
-        .send_direct_message(bob.user.id, "and this one is still trying")
+        .send_direct_message(bob.user.id, "and this one is still trying", None)
         .await
         .unwrap();
 
@@ -2320,7 +2323,7 @@ async fn a_closed_conversation_reopens_when_a_message_arrives() {
 
     alice
         .engine
-        .send_direct_message(bob.user.id, "still here")
+        .send_direct_message(bob.user.id, "still here", None)
         .await
         .unwrap();
 
@@ -2355,7 +2358,7 @@ async fn a_blocked_contact_stays_closed_when_they_write() {
 
     alice
         .engine
-        .send_direct_message(bob.user.id, "let me back in")
+        .send_direct_message(bob.user.id, "let me back in", None)
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(400)).await;
@@ -2380,7 +2383,7 @@ async fn message_info_reports_who_received_and_who_read() {
 
     let sent = alice
         .engine
-        .send_direct_message(bob.user.id, "did you get this?")
+        .send_direct_message(bob.user.id, "did you get this?", None)
         .await
         .unwrap();
 
@@ -2426,4 +2429,609 @@ async fn message_info_reports_who_received_and_who_read() {
 
     // A message nobody has ever heard of has no info, rather than empty info.
     assert!(alice.engine.message_info(Uuid::new_v4()).unwrap().is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Reactions, replies, and deletion
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_reaction_reaches_the_other_side_and_can_be_withdrawn() {
+    let directory = Arc::new(StaticDirectory::new());
+    let mut alice = start("Alice", Arc::clone(&directory)).await;
+    let mut bob = start("Bob", Arc::clone(&directory)).await;
+
+    introduce(&alice, &bob);
+    Arc::clone(&alice.engine).connect(&bob.address).await.unwrap();
+
+    let sent = alice
+        .engine
+        .send_direct_message(bob.user.id, "look at this", None)
+        .await
+        .unwrap();
+
+    wait_for(&mut bob.events, "Bob to receive the message", |event| match event {
+        Event::MessageReceived { message } => Some(message.id),
+        _ => None,
+    })
+    .await;
+
+    bob.engine
+        .react(sent.id, libbounce::types::FrameType::DirectMessage, "🎉")
+        .await
+        .expect("reacts");
+
+    let (message_id, user_id, emoji) =
+        wait_for(&mut alice.events, "the reaction", |event| match event {
+            Event::MessageReacted {
+                message_id,
+                user_id,
+                emoji,
+            } => Some((*message_id, *user_id, emoji.clone())),
+            _ => None,
+        })
+        .await;
+
+    assert_eq!(message_id, sent.id);
+    assert_eq!(user_id, bob.user.id);
+    assert_eq!(emoji, "🎉");
+
+    // And it is on the message Alice's interface would draw.
+    let state = alice.engine.initial_state().unwrap();
+    let view = state.messages.iter().find(|m| m.id == sent.id).unwrap();
+    assert_eq!(view.reactions.len(), 1);
+    assert_eq!(view.reactions[0].emoji, "🎉");
+    assert_eq!(view.reactions[0].users, vec![bob.user.id]);
+    assert!(!view.reactions[0].mine);
+
+    // Withdrawing has to travel too: Alice still holds the reaction, and
+    // nothing else will ever tell her it is gone.
+    bob.engine
+        .remove_reaction(sent.id, libbounce::types::FrameType::DirectMessage)
+        .await
+        .expect("withdraws");
+
+    wait_for(&mut alice.events, "the withdrawal", |event| match event {
+        Event::MessageReacted {
+            message_id, emoji, ..
+        } if *message_id == sent.id && emoji.is_empty() => Some(()),
+        _ => None,
+    })
+    .await;
+
+    let state = alice.engine.initial_state().unwrap();
+    let view = state.messages.iter().find(|m| m.id == sent.id).unwrap();
+    assert!(view.reactions.is_empty(), "{:?}", view.reactions);
+}
+
+#[tokio::test]
+async fn one_person_gets_one_reaction_per_message() {
+    // Signal's rule, and the reason the resolved state is a map rather than a
+    // log. A second reaction replaces the first rather than sitting beside it.
+    let directory = Arc::new(StaticDirectory::new());
+    let alice = start("Alice", Arc::clone(&directory)).await;
+
+    let sent = alice
+        .engine
+        .send_direct_message(alice.user.id, "note to self", None)
+        .await
+        .unwrap();
+
+    for emoji in ["👍", "🎉", "❤️"] {
+        alice
+            .engine
+            .react(sent.id, libbounce::types::FrameType::DirectMessage, emoji)
+            .await
+            .expect("reacts");
+    }
+
+    let state = alice.engine.initial_state().unwrap();
+    let view = state.messages.iter().find(|m| m.id == sent.id).unwrap();
+    assert_eq!(view.reactions.len(), 1);
+    assert_eq!(view.reactions[0].emoji, "❤️");
+    assert!(view.reactions[0].mine);
+}
+
+#[tokio::test]
+async fn a_deletion_reaches_a_peer_who_was_offline_when_it_happened() {
+    // The case the whole deletion design is for, and the one nobody can check
+    // by hand: the person deleting cannot see whether it landed on a device
+    // that was not there. If the frame is not stored and re-offered, the
+    // deletion reaches whoever happened to be connected and nobody else.
+    let directory = Arc::new(StaticDirectory::new());
+    let alice = start("Alice", Arc::clone(&directory)).await;
+    let mut bob = start("Bob", Arc::clone(&directory)).await;
+
+    introduce(&alice, &bob);
+    Arc::clone(&alice.engine).connect(&bob.address).await.unwrap();
+
+    let sent = alice
+        .engine
+        .send_direct_message(bob.user.id, "sent in error", None)
+        .await
+        .unwrap();
+
+    wait_for(&mut bob.events, "Bob to receive it", |event| match event {
+        Event::MessageReceived { message } => Some(message.id),
+        _ => None,
+    })
+    .await;
+
+    // Bob goes away, and only then does Alice delete.
+    alice.engine.disconnect_all().await;
+
+    alice
+        .engine
+        .delete_for_everyone(sent.id, libbounce::types::FrameType::DirectMessage)
+        .await
+        .expect("deletes for everyone");
+
+    // Alice's own copy is a tombstone, not a hole.
+    let alice_copy = alice.store.direct_message(sent.id).unwrap().unwrap();
+    assert!(alice_copy.is_deleted());
+    assert_eq!(alice_copy.text, "");
+
+    // Bob comes back and the reference flow carries the deletion to him.
+    Arc::clone(&bob.engine).connect(&alice.address).await.unwrap();
+
+    let withdrawn = wait_for(&mut bob.events, "the deletion", |event| match event {
+        Event::MessageWithdrawn { message_id, by, .. } => Some((*message_id, *by)),
+        _ => None,
+    })
+    .await;
+
+    assert_eq!(withdrawn, (sent.id, alice.user.id));
+
+    let bob_copy = bob.store.direct_message(sent.id).unwrap().unwrap();
+    assert!(bob_copy.is_deleted());
+    assert_eq!(bob_copy.text, "");
+}
+
+#[tokio::test]
+async fn a_deleted_message_does_not_come_back() {
+    // The tombstone's whole job. Remove the row instead and `has_frame` answers
+    // false, Bob classifies the original as wanted, offers it back, and the
+    // message Alice withdrew reappears on her own screen.
+    let directory = Arc::new(StaticDirectory::new());
+    let alice = start("Alice", Arc::clone(&directory)).await;
+    let mut bob = start("Bob", Arc::clone(&directory)).await;
+
+    introduce(&alice, &bob);
+    Arc::clone(&alice.engine).connect(&bob.address).await.unwrap();
+
+    let sent = alice
+        .engine
+        .send_direct_message(bob.user.id, "please forget this", None)
+        .await
+        .unwrap();
+
+    wait_for(&mut bob.events, "Bob to receive it", |event| match event {
+        Event::MessageReceived { message } => Some(message.id),
+        _ => None,
+    })
+    .await;
+
+    alice
+        .engine
+        .delete_for_everyone(sent.id, libbounce::types::FrameType::DirectMessage)
+        .await
+        .unwrap();
+
+    wait_for(&mut bob.events, "Bob to apply the deletion", |event| match event {
+        Event::MessageWithdrawn { message_id, .. } if *message_id == sent.id => Some(()),
+        _ => None,
+    })
+    .await;
+
+    // A full reference cycle in both directions, which is what would resurrect
+    // it if either side still thought the original was worth offering.
+    alice.engine.disconnect_all().await;
+    Arc::clone(&bob.engine).connect(&alice.address).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    bob.engine.disconnect_all().await;
+    Arc::clone(&alice.engine).connect(&bob.address).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    for (name, store) in [("Alice", &alice.store), ("Bob", &bob.store)] {
+        let copy = store.direct_message(sent.id).unwrap().unwrap();
+        assert!(copy.is_deleted(), "{name} un-deleted the message");
+        assert_eq!(copy.text, "", "{name} recovered the body");
+    }
+}
+
+#[tokio::test]
+async fn only_the_author_can_delete_a_direct_message_for_everyone() {
+    let directory = Arc::new(StaticDirectory::new());
+    let alice = start("Alice", Arc::clone(&directory)).await;
+    let mut bob = start("Bob", Arc::clone(&directory)).await;
+
+    introduce(&alice, &bob);
+    Arc::clone(&alice.engine).connect(&bob.address).await.unwrap();
+
+    let sent = alice
+        .engine
+        .send_direct_message(bob.user.id, "mine to withdraw", None)
+        .await
+        .unwrap();
+
+    wait_for(&mut bob.events, "Bob to receive it", |event| match event {
+        Event::MessageReceived { message } => Some(message.id),
+        _ => None,
+    })
+    .await;
+
+    // Bob is not the author, and there is no admin role in a direct message.
+    assert!(!bob
+        .engine
+        .may_delete_for_everyone(sent.id, libbounce::types::FrameType::DirectMessage)
+        .unwrap());
+    assert!(bob
+        .engine
+        .delete_for_everyone(sent.id, libbounce::types::FrameType::DirectMessage)
+        .await
+        .is_err());
+
+    let copy = bob.store.direct_message(sent.id).unwrap().unwrap();
+    assert!(!copy.is_deleted());
+}
+
+#[tokio::test]
+async fn a_reply_carries_a_quote_of_what_it_answers() {
+    let directory = Arc::new(StaticDirectory::new());
+    let mut alice = start("Alice", Arc::clone(&directory)).await;
+    let mut bob = start("Bob", Arc::clone(&directory)).await;
+
+    introduce(&alice, &bob);
+    Arc::clone(&alice.engine).connect(&bob.address).await.unwrap();
+
+    let original = alice
+        .engine
+        .send_direct_message(bob.user.id, "shall we say Tuesday?", None)
+        .await
+        .unwrap();
+
+    wait_for(&mut bob.events, "Bob to receive it", |event| match event {
+        Event::MessageReceived { message } => Some(message.id),
+        _ => None,
+    })
+    .await;
+
+    let reply = bob
+        .engine
+        .send_direct_message(alice.user.id, "Tuesday works", Some(original.id))
+        .await
+        .unwrap();
+
+    // Assembled from Bob's own copy, not from anything the client passed.
+    let quote = reply.quote.as_ref().expect("the reply carries a quote");
+    assert_eq!(quote.target, original.id);
+    assert_eq!(quote.author, alice.user.id);
+    assert_eq!(quote.text, "shall we say Tuesday?");
+    assert_eq!(quote.kind, "text");
+    assert!(!quote.expired);
+
+    // And it survives the wire.
+    let received = wait_for(&mut alice.events, "the reply", |event| match event {
+        Event::MessageReceived { message } if message.id == reply.id => Some(message.clone()),
+        _ => None,
+    })
+    .await;
+
+    let quote = received.quote.as_ref().expect("the quote crossed the wire");
+    assert_eq!(quote.target, original.id);
+    assert_eq!(quote.text, "shall we say Tuesday?");
+}
+
+#[tokio::test]
+async fn a_quote_is_blanked_when_the_message_it_quotes_expires() {
+    // The reply outlives the original, so without this the excerpt keeps a copy
+    // of a disappearing message for as long as the reply lives — the quote
+    // outliving the thing it quoted is exactly what retention exists to stop.
+    let directory = Arc::new(StaticDirectory::new());
+    let alice = start("Alice", Arc::clone(&directory)).await;
+
+    let original = alice
+        .engine
+        .send_direct_message(alice.user.id, "forget me shortly", None)
+        .await
+        .unwrap();
+
+    // A second, so the quote is taken while the original is still live and the
+    // sweep then finds it genuinely past. The expiry the quote carries is a
+    // *snapshot* taken at send time — it travels on the wire — so moving the
+    // original's afterwards would change nothing, which is the point.
+    alice
+        .store
+        .set_message_delete_at(original.id, libbounce::now() + 1)
+        .expect("gives the original an expiry");
+
+    let reply = alice
+        .engine
+        .send_direct_message(alice.user.id, "noted", Some(original.id))
+        .await
+        .unwrap();
+    assert_eq!(
+        reply.quote.as_ref().map(|quote| quote.text.as_str()),
+        Some("forget me shortly"),
+        "the quote is taken while the original is still live",
+    );
+
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+
+    alice.engine.sweep_expired().expect("sweeps");
+
+    let stored = alice.store.direct_message(reply.id).unwrap().unwrap();
+    let quote = stored.quote.as_ref().expect("the reply keeps its quote block");
+    assert_eq!(quote.text, "", "the excerpt outlived what it quoted");
+    assert_eq!(quote.target, original.id, "but still points at it");
+
+    // The reply itself is untouched.
+    assert_eq!(stored.text, "noted");
+}
+
+#[tokio::test]
+async fn a_peer_that_advertises_nothing_is_never_sent_an_extension_frame() {
+    // The one test standing between this change and a broken network. Go closes
+    // the connection on a frame type it does not know, so a legacy peer must
+    // not be offered one — and "legacy" is the absence of a capability, which
+    // is what every build that exists today looks like.
+    let directory = Arc::new(StaticDirectory::new());
+    let alice = start("Alice", Arc::clone(&directory)).await;
+    let bob = start("Bob", Arc::clone(&directory)).await;
+
+    introduce(&alice, &bob);
+
+    // Alice's record of Bob's device predates the extensions.
+    let mut bob_device = alice
+        .store
+        .device_by_address(&bob.address)
+        .unwrap()
+        .expect("Alice knows Bob's device");
+    bob_device.capabilities = Vec::new();
+    alice.store.save_device(&bob_device).unwrap();
+
+    let sent = alice
+        .engine
+        .send_direct_message(bob.user.id, "hello", None)
+        .await
+        .unwrap();
+
+    alice
+        .engine
+        .react(sent.id, libbounce::types::FrameType::DirectMessage, "👍")
+        .await
+        .unwrap();
+
+    let offered = alice
+        .store
+        .references_not_delivered_to(&bob.address, |_, _| true)
+        .unwrap();
+
+    assert!(
+        offered
+            .iter()
+            .any(|reference| reference.frame_type == libbounce::types::FrameType::DirectMessage.as_u16()),
+        "the message itself is still offered",
+    );
+    assert!(
+        !offered
+            .iter()
+            .any(|reference| libbounce::types::FrameType::from_u16(reference.frame_type)
+                .map(libbounce::types::FrameType::is_extension)
+                .unwrap_or(false)),
+        "an extension frame was offered to a legacy peer: {offered:?}",
+    );
+
+    // And once Bob's build announces itself, the same reaction is offered.
+    bob_device.capabilities = libbounce::types::capability::SUPPORTED
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    alice.store.save_device(&bob_device).unwrap();
+
+    let offered = alice
+        .store
+        .references_not_delivered_to(&bob.address, |_, _| true)
+        .unwrap();
+    assert!(
+        offered
+            .iter()
+            .any(|reference| reference.frame_type == libbounce::types::FrameType::Reaction.as_u16()),
+        "a capable peer is offered the reaction: {offered:?}",
+    );
+}
+
+#[tokio::test]
+async fn a_keep_alive_teaches_a_peer_what_we_speak() {
+    // The gap the device record cannot close. A contact paired before the
+    // extensions existed has an empty capability list stored, and nothing in
+    // the protocol re-announces a device — so without this they read as legacy
+    // forever and every reaction and deletion is silently withheld from them.
+    //
+    // Silently is the problem. The gate fails towards sending less, so there is
+    // no error anywhere: reacting appears to work locally and simply never
+    // arrives.
+    let directory = Arc::new(StaticDirectory::new());
+    let alice = start("Alice", Arc::clone(&directory)).await;
+    let bob = start("Bob", Arc::clone(&directory)).await;
+
+    introduce(&alice, &bob);
+
+    // Alice's record of Bob predates the field, as every existing row does.
+    let mut bob_device = alice
+        .store
+        .device_by_address(&bob.address)
+        .unwrap()
+        .expect("Alice knows Bob's device");
+    bob_device.capabilities = Vec::new();
+    alice.store.save_device(&bob_device).unwrap();
+
+    let sent = alice
+        .engine
+        .send_direct_message(bob.user.id, "hello", None)
+        .await
+        .unwrap();
+    alice
+        .engine
+        .react(sent.id, libbounce::types::FrameType::DirectMessage, "👍")
+        .await
+        .unwrap();
+
+    let offers_reaction = |alice: &Instance| {
+        alice
+            .store
+            .references_not_delivered_to(&bob.address, |_, _| true)
+            .unwrap()
+            .iter()
+            .any(|reference| {
+                reference.frame_type == libbounce::types::FrameType::Reaction.as_u16()
+            })
+    };
+
+    assert!(!offers_reaction(&alice), "a legacy peer is offered nothing new");
+
+    // Bob's keep-alive says what he speaks. Go's `handleKeepAlive` reads its
+    // payload not at all, so this costs a Go peer nothing in either direction.
+    let keep_alive = libbounce::frames::transport::KeepAlive::advertising()
+        .encode()
+        .unwrap();
+    alice
+        .engine
+        .handle_frame(
+            &bob.address,
+            libbounce::wire::RawFrame::new(
+                libbounce::types::FrameType::KeepAlive.as_u16(),
+                keep_alive,
+            ),
+        )
+        .await
+        .expect("handles the keep alive");
+
+    assert!(
+        offers_reaction(&alice),
+        "after Bob announces himself the reaction is offered",
+    );
+
+    // Go sends the literal bytes `keep-alive`, which is not msgpack at all.
+    // That must neither fail the connection nor be read as an announcement of
+    // nothing — otherwise one unparseable frame erases what a capable peer has
+    // already told us, and reactions stop arriving again with no trace of why.
+    alice
+        .engine
+        .handle_frame(
+            &bob.address,
+            libbounce::wire::RawFrame::new(
+                libbounce::types::FrameType::KeepAlive.as_u16(),
+                b"keep-alive".to_vec(),
+            ),
+        )
+        .await
+        .expect("a Go keep-alive is not an error");
+
+    assert!(
+        offers_reaction(&alice),
+        "an unreadable keep-alive is silence, not a downgrade",
+    );
+
+    // An explicit empty announcement *is* a downgrade, and is honoured.
+    let downgraded = libbounce::frames::transport::KeepAlive::default()
+        .encode()
+        .unwrap();
+    alice
+        .engine
+        .handle_frame(
+            &bob.address,
+            libbounce::wire::RawFrame::new(
+                libbounce::types::FrameType::KeepAlive.as_u16(),
+                downgraded,
+            ),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !offers_reaction(&alice),
+        "a peer that says it speaks nothing is believed",
+    );
+}
+
+#[tokio::test]
+async fn withdrawing_a_reaction_reaches_a_peer_who_was_offline() {
+    // The same lesson as deletion, in a second place. A state change that is
+    // only broadcast — never stored — reaches whoever happened to be connected
+    // and nobody else. Here the consequence is that Bob goes on showing a
+    // reaction Alice took back, with nothing that will ever correct him.
+    let directory = Arc::new(StaticDirectory::new());
+    let alice = start("Alice", Arc::clone(&directory)).await;
+    let mut bob = start("Bob", Arc::clone(&directory)).await;
+
+    introduce(&alice, &bob);
+    Arc::clone(&alice.engine).connect(&bob.address).await.unwrap();
+
+    let sent = alice
+        .engine
+        .send_direct_message(bob.user.id, "worth a reaction", None)
+        .await
+        .unwrap();
+
+    wait_for(&mut bob.events, "Bob to receive the message", |event| match event {
+        Event::MessageReceived { message } => Some(message.id),
+        _ => None,
+    })
+    .await;
+
+    alice
+        .engine
+        .react(sent.id, libbounce::types::FrameType::DirectMessage, "👍")
+        .await
+        .unwrap();
+
+    wait_for(&mut bob.events, "Bob to see the reaction", |event| match event {
+        Event::MessageReacted { emoji, .. } if emoji == "👍" => Some(()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(bob.store.reactions_for(sent.id).unwrap().len(), 1);
+
+    // Bob goes away, and only then does Alice take it back.
+    alice.engine.disconnect_all().await;
+    alice
+        .engine
+        .remove_reaction(sent.id, libbounce::types::FrameType::DirectMessage)
+        .await
+        .unwrap();
+
+    // Bob returns. The reference flow has to carry the withdrawal, exactly as
+    // it carries a deletion.
+    Arc::clone(&bob.engine).connect(&alice.address).await.unwrap();
+
+    wait_for(&mut bob.events, "the withdrawal", |event| match event {
+        Event::MessageReacted {
+            message_id, emoji, ..
+        } if *message_id == sent.id && emoji.is_empty() => Some(()),
+        _ => None,
+    })
+    .await;
+
+    // A full reference cycle in both directions, which is what resurrected it
+    // when the withdrawal replaced the reaction instead of being kept beside
+    // it: Bob still held the original, Alice no longer answered for its id, so
+    // he offered it back and the reaction returned on both sides.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Both frames are still held — the log keeps the reaction *and* the
+    // withdrawal, which is what lets either be offered to a third device. What
+    // must be empty is the resolved state.
+    assert_eq!(
+        bob.store.reactions_for(sent.id).unwrap().len(),
+        2,
+        "both frames are kept",
+    );
+
+    for (name, store) in [("Alice", &alice.store), ("Bob", &bob.store)] {
+        let shown = libbounce::engine::interaction::resolve_reactions(
+            store.reactions_for(sent.id).unwrap().into_iter(),
+        );
+        assert!(shown.is_empty(), "{name} resurrected the reaction: {shown:?}");
+    }
 }

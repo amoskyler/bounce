@@ -54,6 +54,7 @@ import {
   MediaIcon,
   MoreIcon,
   PlusIcon,
+  TrashIcon,
 } from './icons';
 import {
   dateSeparator,
@@ -61,6 +62,16 @@ import {
   needsDateSeparator,
   shouldGroupWith,
 } from './format';
+import {
+  deletedMessageText,
+  HoverActions,
+  MESSAGE_FRAME_TYPE,
+  MessageOverflowMenu,
+  QuoteBlock,
+  ReactionPicker,
+  ReactionPills,
+  ReplyPreview,
+} from './MessageActions';
 import { MessageText } from './MessageText';
 import { dismissNotifications, setTimelineAtBottom } from './notifications';
 import { LOCAL_USER, SystemMessageRow, type DisplayNames } from './SystemMessage';
@@ -109,6 +120,20 @@ const JUMP_TO_BOTTOM_SCREENS = 1.5;
  */
 const MAX_REVEAL_ATTEMPTS = 8;
 
+/** How long a jumped-to message stays highlighted, in milliseconds. */
+const FLASH_DURATION = 1_200;
+
+/**
+ * Somebody's name, for a place that has only their id.
+ *
+ * The alias wins where there is one — it is what this person calls them, and a
+ * quote block attributed to a name they do not use reads as a stranger's.
+ */
+function displayNameOf(state: State, userId: string): string {
+  const user = state.users[userId];
+  return user ? user.alias || user.name : 'Unknown';
+}
+
 /** One row of the timeline: either a message or a status change. */
 export type Entry =
   | { kind: 'message'; at: number; id: string; message: Message }
@@ -117,7 +142,11 @@ export type Entry =
 type ConversationProps = {
   conversation: ConversationSummary;
   state: State;
-  onSend: (text: string, attachments: readonly PendingAttachment[]) => void;
+  onSend: (
+    text: string,
+    attachments: readonly PendingAttachment[],
+    replyTo: string | undefined,
+  ) => void;
   onDraftChange: (text: string) => void;
   onAcceptInvite: () => void;
   onDeclineInvite: () => void;
@@ -157,6 +186,41 @@ export function ConversationView({
 
   const [viewerImage, setViewerImage] = React.useState<{ src: string; alt: string } | null>(null);
 
+  /*
+   * The message being replied to, if any.
+   *
+   * Held here rather than in the composer because two things set it — the
+   * hover row and the overflow menu, both of which live in the timeline — and
+   * one thing clears it. Keying this component on the conversation id means it
+   * is dropped when you switch chats, which is what you want: a reply half
+   * written to one person should not follow you to another.
+   */
+  const [replyTo, setReplyTo] = React.useState<Message | null>(null);
+
+  const isGroup = conversation.kind === 'group';
+  const frameType = isGroup ? MESSAGE_FRAME_TYPE.group : MESSAGE_FRAME_TYPE.direct;
+
+  const toggleReaction = React.useCallback(
+    (message: Message, emoji: string, mine: boolean) => {
+      const action =
+        emoji === '' || mine
+          ? window.bounce.removeReaction(message.id, frameType)
+          : window.bounce.react(message.id, frameType, emoji);
+      void action.catch((error: unknown) => onError(String(error)));
+    },
+    [frameType, onError],
+  );
+
+  const deleteMessage = React.useCallback(
+    (message: Message, everyone: boolean) => {
+      const action = everyone
+        ? window.bounce.deleteForEveryone(message.id, frameType)
+        : window.bounce.deleteForMe(message.id, frameType);
+      void action.catch((error: unknown) => onError(String(error)));
+    },
+    [frameType, onError],
+  );
+
   // The header avatar's photo. The summary carries no images — it is derived
   // from both tables — so it is looked up here from whichever one owns the id.
   const images =
@@ -179,10 +243,14 @@ export function ConversationView({
         messages={messages}
         systemMessages={systemMessages}
         state={state}
-        isGroup={conversation.kind === 'group'}
+        isGroup={isGroup}
+        frameType={frameType}
         typing={typing}
         onOpenImage={(src, alt) => setViewerImage({ src, alt })}
         onShowInfo={onShowMessageInfo}
+        onReply={setReplyTo}
+        onToggleReaction={toggleReaction}
+        onDelete={deleteMessage}
       />
 
       {conversation.invitationPending ? (
@@ -190,9 +258,21 @@ export function ConversationView({
       ) : (
         <Composer
           draft={state.drafts[conversation.id] ?? ''}
-          onSend={onSend}
+          onSend={(text, attachments) => {
+            onSend(text, attachments, replyTo?.id);
+            setReplyTo(null);
+          }}
           onChange={onDraftChange}
           onError={onError}
+          replyTo={replyTo}
+          replyToName={
+            replyTo
+              ? replyTo.author === state.profile?.id
+                ? 'yourself'
+                : displayNameOf(state, replyTo.author)
+              : ''
+          }
+          onCancelReply={() => setReplyTo(null)}
         />
       )}
 
@@ -365,19 +445,28 @@ function Timeline({
   systemMessages,
   state,
   isGroup,
+  frameType,
   typing,
   onOpenImage,
   onShowInfo,
+  onReply,
+  onToggleReaction,
+  onDelete,
 }: {
   threadId: string;
   messages: Message[];
   systemMessages: SystemMessage[];
   state: State;
   isGroup: boolean;
+  /** The engine's frame type for messages in this thread. */
+  frameType: number;
   /** User ids currently composing, oldest first. */
   typing: readonly string[];
   onOpenImage: (src: string, alt: string) => void;
   onShowInfo: (message: Message) => void;
+  onReply: (message: Message) => void;
+  onToggleReaction: (message: Message, emoji: string, mine: boolean) => void;
+  onDelete: (message: Message, everyone: boolean) => void;
 }) {
   const scrollRef = React.useRef<HTMLDivElement>(null);
   const atBottomRef = React.useRef(true);
@@ -387,6 +476,23 @@ function Timeline({
   // the row mounted, and none of it is anything to draw.
   const revealRef = React.useRef<number | null>(null);
   const revealAttemptsRef = React.useRef(0);
+
+  /*
+   * How the revealed row should sit, and a counter to re-trigger the search.
+   *
+   * Opening a thread puts the last-read row at the *top*, so the new material
+   * begins under it. Jumping to a quoted message centres it instead, because
+   * there is nothing special about what follows it — you are going to read
+   * around it and come back.
+   *
+   * The counter exists because the reveal itself lives in a ref, and setting a
+   * ref does not run the layout effect that acts on it. Bumping this does.
+   */
+  const revealAlignRef = React.useRef<'top' | 'centre'>('top');
+  const [revealTick, setRevealTick] = React.useState(0);
+
+  /** The row briefly highlighted after a jump, or null. */
+  const [flashedId, setFlashedId] = React.useState<string | null>(null);
 
   const [farFromBottom, setFarFromBottom] = React.useState(false);
 
@@ -448,6 +554,7 @@ function Timeline({
       // Go scrolls to the row above the first unseen one, so what you last read
       // is at the top of the screen and the new material begins under it.
       atBottomRef.current = false;
+      revealAlignRef.current = 'top';
       revealRef.current = Math.max(0, unread - 1);
     }
 
@@ -472,8 +579,12 @@ function Timeline({
       const row = rowElement(element, reveal) ?? rowElement(element, reveal + 1);
 
       if (row) {
-        // Align the row with the top of the viewport.
-        element.scrollTop += row.getBoundingClientRect().top - element.getBoundingClientRect().top;
+        const offset =
+          row.getBoundingClientRect().top - element.getBoundingClientRect().top;
+        element.scrollTop +=
+          revealAlignRef.current === 'centre'
+            ? offset - (element.clientHeight - row.getBoundingClientRect().height) / 2
+            : offset;
         revealRef.current = null;
       } else if (revealAttemptsRef.current >= MAX_REVEAL_ATTEMPTS) {
         // The row is not being mounted where the arithmetic says it is. The
@@ -491,7 +602,46 @@ function Timeline({
     if (atBottomRef.current) {
       element.scrollTop = element.scrollHeight;
     }
-  }, [entries.length, range.start, range.end]);
+  }, [entries.length, range.start, range.end, revealTick]);
+
+  /**
+   * Scroll to a specific message and flash it.
+   *
+   * Returns false when the message is not in this thread — a quote whose
+   * original expired and was swept, most often — so the caller can leave the
+   * quote block inert rather than offering a jump that goes nowhere.
+   *
+   * This reuses the reveal path rather than calling `scrollIntoView`, because
+   * the row may not be mounted: the timeline only keeps the rows near the
+   * viewport, and a quoted message can be thousands of rows up. The reveal
+   * moves the window first and finds the row on the pass after.
+   */
+  const jumpToMessage = React.useCallback(
+    (messageId: string): boolean => {
+      const index = entries.findIndex(
+        (entry) => entry.kind === 'message' && entry.message.id === messageId,
+      );
+      if (index < 0) return false;
+
+      revealAttemptsRef.current = 0;
+      revealAlignRef.current = 'centre';
+      revealRef.current = index;
+      atBottomRef.current = false;
+      setTimelineAtBottom(threadId, false);
+      setRevealTick((tick) => tick + 1);
+      setFlashedId(messageId);
+      return true;
+    },
+    [entries, threadId],
+  );
+
+  // The highlight is a moment, not a mode. Cleared on a timer rather than on
+  // the next interaction, so it fades whether or not anything else happens.
+  React.useEffect(() => {
+    if (!flashedId) return;
+    const timer = setTimeout(() => setFlashedId(null), FLASH_DURATION);
+    return () => clearTimeout(timer);
+  }, [flashedId]);
 
   // Go's jump-to-bottom does three things: scrolls down, zeroes the unread
   // counter, and marks the thread read (`ui/chat_history.go:89-110`). The last
@@ -604,10 +754,17 @@ function Timeline({
         message={message}
         state={state}
         isGroup={isGroup}
+        frameType={frameType}
         grouped={grouped}
         continuesAfter={continuesAfter}
         onOpenImage={onOpenImage}
         onShowInfo={onShowInfo}
+        onReply={onReply}
+        onToggleReaction={onToggleReaction}
+        onDelete={onDelete}
+        onJumpTo={jumpToMessage}
+        flashed={flashedId === message.id}
+        names={names}
       />,
     );
 
@@ -734,25 +891,47 @@ function MessageRow({
   message,
   state,
   isGroup,
+  frameType,
   grouped,
   continuesAfter,
   onOpenImage,
   onShowInfo,
+  onReply,
+  onToggleReaction,
+  onDelete,
+  onJumpTo,
+  flashed,
+  names,
 }: {
   /** Position in the whole thread, so the scroller can find this row again. */
   index: number;
   message: Message;
   state: State;
   isGroup: boolean;
+  frameType: number;
   grouped: boolean;
   continuesAfter: boolean;
   onOpenImage: (src: string, alt: string) => void;
   onShowInfo: (message: Message) => void;
+  onReply: (message: Message) => void;
+  onToggleReaction: (message: Message, emoji: string, mine: boolean) => void;
+  onDelete: (message: Message, everyone: boolean) => void;
+  /** Scroll to a message; false when it is not in this thread. */
+  onJumpTo: (messageId: string) => boolean;
+  /** Briefly highlighted, having just been jumped to. */
+  flashed: boolean;
+  names: DisplayNames;
 }) {
   const author = state.users[message.author];
   const authorName = author ? author.alias || author.name : 'Unknown';
   const attachments = useAttachmentUrls(message.attachments);
   const [menuAt, setMenuAt] = React.useState<{ x: number; y: number } | null>(null);
+  const [picking, setPicking] = React.useState(false);
+  const [mayWithdraw, setMayWithdraw] = React.useState(false);
+
+  const deleted = message.deletedAt > 0;
+  const authorIsMe = message.author === state.profile?.id;
+  const mine = message.reactions.find((reaction) => reaction.mine)?.emoji ?? null;
 
   const groupClassName = [
     'message-group',
@@ -769,6 +948,10 @@ function MessageRow({
     // actually face a neighbour rather than assuming one.
     grouped && 'bubble--grouped',
     continuesAfter && 'bubble--continued',
+    flashed && 'bubble--flashed',
+    // Signal gives up six pixels of the bubble so the pills overlap its lower
+    // edge rather than stacking under it.
+    message.reactions.length > 0 && 'bubble--with-reactions',
   ]
     .filter(Boolean)
     .join(' ');
@@ -790,7 +973,8 @@ function MessageRow({
           // target for something that acts on it.
           onContextMenu={(event) => {
             event.preventDefault();
-            setMenuAt({ x: event.clientX, y: event.clientY });
+            if (deleted) return;
+            openMenu({ x: event.clientX, y: event.clientY });
           }}
         >
           {/* Inside the bubble and in the sender's own colour, as Signal has
@@ -811,9 +995,34 @@ function MessageRow({
             </div>
           )}
 
+          {/* The quote sits above everything the reply itself carries, which
+              is the order it is read in. */}
+          {message.quote && (
+            <QuoteBlock
+              quote={message.quote}
+              authorName={
+                message.quote.author === state.profile?.id
+                  ? 'You'
+                  : names[message.quote.author] ?? 'Unknown'
+              }
+              colors={colorsForId(message.quote.author)}
+              // Inert when the original has expired: there is nothing to
+              // scroll to, and a control that does nothing is worse than no
+              // control. `onJumpTo` answers the same question for a message
+              // that was deleted for me rather than expired.
+              onJump={
+                message.quote.expired
+                  ? null
+                  : () => {
+                      onJumpTo(message.quote!.target);
+                    }
+              }
+            />
+          )}
+
           {/* Ahead of the footer, so the floated timestamp wraps around the
               text rather than around the pictures. */}
-          <AttachmentList attachments={attachments} onOpenImage={onOpenImage} />
+          {!deleted && <AttachmentList attachments={attachments} onOpenImage={onOpenImage} />}
           <span className="bubble__footer">
             <span>{messageTimestamp(message.writtenAt)}</span>
             {/* After the time, as Signal has it: the clock reads as a note on
@@ -821,128 +1030,103 @@ function MessageRow({
             {message.expiresAt > 0 && (
               <ExpireTimer expiresAt={message.expiresAt} writtenAt={message.writtenAt} />
             )}
-            {message.outgoing && <DeliveryStatus message={message} />}
+            {message.outgoing && !deleted && <DeliveryStatus message={message} />}
           </span>
-          <MessageText text={message.text} />
+          {deleted ? (
+            <span className="bubble__deleted">
+              <TrashIcon size={14} />
+              {deletedMessageText(message, authorIsMe)}
+            </span>
+          ) : (
+            <MessageText text={message.text} />
+          )}
         </div>
+
+        {/* Under the bubble, overlapping its lower edge — Signal's placement,
+            and the reason a message with reactions is taller than one without
+            by less than the pills' own height. */}
+        <ReactionPills
+          reactions={message.reactions}
+          outgoing={message.outgoing}
+          names={(userId) =>
+            userId === state.profile?.id ? 'You' : (names[userId] ?? 'Unknown')
+          }
+        />
+
+        {/* Nothing to react to, reply to, or delete once it is a tombstone. */}
+        {!deleted && (
+          <HoverActions
+            outgoing={message.outgoing}
+            // The row is revealed by hovering, so opening a popover from it and
+            // then moving the pointer onto that popover would take the row —
+            // and the popover with it — out from under the hand.
+            active={picking || menuAt !== null}
+            onReact={() => setPicking(true)}
+            onReply={() => onReply(message)}
+            onMore={(anchor) => {
+              const box = anchor.getBoundingClientRect();
+              openMenu({ x: box.left, y: box.bottom + 4 });
+            }}
+            picker={
+              picking ? (
+                <ReactionPicker
+                  mine={mine}
+                  onChoose={(emoji) => {
+                    setPicking(false);
+                    onToggleReaction(message, emoji, emoji === '');
+                  }}
+                  onDismiss={() => setPicking(false)}
+                />
+              ) : null
+            }
+          />
+        )}
       </div>
 
+
       {menuAt && (
-        <MessageMenu
+        <MessageOverflowMenu
           at={menuAt}
           onDismiss={() => setMenuAt(null)}
-          onInfo={() => {
-            setMenuAt(null);
-            onShowInfo(message);
+          actions={{
+            onInfo: () => {
+              setMenuAt(null);
+              onShowInfo(message);
+            },
+            onReply: () => {
+              setMenuAt(null);
+              onReply(message);
+            },
+            onCopy: () => {
+              setMenuAt(null);
+              void navigator.clipboard.writeText(message.text);
+            },
+            onDeleteForMe: () => {
+              setMenuAt(null);
+              onDelete(message, false);
+            },
+            // Only when the engine says so. The window closes a day after the
+            // message was written, so this is asked each time the menu opens
+            // rather than derived once and cached.
+            onDeleteForEveryone: mayWithdraw
+              ? () => {
+                  setMenuAt(null);
+                  onDelete(message, true);
+                }
+              : null,
           }}
         />
       )}
     </div>
   );
-}
 
-/**
- * The right-click menu on a message.
- *
- * Positioned at the pointer and rendered in place rather than in a portal: the
- * timeline does not clip, and a portal would have to re-derive a position that
- * the event already gave us.
- */
-function MessageMenu({
-  at,
-  onDismiss,
-  onInfo,
-}: {
-  at: { x: number; y: number };
-  onDismiss: () => void;
-  onInfo: () => void;
-}) {
-  const menuRef = React.useRef<HTMLDivElement>(null);
-  const [placement, setPlacement] = React.useState<{ left: number; top: number }>({
-    left: at.x,
-    top: at.y,
-  });
-
-  // Measured after mount and nudged back inside the window, because a message
-  // near the bottom right is exactly where a menu would otherwise open
-  // half-off the screen.
-  React.useLayoutEffect(() => {
-    const element = menuRef.current;
-    if (!element) return;
-
-    const box = element.getBoundingClientRect();
-    setPlacement({
-      left: Math.min(at.x, window.innerWidth - box.width - 8),
-      top: Math.min(at.y, window.innerHeight - box.height - 8),
-    });
-  }, [at.x, at.y]);
-
-  React.useEffect(() => {
-    /*
-     * Anything outside the menu closes it — but `mousedown` inside it must not,
-     * because that is the first half of choosing an item. Dismissing there
-     * unmounts the button before its `click` ever fires, and the item does
-     * nothing at all. Calling `.click()` in a test does not reproduce it: that
-     * dispatches `click` alone, with no `mousedown` in front of it.
-     */
-    const dismiss = (event: Event) => {
-      const target = event.target;
-      if (target instanceof Node && menuRef.current?.contains(target)) return;
-      onDismiss();
-    };
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') onDismiss();
-    };
-
-    /*
-     * Attached on the next task, not this one.
-     *
-     * The right-click that opened this menu is still bubbling. React dispatches
-     * `onContextMenu` at the root and flushes the state update synchronously,
-     * so an effect that binds to `document` right here is in place before the
-     * very same event reaches it — and the menu dismisses itself in the act of
-     * opening. A synthetic `dispatchEvent` does not reproduce it; a real click
-     * does, every time.
-     */
-    const timer = window.setTimeout(() => {
-      // `mousedown` anywhere closes it, including a second right-click, which
-      // should move the menu rather than open a second one.
-      document.addEventListener('mousedown', dismiss);
-      document.addEventListener('contextmenu', dismiss);
-      window.addEventListener('blur', dismiss);
-    }, 0);
-
-    // Escape is safe to bind immediately: no key is in flight.
-    document.addEventListener('keydown', onKeyDown, true);
-
-    return () => {
-      window.clearTimeout(timer);
-      document.removeEventListener('mousedown', dismiss);
-      document.removeEventListener('contextmenu', dismiss);
-      window.removeEventListener('blur', dismiss);
-      document.removeEventListener('keydown', onKeyDown, true);
-    };
-  }, [onDismiss]);
-
-  return (
-    <div
-      className="menu menu--at-pointer"
-      ref={menuRef}
-      style={{ left: placement.left, top: placement.top }}
-      role="menu"
-      aria-label="Message actions"
-    >
-      <button
-        className="menu__item menu__item--icon"
-        onClick={onInfo}
-        role="menuitem"
-        type="button"
-      >
-        <InfoIcon size={16} />
-        Info
-      </button>
-    </div>
-  );
+  function openMenu(at: { x: number; y: number }) {
+    setMenuAt(at);
+    void window.bounce
+      .mayDeleteForEveryone(message.id, frameType)
+      .then(setMayWithdraw)
+      .catch(() => setMayWithdraw(false));
+  }
 }
 
 /**
@@ -1045,11 +1229,18 @@ export function Composer({
   onSend,
   onChange,
   onError,
+  replyTo,
+  replyToName,
+  onCancelReply,
 }: {
   draft: string;
   onSend: (text: string, attachments: readonly PendingAttachment[]) => void;
   onChange: (text: string) => void;
   onError: (message: string) => void;
+  /** The message being answered, or null. */
+  replyTo?: Message | null;
+  replyToName?: string;
+  onCancelReply?: () => void;
 }) {
   const [text, setText] = React.useState(draft);
   const [pickerOpen, setPickerOpen] = React.useState(false);
@@ -1070,6 +1261,24 @@ export function Composer({
   );
 
   const textareaRef = React.useRef<HTMLTextAreaElement>(null);
+
+  /*
+   * Choosing "reply" puts the cursor in the composer.
+   *
+   * Replying is a decision to write something, and it is taken with the pointer
+   * up in the timeline — leaving the caret wherever it was means the next thing
+   * typed goes nowhere and the reply strip looks like a notice rather than a
+   * prompt. Keyed on the message so replying to a second one re-focuses.
+   */
+  React.useEffect(() => {
+    if (!replyTo) return;
+    const element = textareaRef.current;
+    if (!element) return;
+    element.focus();
+    // To the end, so a half-written draft is continued rather than typed into
+    // the middle of.
+    element.setSelectionRange(element.value.length, element.value.length);
+  }, [replyTo?.id]);
   const emojiButtonRef = React.useRef<HTMLButtonElement>(null);
   const attachButtonRef = React.useRef<HTMLButtonElement>(null);
 
@@ -1299,6 +1508,24 @@ export function Composer({
       onDragLeave={intake.onDragLeave}
       onDrop={intake.onDrop}
     >
+      {/* Above the tray, because a reply is context for everything below it —
+          the attachments and the text are both part of the same answer. */}
+      {replyTo && onCancelReply && (
+        <ReplyPreview
+          quote={{
+            text: replyTo.text,
+            kind: replyTo.attachments.some((attachment) => attachment.width != null)
+              ? 'image'
+              : replyTo.attachments.length > 0
+                ? 'file'
+                : 'text',
+          }}
+          authorName={replyToName ?? ''}
+          colors={colorsForId(replyTo.author)}
+          onCancel={onCancelReply}
+        />
+      )}
+
       <AttachmentTray attachments={intake.attachments} onRemove={intake.remove} />
 
       {intake.error && <div className="composer-area__error">{intake.error}</div>}

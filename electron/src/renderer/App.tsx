@@ -230,7 +230,11 @@ export function App() {
   );
 
   const handleSend = React.useCallback(
-    async (text: string, attachments: readonly PendingAttachment[]) => {
+    async (
+      text: string,
+      attachments: readonly PendingAttachment[],
+      replyTo?: string,
+    ) => {
       if (!selected) return;
       try {
         if (attachments.length > 0) {
@@ -238,14 +242,24 @@ export function App() {
           // engine does not decode images.
           const outgoing = await Promise.all(attachments.map(measure));
           if (selected.kind === 'group') {
-            await window.bounce.sendGroupMessageWithAttachments(selected.id, text, outgoing);
+            await window.bounce.sendGroupMessageWithAttachments(
+              selected.id,
+              text,
+              outgoing,
+              replyTo,
+            );
           } else {
-            await window.bounce.sendDirectMessageWithAttachments(selected.id, text, outgoing);
+            await window.bounce.sendDirectMessageWithAttachments(
+              selected.id,
+              text,
+              outgoing,
+              replyTo,
+            );
           }
         } else if (selected.kind === 'group') {
-          await window.bounce.sendGroupMessage(selected.id, text);
+          await window.bounce.sendGroupMessage(selected.id, text, replyTo);
         } else {
-          await window.bounce.sendDirectMessage(selected.id, text);
+          await window.bounce.sendDirectMessage(selected.id, text, replyTo);
         }
         // Clearing the stored draft is what removes the "Draft:" prefix from
         // the conversation list.

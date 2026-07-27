@@ -23,6 +23,42 @@ export interface Message {
   readBy: string[];
   attachments: Attachment[];
   outgoing: boolean;
+  /** Reactions, already grouped by emoji in first-use order. */
+  reactions: Reaction[];
+  /** The message this one replies to, if it is a reply. */
+  quote?: Quote;
+  /**
+   * When this message was deleted for everyone; zero if it was not.
+   *
+   * A message with this set is a tombstone — the body and attachments are gone
+   * and the row survives so a peer cannot resurrect it by re-offering the
+   * original. The timeline still draws a row for it.
+   */
+  deletedAt: number;
+  deletedBy?: string;
+  deletedByAdmin: boolean;
+}
+
+export interface Reaction {
+  emoji: string;
+  /** Who reacted, oldest first. */
+  users: string[];
+  /** Whether we are one of them, so clicking the pill means "withdraw". */
+  mine: boolean;
+}
+
+export interface Quote {
+  target: string;
+  author: string;
+  /** Empty when the quoted message has expired — see `expired`. */
+  text: string;
+  kind: 'text' | 'image' | 'file';
+  /**
+   * Whether the quoted message has passed its own expiry, in which case the
+   * excerpt has been blanked and the block reads as unavailable. Decided by the
+   * engine so it means the same thing everywhere.
+   */
+  expired: boolean;
 }
 
 export interface Attachment {
@@ -222,6 +258,9 @@ export type EngineEvent =
   | { type: 'messageSeen'; messageId: string }
   | { type: 'messageUndeliverable'; messageId: string }
   | { type: 'messageDeleted'; messageId: string }
+  | { type: 'messageWithdrawn'; messageId: string; by: string; admin: boolean }
+  | { type: 'messageReacted'; messageId: string; userId: string; emoji: string }
+  | { type: 'quoteExpired'; messageId: string }
   | { type: 'typingStarted'; userId: string; thread: string }
   | { type: 'typingStopped'; userId: string; thread: string }
   | { type: 'userAdded'; user: User }
@@ -286,11 +325,27 @@ const api = {
   createProfile: (name: string, deviceName: string): Promise<string> =>
     ipcRenderer.invoke('bounce:createProfile', name, deviceName),
 
-  sendDirectMessage: (recipient: string, text: string): Promise<Message> =>
-    ipcRenderer.invoke('bounce:sendDirectMessage', recipient, text),
+  sendDirectMessage: (recipient: string, text: string, replyTo?: string): Promise<Message> =>
+    ipcRenderer.invoke('bounce:sendDirectMessage', recipient, text, replyTo),
 
-  sendGroupMessage: (groupId: string, text: string): Promise<Message> =>
-    ipcRenderer.invoke('bounce:sendGroupMessage', groupId, text),
+  /*
+   * `targetType` is the frame type of the message being acted on: 0 for a
+   * direct message, 1 for a group message. It matches `FrameType` in the core,
+   * and `MESSAGE_FRAME_TYPE` in the renderer names both ends of it.
+   */
+  react: (target: string, targetType: number, emoji: string): Promise<void> =>
+    ipcRenderer.invoke('bounce:react', target, targetType, emoji),
+  removeReaction: (target: string, targetType: number): Promise<void> =>
+    ipcRenderer.invoke('bounce:removeReaction', target, targetType),
+  deleteForMe: (target: string, targetType: number): Promise<void> =>
+    ipcRenderer.invoke('bounce:deleteForMe', target, targetType),
+  deleteForEveryone: (target: string, targetType: number): Promise<void> =>
+    ipcRenderer.invoke('bounce:deleteForEveryone', target, targetType),
+  mayDeleteForEveryone: (target: string, targetType: number): Promise<boolean> =>
+    ipcRenderer.invoke('bounce:mayDeleteForEveryone', target, targetType),
+
+  sendGroupMessage: (groupId: string, text: string, replyTo?: string): Promise<Message> =>
+    ipcRenderer.invoke('bounce:sendGroupMessage', groupId, text, replyTo),
 
   /**
    * Send a direct message with files attached.
@@ -302,15 +357,29 @@ const api = {
     recipient: string,
     text: string,
     attachments: OutgoingAttachment[],
+    replyTo?: string,
   ): Promise<Message> =>
-    ipcRenderer.invoke('bounce:sendDirectMessageWithAttachments', recipient, text, attachments),
+    ipcRenderer.invoke(
+      'bounce:sendDirectMessageWithAttachments',
+      recipient,
+      text,
+      attachments,
+      replyTo,
+    ),
 
   sendGroupMessageWithAttachments: (
     groupId: string,
     text: string,
     attachments: OutgoingAttachment[],
+    replyTo?: string,
   ): Promise<Message> =>
-    ipcRenderer.invoke('bounce:sendGroupMessageWithAttachments', groupId, text, attachments),
+    ipcRenderer.invoke(
+      'bounce:sendGroupMessageWithAttachments',
+      groupId,
+      text,
+      attachments,
+      replyTo,
+    ),
 
   /**
    * Where a chosen file lives on disk, or '' if it has no path.

@@ -315,10 +315,15 @@ impl BounceNode {
 
     /// Send a direct message, returning the stored message as JSON.
     #[napi]
-    pub async fn send_direct_message(&self, recipient: String, text: String) -> Result<String> {
+    pub async fn send_direct_message(
+        &self,
+        recipient: String,
+        text: String,
+        reply_to: Option<String>,
+    ) -> Result<String> {
         let recipient = parse_uuid(&recipient)?;
         let message = Arc::clone(&self.engine)
-            .send_direct_message(recipient, &text)
+            .send_direct_message(recipient, &text, parse_optional_uuid(reply_to)?)
             .await
             .map_err(to_napi_error)?;
         serde_json::to_string(&message).map_err(to_napi_error)
@@ -326,10 +331,15 @@ impl BounceNode {
 
     /// Send a group message, returning the stored message as JSON.
     #[napi]
-    pub async fn send_group_message(&self, group_id: String, text: String) -> Result<String> {
+    pub async fn send_group_message(
+        &self,
+        group_id: String,
+        text: String,
+        reply_to: Option<String>,
+    ) -> Result<String> {
         let group_id = parse_uuid(&group_id)?;
         let message = Arc::clone(&self.engine)
-            .send_group_message(group_id, &text)
+            .send_group_message(group_id, &text, parse_optional_uuid(reply_to)?)
             .await
             .map_err(to_napi_error)?;
         serde_json::to_string(&message).map_err(to_napi_error)
@@ -346,10 +356,16 @@ impl BounceNode {
         recipient: String,
         text: String,
         attachments: Vec<Attachment>,
+        reply_to: Option<String>,
     ) -> Result<String> {
         let recipient = parse_uuid(&recipient)?;
         let message = Arc::clone(&self.engine)
-            .send_direct_message_with_attachments(recipient, &text, convert(attachments))
+            .send_direct_message_with_attachments(
+                recipient,
+                &text,
+                convert(attachments),
+                parse_optional_uuid(reply_to)?,
+            )
             .await
             .map_err(to_napi_error)?;
         serde_json::to_string(&message).map_err(to_napi_error)
@@ -362,13 +378,82 @@ impl BounceNode {
         group_id: String,
         text: String,
         attachments: Vec<Attachment>,
+        reply_to: Option<String>,
     ) -> Result<String> {
         let group_id = parse_uuid(&group_id)?;
         let message = Arc::clone(&self.engine)
-            .send_group_message_with_attachments(group_id, &text, convert(attachments))
+            .send_group_message_with_attachments(
+                group_id,
+                &text,
+                convert(attachments),
+                parse_optional_uuid(reply_to)?,
+            )
             .await
             .map_err(to_napi_error)?;
         serde_json::to_string(&message).map_err(to_napi_error)
+    }
+
+    // -- reactions, replies, deletion ----------------------------------------
+
+    /// React to a message with a single emoji, replacing any earlier reaction.
+    ///
+    /// `targetType` is the frame type of the message: 0 for a direct message,
+    /// 1 for a group message. The caller already knows which thread it is in,
+    /// so asking is cheaper than a lookup on this side.
+    #[napi]
+    pub async fn react(&self, target: String, target_type: u16, emoji: String) -> Result<()> {
+        let target = parse_uuid(&target)?;
+        let target_type = FrameType::from_u16(target_type).map_err(to_napi_error)?;
+        Arc::clone(&self.engine)
+            .react(target, target_type, &emoji)
+            .await
+            .map_err(to_napi_error)
+    }
+
+    /// Withdraw our reaction to a message.
+    #[napi]
+    pub async fn remove_reaction(&self, target: String, target_type: u16) -> Result<()> {
+        let target = parse_uuid(&target)?;
+        let target_type = FrameType::from_u16(target_type).map_err(to_napi_error)?;
+        Arc::clone(&self.engine)
+            .remove_reaction(target, target_type)
+            .await
+            .map_err(to_napi_error)
+    }
+
+    /// Remove a message from this device only. Nothing is sent.
+    #[napi]
+    pub fn delete_for_me(&self, target: String, target_type: u16) -> Result<()> {
+        let target = parse_uuid(&target)?;
+        let target_type = FrameType::from_u16(target_type).map_err(to_napi_error)?;
+        self.engine
+            .delete_for_me(target, target_type)
+            .map_err(to_napi_error)
+    }
+
+    /// Withdraw a message from everybody who received it.
+    #[napi]
+    pub async fn delete_for_everyone(&self, target: String, target_type: u16) -> Result<()> {
+        let target = parse_uuid(&target)?;
+        let target_type = FrameType::from_u16(target_type).map_err(to_napi_error)?;
+        Arc::clone(&self.engine)
+            .delete_for_everyone(target, target_type)
+            .await
+            .map_err(to_napi_error)
+    }
+
+    /// Whether "delete for everyone" is available for a message right now.
+    ///
+    /// Asked so the menu can omit the item rather than offer it and fail. The
+    /// answer changes with the clock — the window closes a day after the
+    /// message was written — so it is not cacheable.
+    #[napi]
+    pub fn may_delete_for_everyone(&self, target: String, target_type: u16) -> Result<bool> {
+        let target = parse_uuid(&target)?;
+        let target_type = FrameType::from_u16(target_type).map_err(to_napi_error)?;
+        self.engine
+            .may_delete_for_everyone(target, target_type)
+            .map_err(to_napi_error)
     }
 
     /// Everything known about what happened to one message.
@@ -987,6 +1072,18 @@ impl std::io::Write for LogSink {
 fn parse_uuid(value: &str) -> Result<uuid::Uuid> {
     uuid::Uuid::parse_str(value)
         .map_err(|error| Error::new(Status::InvalidArg, format!("invalid UUID: {error}")))
+}
+
+/// An optional UUID from the renderer, where absent and empty both mean none.
+///
+/// The renderer sends `undefined` for "not a reply", but an empty string is
+/// what a form field produces when it has been cleared, and treating that as a
+/// parse failure would turn a cleared reply box into an error dialog.
+fn parse_optional_uuid(value: Option<String>) -> Result<Option<uuid::Uuid>> {
+    match value.as_deref().map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(value) => parse_uuid(value).map(Some),
+    }
 }
 
 fn to_napi_error<E: std::fmt::Display>(error: E) -> Error {

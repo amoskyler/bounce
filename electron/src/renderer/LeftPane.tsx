@@ -51,23 +51,50 @@ export function LeftPane({
   return (
     <div className="left-pane" style={{ width: resize.width }}>
       <div className="left-pane__header">
-        {/* The avatar opens settings, the way the profile button does in
-            Signal — it is the one thing in the header that is about you. */}
-        {state.profile && (
-          <button
-            className="left-pane__profile"
-            onClick={onOpenSettings}
-            title="Settings"
-            aria-label="Settings"
-          >
-            <Avatar
-              id={state.profile.id}
-              name={state.profile.name}
-              images={state.profile.images}
-              size={28}
-            />
-          </button>
-        )}
+        {/*
+          Two rows, not one.
+          
+          A profile button, a search field and three actions on a single line
+          leaves the search box squeezed between two fixed-width clusters — it
+          was the only thing that could give, so it gave on every pane width.
+          Signal splits them: identity and actions above, search across the full
+          width below.
+        */}
+        <div className="left-pane__header-top">
+          {/* The avatar opens settings, the way the profile button does in
+              Signal — it is the one thing in the header that is about you. */}
+          {state.profile && (
+            <button
+              className="left-pane__profile"
+              onClick={onOpenSettings}
+              title="Settings"
+              aria-label="Settings"
+            >
+              <Avatar
+                id={state.profile.id}
+                name={state.profile.name}
+                images={state.profile.images}
+                size={32}
+              />
+            </button>
+          )}
+
+          <div className="left-pane__actions">
+            <button className="icon-button" onClick={onNewGroup} title="New group">
+              <NewGroupIcon />
+            </button>
+            {/* The compose button opens the contact store, the way Go's menu
+                reaches `showNewDM` (`ui/menu.go:71`) — starting a conversation
+                is picking somebody you already know, and adding somebody new is
+                a step inside that. */}
+            <button className="icon-button" onClick={onBrowseContacts} title="New conversation">
+              <ComposeIcon />
+            </button>
+            <button className="icon-button" onClick={onOpenSettings} title="Settings">
+              <SettingsIcon />
+            </button>
+          </div>
+        </div>
 
         <label className="left-pane__search">
           <SearchIcon />
@@ -79,22 +106,6 @@ export function LeftPane({
             aria-label="Search conversations"
           />
         </label>
-
-        <div className="left-pane__actions">
-          {/* The compose button opens the contact store, the way Go's menu
-              reaches `showNewDM` (`ui/menu.go:71`) — starting a conversation
-              is picking somebody you already know, and adding somebody new is
-              a step inside that. */}
-          <button className="icon-button" onClick={onBrowseContacts} title="New conversation">
-            <ComposeIcon />
-          </button>
-          <button className="icon-button" onClick={onNewGroup} title="New group">
-            <NewGroupIcon />
-          </button>
-          <button className="icon-button" onClick={onOpenSettings} title="Settings">
-            <SettingsIcon />
-          </button>
-        </div>
       </div>
 
       <div className="left-pane__list" role="list">
@@ -253,11 +264,16 @@ function ConversationRow({ conversation, state, selected, onSelect }: RowProps) 
 
   const preview = draft
     ? draft
-    : latest
-      ? snippet(latest.text, latest.attachments.length)
-      : conversation.invitationPending
-        ? 'You have been invited to this group'
-        : '';
+    : // A tombstone has no text and no attachments, so the ordinary snippet is
+      // empty — and a row showing a name, a time and nothing else reads as a
+      // rendering fault rather than as a message somebody withdrew.
+      latest?.deletedAt
+      ? 'This message was deleted'
+      : latest
+        ? snippet(latest.text, latest.attachments.length)
+        : conversation.invitationPending
+          ? 'You have been invited to this group'
+          : '';
 
   const className = [
     'conversation-row',
@@ -296,11 +312,13 @@ function ConversationRow({ conversation, state, selected, onSelect }: RowProps) 
 
         <div className="conversation-row__bottom">
           <span
-            className={
-              draft
-                ? 'conversation-row__snippet conversation-row__snippet--draft'
-                : 'conversation-row__snippet'
-            }
+            className={[
+              'conversation-row__snippet',
+              draft && 'conversation-row__snippet--draft',
+              !draft && latest?.deletedAt && 'conversation-row__snippet--deleted',
+            ]
+              .filter(Boolean)
+              .join(' ')}
           >
             {preview}
           </span>

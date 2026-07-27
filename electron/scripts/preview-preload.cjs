@@ -119,6 +119,9 @@ function message(id, thread, author, text, writtenAt, overrides = {}) {
     readBy: [],
     attachments: [],
     outgoing: author === me,
+    reactions: [],
+    deletedAt: 0,
+    deletedByAdmin: false,
     ...overrides,
   };
 }
@@ -203,7 +206,26 @@ const state = {
       deliveredTo: [grace, alan],
       readBy: [grace],
     }),
-    message('g4', bookClub, ada, 'I will bring the second volume.', now - 40 * 60),
+    message('g4', bookClub, ada, 'I will bring the second volume.', now - 40 * 60, {
+      reactions: [
+        { emoji: '\u2764\ufe0f', users: [me, grace], mine: true },
+        { emoji: '\ud83d\udc4d', users: [alan], mine: false },
+      ],
+    }),
+    message('g5', bookClub, me, 'Perfect \u2014 see you Tuesday.', now - 35 * 60, {
+      deliveredTo: [grace, alan],
+      quote: {
+        target: 'g4',
+        author: ada,
+        text: 'I will bring the second volume.',
+        kind: 'text',
+        expired: false,
+      },
+    }),
+    message('g6', bookClub, grace, '', now - 30 * 60, {
+      deletedAt: now - 29 * 60,
+      deletedBy: grace,
+    }),
 
     // Sidebar rows: an unread run, a delivered outgoing last message, and a
     // preview long enough to need the second line.
@@ -322,6 +344,11 @@ if (bulk > 0) {
 }
 
 const listeners = [];
+
+/** Push an engine event at the renderer, as the real bridge does. */
+function emit(event) {
+  for (const listener of listeners) listener(event);
+}
 const slowCalls = new Map();
 let lastSend = null;
 
@@ -349,6 +376,27 @@ const api = {
     'bounce:df7wwi7bnsctfrvlza4pvtk6u6e34ddwwkjagnadtp5iwpjwrvq5bpad:0f8a1c3d5e7b9a2c4d6e8f0a1b2c3d4e',
   requestToAddUser: async () => undefined,
   markAsRead: async () => undefined,
+
+  /*
+   * Reacting and deleting, backed by the same event stream the engine uses.
+   *
+   * Without these the preview cannot exercise the reaction path at all — the
+   * stub is what every screenshot runs against, so a control that is only wired
+   * in the real app is a control no capture has ever pressed.
+   */
+  react: async (target, _targetType, emoji) => {
+    emit({ type: 'messageReacted', messageId: target, userId: me, emoji });
+  },
+  removeReaction: async (target) => {
+    emit({ type: 'messageReacted', messageId: target, userId: me, emoji: '' });
+  },
+  deleteForMe: async (target) => {
+    emit({ type: 'messageDeleted', messageId: target });
+  },
+  deleteForEveryone: async (target) => {
+    emit({ type: 'messageWithdrawn', messageId: target, by: me, admin: false });
+  },
+  mayDeleteForEveryone: async () => true,
   /*
    * A 4:3 PNG, so an image row is drawn at its real height rather than
    * collapsing to a broken frame.
@@ -459,7 +507,5 @@ contextBridge.exposeInMainWorld('bouncePreview', {
   /** What the composer last tried to send. */
   lastSend: () => lastSend,
   /** Push an engine event at the renderer, as the real bridge would. */
-  emit: (event) => {
-    for (const listener of listeners) listener(event);
-  },
+  emit,
 });
