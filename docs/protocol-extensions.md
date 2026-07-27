@@ -2,6 +2,12 @@
 
 **For the maintainers of the Go implementation (`chat/`, `ui/`, `fyne/`, `android/`).**
 
+> **Draft, not yet sent.** One decision is still open on our side — whether we
+> gate sending on an advertised capability. If we do not, delete item 1 under
+> [What we are doing on our side](#what-we-are-doing-on-our-side-in-the-meantime),
+> and part one stops being belt-and-braces and becomes a prerequisite. Remove
+> this note before sending.
+
 This document has two halves and they can be acted on independently.
 
 - **[Part one](#part-one-the-compatibility-request)** asks for a small change so
@@ -31,6 +37,14 @@ document entirely.
 
 Reactions and deletion are different, because both refer to a message that has
 already been sent and neither can ride it. They need frame types of their own.
+
+Worth saying plainly: **two of these three are already on your roadmap.**
+`docs/next_steps.md` lists emoji reactions and replies at the top of "New
+Features". So this is not a request to carry someone else's design — it is an
+offer of a specification for work you had already planned, arrived at early
+because the Electron client reached that part of the interface first. If any of
+it is wrong for where you want to take the protocol, we would rather change ours
+than have two.
 
 ---
 
