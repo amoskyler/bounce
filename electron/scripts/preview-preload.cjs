@@ -17,6 +17,9 @@ const me = '00000000-0000-4000-8000-000000000001';
 const ada = '00000000-0000-4000-8000-000000000002';
 const grace = '00000000-0000-4000-8000-000000000003';
 const alan = '00000000-0000-4000-8000-000000000004';
+const katherine = '00000000-0000-4000-8000-000000000005';
+const barbara = '00000000-0000-4000-8000-000000000006';
+const edsger = '00000000-0000-4000-8000-000000000007';
 const bookClub = '00000000-0000-4000-8000-000000000010';
 
 function user(id, name, overrides = {}) {
@@ -31,6 +34,10 @@ function user(id, name, overrides = {}) {
     lastActivity: now,
     mutedUntil: 0,
     online: false,
+    // Without this the sidebar filters every contact out — `conversations()`
+    // treats the flag as the whole answer — and a preview of the left pane
+    // shows two rows however many people the fixture defines.
+    openDm: true,
     ...overrides,
   };
 }
@@ -136,6 +143,16 @@ const state = {
     user(ada, 'Ada Lovelace', { online: true, lastActivity: now - 120 }),
     user(grace, 'Grace Hopper', { lastActivity: now - 5 * HOUR }),
     user(alan, 'Alan Turing', { lastActivity: now - 30 * HOUR }),
+    // A muted thread, a name long enough to truncate, and somebody with no
+    // history at all — the three row shapes the ordinary fixtures never reach.
+    user(katherine, 'Katherine Johnson', {
+      lastActivity: now - 8 * HOUR,
+      mutedUntil: now + 30 * 24 * HOUR,
+    }),
+    user(barbara, 'Barbara Liskov (Substitution Principle)', {
+      lastActivity: now - 3 * 24 * HOUR,
+    }),
+    user(edsger, 'Edsger Dijkstra', { lastActivity: now - 9 * 24 * HOUR }),
   ],
   groups: [
     {
@@ -187,6 +204,37 @@ const state = {
       readBy: [grace],
     }),
     message('g4', bookClub, ada, 'I will bring the second volume.', now - 40 * 60),
+
+    // Sidebar rows: an unread run, a delivered outgoing last message, and a
+    // preview long enough to need the second line.
+    message('k1', katherine, katherine, 'Numbers check out.', now - 8 * HOUR, { seen: false }),
+    message('k2', katherine, katherine, 'Running it once more to be sure.', now - 8 * HOUR + 60, {
+      seen: false,
+    }),
+    message(
+      'b1',
+      barbara,
+      me,
+      'The substitution rule only bites when the subtype narrows a precondition — which is exactly what happened here.',
+      now - 3 * 24 * HOUR,
+      { deliveredTo: [barbara] },
+    ),
+
+    // Every reachable delivery state at once, so one capture shows the ladder
+    // rather than whichever rungs the ordinary fixtures happen to hit. `sent`
+    // is missing because it is genuinely unreachable — it needs an encrypted
+    // device to acknowledge — and faking a field for it would make the capture
+    // a picture of the fixture rather than of the app.
+    ...(process.env.BOUNCE_PREVIEW_TICKS === '1'
+      ? [
+          ['Sending — nobody has acknowledged it yet.', {}],
+          ['Delivered — their own device has it.', { deliveredTo: [grace] }],
+          ['Read — and they have looked at it.', { deliveredTo: [grace], readBy: [grace] }],
+          ['Not delivered — given up on.', { undeliverable: true }],
+        ].map(([text, overrides], index) =>
+          message(`k${index}`, bookClub, me, text, now - 30 + index, overrides),
+        )
+      : []),
 
     // Disappearing messages at several points around the dial, so a capture
     // shows the whole sweep at once rather than one frame of it.

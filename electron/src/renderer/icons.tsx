@@ -11,6 +11,7 @@
 
 import * as React from 'react';
 
+import { DELIVERY_LABELS, type DeliveryState } from './delivery';
 import { encodeQr } from './qrcode';
 
 type IconProps = {
@@ -156,42 +157,187 @@ export function EmojiIcon({ size = 20, className }: IconProps) {
   );
 }
 
-/** Outgoing status: queued, not yet written to any peer. */
-export function SendingIcon({ size = 12, className }: IconProps) {
+/* --------------------------------------------------------------------------
+ * Delivery status
+ *
+ * These four are the only icons drawn on a 12-unit grid rather than the 20-unit
+ * one above, because that is the grid Signal draws them on and the geometry is
+ * unusually tight: a 1.1px ring on a 5.45 radius, with a check whose arms are
+ * placed to sit optically centred rather than geometrically. Rounding those
+ * numbers onto the shared grid is visible at 12px.
+ *
+ * Signal ships them as filled paths produced by a boolean subtraction. Redrawn
+ * here as rings and strokes so the pair glyphs can be composed from the single
+ * one and nothing has to be kept in sync by hand.
+ * -------------------------------------------------------------------------- */
+
+/** The ring's radius and weight, shared by every state. */
+const TICK_RADIUS = 5.45;
+const TICK_STROKE = 1.1;
+
+/** The check inside one dial, as a centreline through three points. */
+const TICK_CHECK = 'M3.75 6.25 5.25 8.25 8 4';
+
+/**
+ * The filled dial is drawn a little smaller than the outlined one.
+ *
+ * Signal's is 5.75 against the ring's 6.0 outer edge. Solid shapes read heavier
+ * than outlines at the same diameter, and matching them numerically makes the
+ * read pair look like it grew.
+ */
+const TICK_FILLED_RADIUS = 5.75;
+
+/**
+ * How much of the left dial the right one eats.
+ *
+ * Both are the dial's own radius plus a one-unit gap — 6.0 + 1 for the ring,
+ * 5.75 + 1 for the disc — which is what separates the two shapes instead of
+ * letting them touch. Recovered from the endpoints of Signal's own arcs; they
+ * ship the subtraction already applied, so the numbers are not written down
+ * anywhere in their source either.
+ */
+const TICK_BITE_OUTLINE = 7;
+const TICK_BITE_FILLED = 6.75;
+
+/** A mask id that is safe to interpolate into `url(#…)`. */
+function useMaskId(): string {
+  return `tick-${React.useId().replace(/:/g, '')}`;
+}
+
+function tickProps(size: number, width: number) {
+  return {
+    width: (size * width) / 12,
+    height: size,
+    viewBox: `0 0 ${width} 12`,
+    fill: 'none',
+    stroke: 'currentColor',
+    strokeWidth: TICK_STROKE,
+    strokeLinecap: 'round' as const,
+    strokeLinejoin: 'round' as const,
+    'aria-hidden': true,
+  };
+}
+
+/** One dial: a ring with a check in it, centred on `cx`. */
+function TickDial({ cx }: { cx: number }) {
   return (
-    <svg {...svgProps(size)} className={className} strokeWidth={1.6}>
-      <circle cx="10" cy="10" r="7.6" />
-      <path d="M10 5.8V10l2.8 1.7" />
-    </svg>
+    <g transform={`translate(${cx - 6} 0)`}>
+      <circle cx="6" cy="6" r={TICK_RADIUS} />
+      <path d={TICK_CHECK} />
+    </g>
   );
 }
 
-/** Outgoing status: written to at least one peer. */
-export function SentIcon({ size = 12, className }: IconProps) {
+/**
+ * Outgoing status: queued, not yet acknowledged by anybody.
+ *
+ * A dashed ring that turns. Twelve dashes at this radius come out at 2.85 units
+ * of arc each, so the dash and gap below divide that; drawing it as one dashed
+ * circle rather than twelve arcs is what lets the rotation be a single
+ * transform on a single element.
+ */
+export function SendingIcon({ size = 12, className }: IconProps) {
+  const step = (2 * Math.PI * TICK_RADIUS) / 12;
+  // The round caps add a stroke-width to each dash on top of this, which is
+  // most of what is visible: the drawn centreline is barely longer than a point.
+  const dash = 0.42;
+
   return (
-    <svg {...svgProps(size)} className={className} strokeWidth={2}>
-      <path d="M3.6 10.6 7.7 14.6 16.4 5.6" />
+    <svg {...tickProps(size, 12)} className={`tick-spin${className ? ` ${className}` : ''}`}>
+      <circle cx="6" cy="6" r={TICK_RADIUS} strokeDasharray={`${dash} ${step - dash}`} />
     </svg>
   );
 }
 
 /**
- * Outgoing status: acknowledged by a recipient's device (double tick), or read
- * by the recipient — read uses the same glyph in a brighter colour, which is
- * how Signal distinguishes them.
+ * Outgoing status: held by a device of the recipient's that is not their
+ * client — an encrypted storage device.
+ *
+ * Unreachable until encrypted devices land (P24). It exists now because it is
+ * the state the glyph set is *for*: one dial means somebody has the bytes, two
+ * means the person does. Leaving the middle rung out and adding it later would
+ * silently change what a single check had meant.
  */
-export function DeliveredIcon({ size = 12, className }: IconProps) {
+export function SentIcon({ size = 12, className }: IconProps) {
   return (
-    <svg
-      {...svgProps(size)}
-      className={className}
-      viewBox="0 0 26 20"
-      width={(size * 26) / 20}
-      height={size}
-      strokeWidth={2}
-    >
-      <path d="M2.6 10.6 6.7 14.6 15.4 5.6" />
-      <path d="M10.6 14.2 11.7 15.4 20.4 6.4" />
+    <svg {...tickProps(size, 12)} className={className}>
+      <TickDial cx={6} />
+    </svg>
+  );
+}
+
+/**
+ * Where the right dial's bite crosses the left dial's ring.
+ *
+ * Standard two-circle intersection, with the centres six apart on the same
+ * line. Computed rather than written down because the three radii above are the
+ * numbers worth being able to change, and hand-solving this again each time is
+ * how a ring ends up not quite meeting its own crescent.
+ */
+function biteCrossing(radius: number, bite: number): { x: number; y: number } {
+  const separation = 6;
+  const x = (separation ** 2 - bite ** 2 + radius ** 2) / (2 * separation);
+  return { x: 6 + x, y: Math.sqrt(Math.max(0, radius ** 2 - x ** 2)) };
+}
+
+/** Outgoing status: acknowledged by a recipient's own device. */
+export function DeliveredIcon({ size = 12, className }: IconProps) {
+  // An arc rather than a masked circle. A mask here would inherit this svg's
+  // stroke onto its own children and leak a faint ghost of the whole ring —
+  // and the arc is what Signal ships anyway, with the subtraction pre-applied.
+  const cut = biteCrossing(TICK_RADIUS, TICK_BITE_OUTLINE);
+
+  return (
+    <svg {...tickProps(size, 18)} className={className}>
+      {/* The crescent: from the upper crossing, anticlockwise round the far
+          side, to the lower one. */}
+      <path
+        d={`M${cut.x} ${6 - cut.y}A${TICK_RADIUS} ${TICK_RADIUS} 0 1 0 ${cut.x} ${6 + cut.y}`}
+      />
+      {/* All that survives of the left check is its short arm. */}
+      <path d="M3.75 6.25 5.25 8.25" />
+      <TickDial cx={12} />
+    </svg>
+  );
+}
+
+/**
+ * Outgoing status: read.
+ *
+ * The same pair, filled. Signal's one departure from stroking: the check is
+ * knocked *out* of the disc rather than drawn on it, so it reads at 12px where
+ * a light-on-dark stroke would close up.
+ */
+export function ReadIcon({ size = 12, className }: IconProps) {
+  const maskId = useMaskId();
+
+  // A mask per disc, not one for the pair: the bite belongs to the left disc
+  // alone, and a shared mask would take the same crescent out of the right one.
+  // Every child spells out its own paint. Mask content inherits from the svg it
+  // is declared in, and an inherited stroke on the white rect would put a rim of
+  // partial luminance around the whole glyph.
+  const knockout = (check: string, bite: boolean) => (
+    <>
+      <rect width="18" height="12" fill="#fff" stroke="none" />
+      {bite && <circle cx="12" cy="6" r={TICK_BITE_FILLED} fill="#000" stroke="none" />}
+      <path
+        d={TICK_CHECK}
+        transform={check}
+        stroke="#000"
+        strokeWidth={TICK_STROKE}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        fill="none"
+      />
+    </>
+  );
+
+  return (
+    <svg {...tickProps(size, 18)} className={className} fill="currentColor" stroke="none">
+      <mask id={`${maskId}-l`}>{knockout('translate(0 0)', true)}</mask>
+      <mask id={`${maskId}-r`}>{knockout('translate(6 0)', false)}</mask>
+      <circle cx="6" cy="6" r={TICK_FILLED_RADIUS} mask={`url(#${maskId}-l)`} />
+      <circle cx="12" cy="6" r={TICK_FILLED_RADIUS} mask={`url(#${maskId}-r)`} />
     </svg>
   );
 }
@@ -199,11 +345,51 @@ export function DeliveredIcon({ size = 12, className }: IconProps) {
 /** Outgoing status: delivery abandoned. */
 export function UndeliverableIcon({ size = 12, className }: IconProps) {
   return (
-    <svg {...svgProps(size)} className={className} strokeWidth={1.8}>
-      <circle cx="10" cy="10" r="7.6" />
-      <path d="M10 6.2v4.6" />
-      <circle cx="10" cy="13.9" r="0.95" fill="currentColor" strokeWidth={0} />
+    <svg {...tickProps(size, 12)} className={className}>
+      <circle cx="6" cy="6" r={TICK_RADIUS} />
+      <path d="M6 3.4v3" />
+      <circle cx="6" cy="8.6" r="0.62" fill="currentColor" strokeWidth={0} />
     </svg>
+  );
+}
+
+const TICK_GLYPHS: Record<DeliveryState, (props: IconProps) => React.JSX.Element> = {
+  sending: SendingIcon,
+  sent: SentIcon,
+  delivered: DeliveredIcon,
+  read: ReadIcon,
+  undeliverable: UndeliverableIcon,
+};
+
+/**
+ * The tick for one delivery state, wherever it appears.
+ *
+ * The bubble and the sidebar row both show one, and they have to agree — a
+ * message whose row says delivered and whose bubble says sending is worse than
+ * either being wrong on its own. Keeping the mapping in one table is what makes
+ * that impossible rather than merely unlikely.
+ */
+export function DeliveryTick({
+  state,
+  className,
+  size = 12,
+}: {
+  state: DeliveryState;
+  className?: string;
+  size?: number;
+}) {
+  const Glyph = TICK_GLYPHS[state];
+  const label = DELIVERY_LABELS[state];
+
+  return (
+    <span
+      className={`tick tick--${state}${className ? ` ${className}` : ''}`}
+      title={label}
+      aria-label={label}
+      role="img"
+    >
+      <Glyph size={size} />
+    </span>
   );
 }
 

@@ -40,6 +40,8 @@
   /* Geometry. */
   --left-pane-width: 300px;
   --header-height: 52px;
+  /* Must match the `::-webkit-scrollbar` width below. */
+  --scrollbar-width: 9px;
 
   /*
    * macOS only. The window is frameless with inset traffic lights, so the top
@@ -185,6 +187,8 @@ textarea {
 
 /* A thin, unobtrusive scrollbar that only appears over content. */
 ::-webkit-scrollbar {
+  /* Kept in step with `--scrollbar-width`, which the left pane subtracts from
+     its trailing inset so the reserved gutter does not widen the margin. */
   width: 9px;
   height: 9px;
 }
@@ -416,11 +420,21 @@ textarea {
   color: var(--text-tertiary);
 }
 
+/*
+ * The list is inset, and the rows are tiles rather than full-bleed bars.
+ *
+ * `scrollbar-gutter: stable` reserves the track whether or not there is
+ * anything to scroll, so the rows do not jump sideways the first time the list
+ * outgrows the pane. The trailing inset then subtracts the reserved track, so
+ * the tiles keep the same 11px on both sides either way.
+ */
 .left-pane__list {
   flex: 1;
   overflow-y: auto;
   overflow-x: hidden;
-  padding-bottom: 8px;
+  scrollbar-gutter: stable;
+  padding: 2px 11px 8px;
+  padding-inline-end: calc(11px - var(--scrollbar-width));
 }
 
 .left-pane__section-title {
@@ -458,14 +472,24 @@ textarea {
  * Conversation rows
  * -------------------------------------------------------------------------- */
 
+/*
+ * A fixed height, not a padded one.
+ *
+ * Signal pins every row to 72px whatever it holds, which is what gives the list
+ * its rhythm: a conversation with no messages yet is the same size as one with
+ * two lines of preview, so scanning the column is scanning a grid rather than a
+ * ragged stack. Deriving the height from content instead makes the avatar the
+ * floor and every row a slightly different size.
+ */
 .conversation-row {
   display: flex;
   align-items: center;
-  gap: 12px;
   width: 100%;
-  padding: 8px 16px;
+  height: 72px;
+  margin-block: 2px;
+  padding: 8px 14px;
   text-align: left;
-  border-radius: 0;
+  border-radius: 10px;
   transition: background 0.08s ease;
 }
 
@@ -481,19 +505,27 @@ textarea {
 .conversation-row__body {
   flex: 1;
   min-width: 0;
+  margin-inline-start: 12px;
+  /* The two lines are laid out by the row's own height, so they stretch. */
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  overflow: hidden;
 }
 
 .conversation-row__top {
   display: flex;
-  align-items: baseline;
-  gap: 8px;
+  align-items: center;
 }
 
 .conversation-row__name {
   flex: 1;
   min-width: 0;
+  /* Signal's `font-body-1-bold`. */
   font-size: 14px;
-  font-weight: 500;
+  line-height: 20px;
+  letter-spacing: -0.08px;
+  font-weight: 600;
   color: var(--text-primary);
   white-space: nowrap;
   overflow: hidden;
@@ -502,7 +534,11 @@ textarea {
 
 .conversation-row__time {
   flex-shrink: 0;
-  font-size: 12px;
+  margin-inline-start: 6px;
+  /* Signal's `font-caption`. */
+  font-size: 11px;
+  line-height: 14px;
+  letter-spacing: 0.06px;
   color: var(--text-tertiary);
 }
 
@@ -513,23 +549,35 @@ textarea {
 
 .conversation-row__bottom {
   display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 2px;
+  align-items: flex-start;
 }
 
+/*
+ * Two lines, not one.
+ *
+ * The row is tall enough for them and a snippet is usually a sentence, so
+ * clipping at one line throws away the half of it that says what the message
+ * was about. `-webkit-line-clamp` is what puts the ellipsis at the end of the
+ * second line rather than the first.
+ */
 .conversation-row__snippet {
   flex: 1;
   min-width: 0;
+  /* Signal's `font-body-2`. */
   font-size: 13px;
+  line-height: 18px;
+  letter-spacing: -0.03px;
   color: var(--text-secondary);
-  white-space: nowrap;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
 .conversation-row__snippet--draft::before {
   content: 'Draft: ';
+  font-style: italic;
   color: var(--red);
 }
 
@@ -538,17 +586,28 @@ textarea {
   font-weight: 500;
 }
 
+/* The last message's delivery state, when the last message is ours. */
+.conversation-row__status {
+  margin-top: 4px;
+  margin-inline-start: 6px;
+  color: var(--text-tertiary);
+}
+
 .conversation-row__badge {
   flex-shrink: 0;
-  min-width: 20px;
-  height: 20px;
-  padding: 0 6px;
+  align-self: center;
+  min-width: 18px;
+  height: 18px;
+  margin-inline-start: 6px;
+  padding: 0 4px;
   border-radius: 10px;
   background: var(--ultramarine);
   color: #ffffff;
-  font-size: 12px;
-  font-weight: 600;
-  line-height: 20px;
+  /* Signal's `font-caption-bold`, at the weight their unread pill actually uses. */
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.06px;
+  line-height: 18px;
   text-align: center;
 }
 
@@ -833,9 +892,11 @@ textarea {
   float: right;
   margin-left: 12px;
   position: relative;
-  top: 4px;
+  top: 2px;
+  /* Signal's `font-caption`. */
   font-size: 11px;
-  line-height: 11px;
+  line-height: 14px;
+  letter-spacing: 0.06px;
 }
 
 .bubble--incoming .bubble__footer {
@@ -843,20 +904,56 @@ textarea {
 }
 
 .bubble--outgoing .bubble__footer {
-  color: rgba(255, 255, 255, 0.75);
+  color: rgba(255, 255, 255, 0.8);
 }
 
-.bubble__status {
-  display: flex;
+/*
+ * Delivery ticks.
+ *
+ * The single glyph is 12px wide and the pair 18px, so the box always reserves
+ * 18px and the single sits at its leading edge. That is Signal's arrangement —
+ * one check inset from the bubble's edge, two flush with it — and it is why a
+ * message crossing from delivered to read does not shift its own timestamp.
+ */
+.tick {
+  display: inline-flex;
   align-items: center;
+  justify-content: flex-start;
+  flex-shrink: 0;
+  width: 18px;
 }
 
-.bubble__status--read {
-  color: #ffffff;
-}
-
-.bubble__undeliverable {
+.tick--undeliverable {
   color: var(--red);
+}
+
+/*
+ * The pending ring turns once every four seconds, as Signal's does.
+ *
+ * Paused rather than merely offscreen when the window is hidden: a compositor
+ * animation in a background window is still work, and there is nobody to see
+ * the four seconds it skips. `prefers-reduced-motion` stops it outright — the
+ * dashed ring is already distinct from every other tick standing still.
+ */
+@keyframes tick-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.tick-spin {
+  animation: tick-spin 4s linear infinite;
+  transform-origin: 50% 50%;
+}
+
+:root[data-window-hidden='true'] .tick-spin {
+  animation-play-state: paused;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tick-spin {
+    animation: none;
+  }
 }
 
 /* --------------------------------------------------------------------------

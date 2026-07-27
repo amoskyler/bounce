@@ -43,9 +43,10 @@ import {
   searchSlashCommands,
   type SlashCommand,
 } from './slash';
+import { deliveryState } from './delivery';
 import {
   BounceLogo,
-  DeliveredIcon,
+  DeliveryTick,
   DocumentIcon,
   EmojiIcon,
   InfoIcon,
@@ -53,9 +54,6 @@ import {
   MediaIcon,
   MoreIcon,
   PlusIcon,
-  SendingIcon,
-  SentIcon,
-  UndeliverableIcon,
 } from './icons';
 import {
   dateSeparator,
@@ -950,40 +948,11 @@ function MessageMenu({
 /**
  * The tick marks on an outgoing message.
  *
- * Bounce establishes delivery only from acknowledgements, so these four states
- * are the whole truth about a message: queued, written to somebody, confirmed
- * by a recipient's device, or given up on.
+ * Which glyph goes with which state is `DeliveryTick`'s business, shared with
+ * the sidebar so the same message never gets two different answers.
  */
 function DeliveryStatus({ message }: { message: Message }) {
-  if (message.undeliverable) {
-    return (
-      <span className="bubble__status bubble__undeliverable" title="Not delivered">
-        <UndeliverableIcon />
-      </span>
-    );
-  }
-
-  if (message.readBy.length > 0) {
-    return (
-      <span className="bubble__status bubble__status--read" title="Read">
-        <DeliveredIcon />
-      </span>
-    );
-  }
-
-  if (message.deliveredTo.length > 0) {
-    return (
-      <span className="bubble__status" title="Delivered">
-        <SentIcon />
-      </span>
-    );
-  }
-
-  return (
-    <span className="bubble__status" title="Sending">
-      <SendingIcon />
-    </span>
-  );
+  return <DeliveryTick state={deliveryState(message)} className="bubble__status" />;
 }
 
 function InvitationActions({

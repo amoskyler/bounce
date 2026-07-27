@@ -158,6 +158,23 @@ export function App() {
     };
   }, []);
 
+  /*
+   * Publish the window's visibility so CSS can stand animations down.
+   *
+   * Only the pending-delivery ring uses it today. It is an attribute rather
+   * than React state deliberately: a hidden window flipping a state flag would
+   * re-render the whole tree to pause an animation nobody is watching.
+   */
+  React.useEffect(() => {
+    const apply = () => {
+      document.documentElement.dataset.windowHidden = String(document.hidden);
+    };
+    apply();
+
+    document.addEventListener('visibilitychange', apply);
+    return () => document.removeEventListener('visibilitychange', apply);
+  }, []);
+
   // The platform class drives the title bar inset on macOS.
   React.useEffect(() => {
     document.body.classList.add(`platform-${window.bounce.platform}`);

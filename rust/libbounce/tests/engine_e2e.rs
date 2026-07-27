@@ -988,6 +988,93 @@ async fn reading_a_message_tells_its_author() {
 }
 
 #[tokio::test]
+async fn a_delivered_message_is_still_delivered_after_a_restart() {
+    // `MessageDelivered` fires once, when the acknowledgement lands. A client
+    // that rebuilds its timeline from `initial_state` has no way to hear it
+    // again, so a view that reported nobody left every delivered-but-unread
+    // message showing the pending tick from the next launch onwards — and
+    // permanently, since the event never repeats.
+    let directory = Arc::new(StaticDirectory::new());
+    let mut alice = start("Alice", Arc::clone(&directory)).await;
+    let mut bob = start("Bob", Arc::clone(&directory)).await;
+
+    introduce(&alice, &bob);
+    Arc::clone(&alice.engine).connect(&bob.address).await.unwrap();
+
+    let sent = alice
+        .engine
+        .send_direct_message(bob.user.id, "did this land?")
+        .await
+        .unwrap();
+
+    wait_for(&mut bob.events, "Bob to receive the message", |event| match event {
+        Event::MessageReceived { message } => Some(message.clone()),
+        _ => None,
+    })
+    .await;
+
+    wait_for(&mut alice.events, "the acknowledgement", |event| match event {
+        Event::MessageDelivered { message_id, .. } if *message_id == sent.id => Some(()),
+        _ => None,
+    })
+    .await;
+
+    // Deliberately not read: this is the rung between sending and read, and it
+    // is the only one that depends on the delivery record surviving.
+    assert!(alice.store.readers_of(sent.id).unwrap().is_empty());
+
+    let state = alice.engine.initial_state().expect("builds initial state");
+    let view = state
+        .messages
+        .iter()
+        .find(|message| message.id == sent.id)
+        .expect("the message is in the snapshot");
+
+    assert_eq!(view.delivered_to, vec![bob.user.id]);
+    assert!(view.read_by.is_empty());
+}
+
+#[tokio::test]
+async fn delivery_to_our_own_devices_does_not_tick_a_message_off() {
+    // A sync-scoped copy landing on another of our own devices is the same
+    // person twice. Counting it would show delivered before the message had
+    // left the profile — and a note to self, which never leaves at all, would
+    // report itself delivered.
+    let directory = Arc::new(StaticDirectory::new());
+    let alice = start("Alice", Arc::clone(&directory)).await;
+
+    let sent = alice
+        .engine
+        .send_direct_message(alice.user.id, "remember this")
+        .await
+        .unwrap();
+
+    // Stand in for a second device of Alice's acknowledging the frame.
+    alice
+        .store
+        .record_delivery(&libbounce::frames::transport::DeliveryRecord::new(
+            alice.address.clone(),
+            sent.id,
+            libbounce::types::FrameType::DirectMessage,
+            libbounce::now(),
+        ))
+        .expect("records the delivery");
+
+    let state = alice.engine.initial_state().expect("builds initial state");
+    let view = state
+        .messages
+        .iter()
+        .find(|message| message.id == sent.id)
+        .expect("the message is in the snapshot");
+
+    assert!(
+        view.delivered_to.is_empty(),
+        "our own device is not a recipient: {:?}",
+        view.delivered_to,
+    );
+}
+
+#[tokio::test]
 async fn a_receipt_that_arrives_before_its_message_is_resolved_later() {
     // Receipts and messages are independent frames, so on a catch up the
     // receipt can land first. It must not be discarded.

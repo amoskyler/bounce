@@ -3705,12 +3705,28 @@ impl<N: Network + 'static> Engine<N> {
             expires_at: message.delete_at,
             seen: message.seen,
             undeliverable: message.undeliverable,
-            delivered_to: Vec::new(),
+            delivered_to: self.recipients_reached(message.id, message.author),
             read_by: self.store.readers_of(message.id).unwrap_or_default(),
             attachments: self
                 .attachment_views(&message.image_attachments, &message.file_attachments),
             outgoing: message.author == my_id,
         })
+    }
+
+    /// Who, other than the author, has a device holding this frame.
+    ///
+    /// The author is dropped because a sync-scoped copy landing on the sender's
+    /// own second device is not delivery — it is the same person twice, and
+    /// counting it would tick a message off before it had left the profile.
+    ///
+    /// A view built before this existed reported nobody, which meant an
+    /// outgoing message that had been delivered but not read fell back to the
+    /// pending tick on every restart, and stayed there: `messageDelivered`
+    /// fires once, when the acknowledgement arrives, and never again.
+    fn recipients_reached(&self, frame_id: Uuid, author: Uuid) -> Vec<Uuid> {
+        let mut reached = self.store.deliverers_of(frame_id).unwrap_or_default();
+        reached.retain(|user| *user != author);
+        reached
     }
 
     fn group_message_view(&self, message: &GroupMessage, my_id: Option<Uuid>) -> Result<MessageView> {
@@ -3723,7 +3739,7 @@ impl<N: Network + 'static> Engine<N> {
             expires_at: message.delete_at,
             seen: message.seen,
             undeliverable: message.undeliverable,
-            delivered_to: Vec::new(),
+            delivered_to: self.recipients_reached(message.id, message.author),
             read_by: self.store.readers_of(message.id).unwrap_or_default(),
             attachments: self
                 .attachment_views(&message.image_attachments, &message.file_attachments),

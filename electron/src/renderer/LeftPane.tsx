@@ -5,7 +5,14 @@
 import * as React from 'react';
 
 import { Avatar } from './Avatar';
-import { ComposeIcon, NewGroupIcon, SearchIcon, SettingsIcon } from './icons';
+import { deliveryState } from './delivery';
+import {
+  ComposeIcon,
+  DeliveryTick,
+  NewGroupIcon,
+  SearchIcon,
+  SettingsIcon,
+} from './icons';
 import { conversationTimestamp, snippet } from './format';
 import {
   clampLeftPaneWidth,
@@ -297,6 +304,15 @@ function ConversationRow({ conversation, state, selected, onSelect }: RowProps) 
           >
             {preview}
           </span>
+          {/* Signal puts the tick here too, so the list answers "did that
+              send?" without opening the thread. Only when the newest message
+              is ours and is not being displaced by a draft. */}
+          {!draft && latest?.outgoing && (
+            <DeliveryTick
+              state={deliveryState(latest)}
+              className="conversation-row__status"
+            />
+          )}
           {unreadCount > 0 && !selected && (
             <span className="conversation-row__badge">
               {unreadCount > 99 ? '99+' : unreadCount}

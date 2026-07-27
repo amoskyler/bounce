@@ -1204,6 +1204,33 @@ impl Store {
         })
     }
 
+    /// The users with at least one device that acknowledged a frame.
+    ///
+    /// The tick-mark counterpart to [`Self::delivery_times_for`], which the
+    /// info panel uses: this one only has to answer "anybody?", so it folds
+    /// devices into people in SQL rather than making the caller do it.
+    ///
+    /// One statement per message, matching [`Self::readers_of`] next door. That
+    /// is a query per row when the timeline is first built; if either becomes a
+    /// cost, both want batching into one grouped query at the same time.
+    pub fn deliverers_of(&self, frame_id: Uuid) -> Result<Vec<Uuid>> {
+        self.with(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT DISTINCT devices.user_id FROM delivery_records
+                 JOIN devices ON devices.address = delivery_records.destination
+                 WHERE delivery_records.frame_id = ?1",
+            )?;
+            let rows = statement.query_map(params![uuid_bytes(frame_id)], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })?;
+            Ok(rows
+                .collect::<std::result::Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter_map(|bytes| Uuid::from_slice(&bytes).ok())
+                .collect())
+        })
+    }
+
     pub fn readers_of(&self, target: Uuid) -> Result<Vec<Uuid>> {
         self.with(|connection| {
             let mut statement =
