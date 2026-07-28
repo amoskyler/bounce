@@ -53,3 +53,20 @@ export function deliveryState(message: Deliverable): DeliveryState {
   if (message.deliveredTo.length > 0) return 'delivered';
   return 'sending';
 }
+
+/**
+ * Whether an outgoing message has a delivery state worth showing at all.
+ *
+ * Every rung of the ladder is evidence that somebody *else* has the message:
+ * the engine drops the author from the list of who was reached, because a copy
+ * landing on the sender's own second device is the same person twice. A note to
+ * self has nobody else in it, so the honest answer is not `sending` — it is
+ * that the question does not apply. Asking it anyway left a ring turning
+ * forever under a message that had arrived the moment it was written.
+ */
+export function showsDeliveryState(
+  message: { thread: string },
+  myId: string | undefined,
+): boolean {
+  return myId === undefined || message.thread !== myId;
+}

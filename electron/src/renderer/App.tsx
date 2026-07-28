@@ -29,6 +29,7 @@ import {
   initialState,
   reducer,
   type Contact,
+  type Conversation,
   type State,
 } from './state';
 import type { BounceApi, Message, OutgoingAttachment, TransportInfo } from '../preload';
@@ -45,6 +46,14 @@ export function App() {
   const [dialog, setDialog] = React.useState<'newGroup' | 'addContact' | 'contacts' | null>(null);
   const [transport, setTransport] = React.useState<TransportInfo | null>(null);
   const [detailsOpen, setDetailsOpen] = React.useState(false);
+  /*
+   * Somebody whose details are open who is *not* the selected conversation —
+   * a member of the group you are reading, reached by clicking their face.
+   *
+   * Held separately rather than by selecting them, because opening a person's
+   * card should not navigate away from the conversation you were reading.
+   */
+  const [detailsUser, setDetailsUser] = React.useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = React.useState(false);
   // The message behind the info drawer, or null. Held by value rather than by
   // id so the panel keeps showing what you opened even if the thread reloads
@@ -189,6 +198,35 @@ export function App() {
   const selected = allConversations.find(
     (conversation) => conversation.id === state.selectedConversation,
   );
+
+  /*
+   * Whose card the details pane is showing.
+   *
+   * A group member reached by clicking their face may have no open
+   * conversation at all — that is the ordinary case for somebody met through a
+   * group — so the summary is built from the user record rather than looked up
+   * in the sidebar's list, which would find nothing and show nothing.
+   */
+  const detailsSubject: Conversation | undefined = React.useMemo(() => {
+    if (!detailsUser) return selected;
+
+    const found = allConversations.find((conversation) => conversation.id === detailsUser);
+    if (found) return found;
+
+    const user = state.users[detailsUser];
+    if (!user) return undefined;
+
+    return {
+      id: user.id,
+      kind: 'direct',
+      name: user.alias || user.name,
+      memberCount: 0,
+      lastActivity: user.lastActivity,
+      online: user.online,
+      muted: user.mutedUntil !== 0,
+      invitationPending: false,
+    };
+  }, [detailsUser, selected, allConversations, state.users]);
 
   const openConversation = React.useCallback((id: string) => {
     dispatch({ type: 'selectConversation', id });
@@ -415,6 +453,18 @@ export function App() {
           conversation={selected}
           state={state}
           onSend={handleSend}
+          onShowUser={(userId) => {
+            // Our own face opens our own settings, which is where our profile
+            // actually lives; a contact card of ourselves would be a dead end.
+            if (userId === state.profile?.id) {
+              setDetailsOpen(false);
+              setSettingsOpen(true);
+              return;
+            }
+            setDetailsUser(userId);
+            setDetailsOpen(true);
+            setSettingsOpen(false);
+          }}
           onDraftChange={handleDraftChange}
           onAcceptInvite={() => void window.bounce.respondToInvite(selected.id, true)}
           onDeclineInvite={() => void window.bounce.respondToInvite(selected.id, false)}
@@ -446,11 +496,27 @@ export function App() {
         />
       )}
 
-      {selected && detailsOpen && !settingsOpen && !infoMessage && (
+      {detailsSubject && detailsOpen && !settingsOpen && !infoMessage && (
         <DetailsPanel
-          conversation={selected}
+          /*
+           * Namespaced, not the bare id.
+           *
+           * These panes are siblings in one children array, and
+           * `ConversationView` is keyed on the selected conversation — which is
+           * what `detailsSubject` falls back to. A bare id therefore collided
+           * whenever the details pane was showing the conversation you were
+           * already in, and React does not recover gracefully from duplicate
+           * keys in one array: the previous conversation was left mounted
+           * underneath the new one, and state updates landed on the wrong
+           * fiber, so controls inside the pane stopped responding.
+           */
+          key={`details-${detailsSubject.id}`}
+          conversation={detailsSubject}
           state={state}
-          onClose={() => setDetailsOpen(false)}
+          onClose={() => {
+            setDetailsOpen(false);
+            setDetailsUser(null);
+          }}
         />
       )}
 

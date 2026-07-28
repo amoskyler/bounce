@@ -20,8 +20,9 @@
 //!   listener                              dialer
 //!      |------- 32 random bytes ------------->|
 //!      |<------ 56 byte onion address --------|
+//!      |<------ 32 random bytes --------------|
 //!      |<------ 64 byte Ed25519 signature ----|
-//!      |  verify signature against address    |
+//!      |  verify against challenge ^ their 32 |
 //! ```
 //!
 //! The listener's own address needs no proving: the dialer had to know it to
@@ -30,50 +31,42 @@
 //! establishes the peer's identity. After it, both sides speak the framing in
 //! [`crate::wire`].
 //!
-//! ## Why the dialer does not sign the challenge directly
+//! ## Why both sides contribute to the challenge
 //!
 //! A device's key signs two different things: handshake responses, and the
 //! `BLAKE3` digest inside every [`SignedContainer`]. That digest is 32 bytes —
-//! exactly the size of a challenge. If the dialer signed a peer-supplied
+//! exactly the size of a challenge. If the dialer signed the listener's
 //! challenge as-is, **any address you dial would be a signing oracle**: a
 //! malicious listener could send `BLAKE3(frame)` as the challenge and receive a
 //! signature that verifies as a frame authored by your device. It could then
 //! put words in your mouth to every one of your contacts — messages, group
-//! removals, consensus confirmations — with a fresh signature available on
-//! every reconnect.
+//! removals, consensus confirmations — with a fresh signature on every
+//! reconnect.
 //!
-//! So the dialer signs a domain-separated transcript instead:
-//!
-//! ```text
-//! BLAKE3("bounce-handshake-v1" || listener_address || challenge)
-//! ```
-//!
-//! The tag makes the handshake and frame message spaces disjoint: producing a
-//! frame signature this way would require finding a payload whose digest equals
-//! a BLAKE3 output, which is a preimage attack. Binding the listener's address
-//! additionally stops the response being *relayed* — a signature produced for
-//! one listener does not verify at another, so a peer you dial cannot turn
-//! around and authenticate as you elsewhere.
+//! So the dialer contributes 32 random bytes of its own and both sides use
+//! `challenge XOR dialer_bytes`. The listener has already committed to its
+//! challenge by the time those bytes are chosen, so it cannot steer the result
+//! anywhere: whatever it sends, the signed message is uniformly random to it.
+//! A malicious *dialer* can of course choose the outcome — it picks its half
+//! last — but it is signing with its own key, and a signature it could have
+//! made anyway is not a capability it gained.
 //!
 //! [`SignedContainer`]: crate::signed::SignedContainer
 //!
 //! ## Interoperating with the Go implementation
 //!
-//! The Go client signs the raw challenge, so it is vulnerable to exactly this,
-//! and its handshake is not the one described above.
+//! This is Go's handshake, byte for byte (`network/tor.go`, upstream
+//! `e553f68`). It has to be: the exchange is fixed-size and unversioned, so
+//! there is no room to negotiate and no way to tell a mismatch from a bad
+//! signature.
 //!
-//! Accepting is asymmetric with signing, and the two are treated differently:
+//! This port previously solved the oracle problem differently — the dialer
+//! signed `BLAKE3("bounce-handshake-v1" || listener || challenge)` — which was
+//! sound but not what Go did, so reaching a Go peer meant opting in to signing
+//! the bare challenge and accepting the oracle for the duration. Go now
+//! contributes randomness instead, which closes the same hole without anyone
+//! having to choose, so both the transcript and the opt-in are gone.
 //!
-//! - **As listener** we verify against the tagged transcript first and fall
-//!   back to the bare challenge. Verifying costs nothing — we produce no
-//!   signature — so a Go client can always dial us with no loss of safety.
-//! - **As dialer** we choose what to put our key to, and signing a
-//!   peer-supplied blob is the whole vulnerability. That is opt-in, per
-//!   [`HandshakeMode::Compatible`], because a Go peer will otherwise reject us.
-//!
-//! So Go-to-Rust works out of the box; Rust-to-Go needs the opt-in, and taking
-//! it means accepting the oracle for the duration. The real fix is to patch the
-//! Go side to sign a transcript too.
 
 pub mod tcp;
 
@@ -105,19 +98,6 @@ pub const SIGNATURE_SIZE: usize = 64;
 /// loop for every other peer. Tor circuits are slow enough that the limit has
 /// to be generous, but it must exist.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// What a dialer is willing to put its key to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum HandshakeMode {
-    /// Sign a domain-separated transcript. The only safe option.
-    #[default]
-    Strict,
-    /// Sign the bare challenge, as the Go implementation expects.
-    ///
-    /// **This makes every address you dial a signing oracle** — see the module
-    /// documentation. Use it only to reach Go peers, knowing the cost.
-    Compatible,
-}
 
 /// The virtual port Bounce listens on. Onion services do their own
 /// multiplexing, so the number is arbitrary — it just has to match what peers
@@ -194,19 +174,19 @@ pub trait Network: Send + Sync {
 ///
 /// Bounded by [`HANDSHAKE_TIMEOUT`]; a peer that goes quiet mid-handshake is
 /// dropped rather than held onto.
-pub async fn accept_handshake<S>(stream: &mut S, local_address: &str) -> Result<String>
+pub async fn accept_handshake<S>(stream: &mut S) -> Result<String>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
-        accept_handshake_inner(stream, local_address),
+        accept_handshake_inner(stream),
     )
     .await
     .map_err(|_| Error::Network("handshake timed out".into()))?
 }
 
-async fn accept_handshake_inner<S>(stream: &mut S, local_address: &str) -> Result<String>
+async fn accept_handshake_inner<S>(stream: &mut S) -> Result<String>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -224,87 +204,52 @@ where
         )));
     }
 
+    // The dialer's half of the challenge, chosen after ours was sent.
+    let peer_challenge = wire::read_exact(stream, HANDSHAKE_CHALLENGE_SIZE).await?;
     let signature = wire::read_exact(stream, SIGNATURE_SIZE).await?;
 
-    // Prefer the transcript; fall back to the bare challenge so a Go peer can
-    // reach us. Verifying either is safe — we sign nothing here.
-    let transcript = handshake_transcript(local_address, &challenge);
-    let verified = crypto::verify_signature(&peer_address, &transcript, &signature)
-        || crypto::verify_signature(&peer_address, &challenge, &signature);
-
-    if !verified {
-        return Err(Error::Network(
-            "handshake signature did not verify against the claimed address".into(),
-        ));
+    if !crypto::verify_signature(&peer_address, &xor(&challenge, &peer_challenge), &signature) {
+        return Err(Error::Network(format!(
+            "handshake signature did not verify against {peer_address}"
+        )));
     }
 
     Ok(peer_address)
 }
 
-/// Domain separation tag for handshake signatures.
+/// The two halves of a challenge, combined.
 ///
-/// See the module documentation: without this, a dialed peer is a signing
-/// oracle for frame signatures.
-const HANDSHAKE_DOMAIN: &[u8] = b"bounce-handshake-v1";
-
-/// The digest a handshake response signs.
-///
-/// Binds the tag, the listener being authenticated to, and the challenge, so
-/// the signature is neither confusable with a frame signature nor replayable
-/// against a different listener.
-fn handshake_transcript(listener_address: &str, challenge: &[u8]) -> [u8; 32] {
-    let mut transcript =
-        Vec::with_capacity(HANDSHAKE_DOMAIN.len() + listener_address.len() + challenge.len());
-    transcript.extend_from_slice(HANDSHAKE_DOMAIN);
-    transcript.extend_from_slice(listener_address.as_bytes());
-    transcript.extend_from_slice(challenge);
-    crypto::hash(&transcript)
+/// Both are [`HANDSHAKE_CHALLENGE_SIZE`], which is what makes this total; Go
+/// treats a length mismatch as unreachable and aborts the process.
+fn xor(a: &[u8], b: &[u8]) -> Vec<u8> {
+    a.iter().zip(b).map(|(left, right)| left ^ right).collect()
 }
 
 /// Run the dialer's half of the handshake.
-pub async fn dial_handshake<S>(
-    stream: &mut S,
-    key: &DeviceKey,
-    listener_address: &str,
-    mode: HandshakeMode,
-) -> Result<()>
+pub async fn dial_handshake<S>(stream: &mut S, key: &DeviceKey) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
-        dial_handshake_inner(stream, key, listener_address, mode),
-    )
-    .await
-    .map_err(|_| Error::Network("handshake timed out".into()))?
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, dial_handshake_inner(stream, key))
+        .await
+        .map_err(|_| Error::Network("handshake timed out".into()))?
 }
 
-async fn dial_handshake_inner<S>(
-    stream: &mut S,
-    key: &DeviceKey,
-    listener_address: &str,
-    mode: HandshakeMode,
-) -> Result<()>
+async fn dial_handshake_inner<S>(stream: &mut S, key: &DeviceKey) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let challenge = wire::read_exact(stream, HANDSHAKE_CHALLENGE_SIZE).await?;
 
-    let signature = match mode {
-        // Never sign the challenge as given — see the module documentation.
-        HandshakeMode::Strict => key.sign(&handshake_transcript(listener_address, &challenge)),
-        HandshakeMode::Compatible => {
-            tracing::warn!(
-                peer = %listener_address,
-                "signing a peer-supplied challenge for Go compatibility: this peer can \
-                 obtain a signature from this device"
-            );
-            key.sign(&challenge)
-        }
-    };
+    // Our half, chosen only after theirs has arrived. That ordering is the
+    // whole protection: they cannot aim the signed bytes at anything, because
+    // they committed to their half before seeing ours.
+    let peer_challenge = crypto::random_bytes(HANDSHAKE_CHALLENGE_SIZE);
+    let signature = key.sign(&xor(&challenge, &peer_challenge));
 
     let address = key.address();
     wire::write_all(stream, address.as_bytes()).await?;
+    wire::write_all(stream, &peer_challenge).await?;
     wire::write_all(stream, &signature).await?;
 
     Ok(())
@@ -443,32 +388,77 @@ mod tests {
         assert_eq!(listener.await.unwrap(), sent);
     }
 
+    /// Play the dialer's half by hand, so a test can vary one step of it.
+    async fn dial_by_hand<S>(stream: &mut S, key: &DeviceKey, peer_challenge: &[u8]) -> Vec<u8>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let challenge = wire::read_exact(stream, HANDSHAKE_CHALLENGE_SIZE).await.unwrap();
+        let signature = key.sign(&xor(&challenge, peer_challenge));
+        wire::write_all(stream, key.address().as_bytes()).await.unwrap();
+        wire::write_all(stream, peer_challenge).await.unwrap();
+        wire::write_all(stream, &signature).await.unwrap();
+        signature.to_vec()
+    }
+
     #[tokio::test]
     async fn a_handshake_establishes_the_dialers_verified_address() {
         let (mut listener_side, mut dialer_side) = tokio::io::duplex(4096);
 
         let dialer_key = DeviceKey::generate();
         let expected = dialer_key.address();
-        let listener_key = DeviceKey::generate();
-        let listener_address = listener_key.address();
 
         let dialer = tokio::spawn(async move {
-            dial_handshake(
-                &mut dialer_side,
-                &dialer_key,
-                &listener_address,
-                HandshakeMode::Strict,
-            )
-            .await
-            .unwrap();
+            dial_handshake(&mut dialer_side, &dialer_key).await.unwrap();
         });
 
-        let peer_address = accept_handshake(&mut listener_side, &listener_key.address())
+        let peer_address = accept_handshake(&mut listener_side)
             .await
             .expect("handshake succeeds");
         dialer.await.unwrap();
 
         assert_eq!(peer_address, expected);
+    }
+
+    #[tokio::test]
+    async fn the_wire_is_challenge_address_challenge_signature() {
+        // The exchange is fixed-size and unversioned, so a peer cannot tell a
+        // layout change from a bad signature — it just stops connecting. This
+        // pins the layout Go reads (`network/tor.go`, upstream `e553f68`).
+        let (mut listener_side, mut dialer_side) = tokio::io::duplex(4096);
+
+        let dialer_key = DeviceKey::generate();
+        let dialer = tokio::spawn(async move {
+            dial_handshake(&mut dialer_side, &dialer_key).await.unwrap();
+            dialer_key
+        });
+
+        // Act as the listener by hand: send the challenge, then read the three
+        // fields the dialer owes us, in order.
+        let challenge = crypto::random_bytes(HANDSHAKE_CHALLENGE_SIZE);
+        wire::write_all(&mut listener_side, &challenge).await.unwrap();
+
+        let address = wire::read_exact(&mut listener_side, onion::ONION_ADDRESS_LENGTH)
+            .await
+            .unwrap();
+        let peer_challenge = wire::read_exact(&mut listener_side, HANDSHAKE_CHALLENGE_SIZE)
+            .await
+            .unwrap();
+        let signature = wire::read_exact(&mut listener_side, SIGNATURE_SIZE)
+            .await
+            .unwrap();
+
+        let key = dialer.await.unwrap();
+        assert_eq!(String::from_utf8(address).unwrap(), key.address());
+        assert_ne!(
+            peer_challenge, challenge,
+            "the dialer's half must be its own, not an echo",
+        );
+        assert!(crypto::verify_signature(
+            &key.address(),
+            &xor(&challenge, &peer_challenge),
+            &signature,
+        ));
     }
 
     #[tokio::test]
@@ -483,15 +473,15 @@ mod tests {
             let challenge = wire::read_exact(&mut dialer_side, HANDSHAKE_CHALLENGE_SIZE)
                 .await
                 .unwrap();
-            let signature = attacker_key.sign(&challenge);
-            wire::write_all(&mut dialer_side, victim_address.as_bytes())
-                .await
-                .unwrap();
+            let peer_challenge = vec![7u8; HANDSHAKE_CHALLENGE_SIZE];
+            let signature = attacker_key.sign(&xor(&challenge, &peer_challenge));
+            wire::write_all(&mut dialer_side, victim_address.as_bytes()).await.unwrap();
+            wire::write_all(&mut dialer_side, &peer_challenge).await.unwrap();
             wire::write_all(&mut dialer_side, &signature).await.unwrap();
         });
 
         assert!(
-            matches!(accept_handshake(&mut listener_side, &DeviceKey::generate().address()).await, Err(Error::Network(_))),
+            matches!(accept_handshake(&mut listener_side).await, Err(Error::Network(_))),
             "impersonating an address must fail the handshake"
         );
     }
@@ -505,90 +495,54 @@ mod tests {
             // The right length, but not a valid onion address.
             let junk = vec![b'!'; onion::ONION_ADDRESS_LENGTH];
             let _ = wire::write_all(&mut dialer_side, &junk).await;
+            let _ = wire::write_all(&mut dialer_side, &[0u8; HANDSHAKE_CHALLENGE_SIZE]).await;
             let _ = wire::write_all(&mut dialer_side, &[0u8; SIGNATURE_SIZE]).await;
         });
 
-        assert!(accept_handshake(&mut listener_side, &DeviceKey::generate().address()).await.is_err());
+        assert!(accept_handshake(&mut listener_side).await.is_err());
     }
 
     #[tokio::test]
     async fn a_captured_signature_cannot_be_replayed() {
         let dialer_key = DeviceKey::generate();
-        let listener_key = DeviceKey::generate();
-        let listener_address = listener_key.address();
 
-        // Capture a signature from a legitimate session.
+        // Capture a signature from a legitimate session, along with the half
+        // of the challenge the dialer contributed to it.
         let (mut listener_side, mut dialer_side) = tokio::io::duplex(4096);
         let captured_key = dialer_key.clone();
-        let captured_listener = listener_address.clone();
+        let peer_challenge = vec![3u8; HANDSHAKE_CHALLENGE_SIZE];
+        let replayed_challenge = peer_challenge.clone();
         let capture = tokio::spawn(async move {
-            let challenge = wire::read_exact(&mut dialer_side, HANDSHAKE_CHALLENGE_SIZE)
-                .await
-                .unwrap();
-            let signature =
-                captured_key.sign(&handshake_transcript(&captured_listener, &challenge));
-            wire::write_all(&mut dialer_side, captured_key.address().as_bytes())
-                .await
-                .unwrap();
-            wire::write_all(&mut dialer_side, &signature).await.unwrap();
-            signature
+            dial_by_hand(&mut dialer_side, &captured_key, &peer_challenge).await
         });
-        accept_handshake(&mut listener_side, &listener_address).await.unwrap();
+        accept_handshake(&mut listener_side).await.unwrap();
         let captured_signature = capture.await.unwrap();
 
-        // Replaying it fails, because each session issues a fresh challenge.
+        // Replaying both fails, because each session issues a fresh challenge
+        // and the dialer's half cannot cancel one it has not seen.
         let (mut listener_side, mut dialer_side) = tokio::io::duplex(4096);
         let address = dialer_key.address();
         tokio::spawn(async move {
             let _ = wire::read_exact(&mut dialer_side, HANDSHAKE_CHALLENGE_SIZE).await;
             let _ = wire::write_all(&mut dialer_side, address.as_bytes()).await;
+            let _ = wire::write_all(&mut dialer_side, &replayed_challenge).await;
             let _ = wire::write_all(&mut dialer_side, &captured_signature).await;
         });
 
-        assert!(accept_handshake(&mut listener_side, &listener_address)
-            .await
-            .is_err());
-    }
-
-    #[tokio::test]
-    async fn a_listener_accepts_the_go_implementations_handshake() {
-        // Go signs the bare challenge. Verifying it costs us nothing — we
-        // produce no signature as listener — so a Go peer can always reach us.
-        let (mut listener_side, mut dialer_side) = tokio::io::duplex(4096);
-
-        let dialer_key = DeviceKey::generate();
-        let expected = dialer_key.address();
-        let listener_address = DeviceKey::generate().address();
-
-        let dialer = tokio::spawn(async move {
-            dial_handshake(
-                &mut dialer_side,
-                &dialer_key,
-                "an address the legacy dialer never mixes in",
-                HandshakeMode::Compatible,
-            )
-            .await
-            .unwrap();
-        });
-
-        let peer_address = accept_handshake(&mut listener_side, &listener_address)
-            .await
-            .expect("a legacy handshake is accepted");
-        dialer.await.unwrap();
-
-        assert_eq!(peer_address, expected);
+        assert!(accept_handshake(&mut listener_side).await.is_err());
     }
 
     #[tokio::test]
     async fn a_dialed_peer_cannot_use_the_handshake_as_a_signing_oracle() {
         // The attack this exists to prevent: a malicious listener sends
         // BLAKE3(frame) as the challenge, hoping the response doubles as a
-        // frame signature from the dialer's device.
+        // frame signature from the dialer's device. The dialer's own half of
+        // the challenge is what defeats it — the listener has already
+        // committed by the time that half is chosen.
         use crate::signed::SignedContainer;
 
         let victim_key = DeviceKey::generate();
         let victim_address = victim_key.address();
-        let attacker_address = DeviceKey::generate().address();
 
         // A frame the attacker would like the victim to appear to have written.
         let forged_payload = b"a message the victim never wrote".to_vec();
@@ -605,40 +559,22 @@ mod tests {
             // Send the digest where a random challenge belongs.
             wire::write_all(&mut listener_side, &digest).await.unwrap();
             let _ = wire::read_exact(&mut listener_side, onion::ONION_ADDRESS_LENGTH).await;
-            wire::read_exact(&mut listener_side, SIGNATURE_SIZE)
-                .await
-                .unwrap()
+            let _ = wire::read_exact(&mut listener_side, HANDSHAKE_CHALLENGE_SIZE).await;
+            wire::read_exact(&mut listener_side, SIGNATURE_SIZE).await.unwrap()
         });
 
-        dial_handshake(
-            &mut dialer_side,
-            &victim_key,
-            &attacker_address,
-            HandshakeMode::Strict,
-        )
-        .await
-        .unwrap();
+        dial_handshake(&mut dialer_side, &victim_key).await.unwrap();
         let harvested = attacker.await.unwrap();
 
-        // The harvested signature must not authenticate the frame.
         let forged = SignedContainer {
             signer: victim_address.clone(),
             payload: forged_payload,
-            signature: harvested.clone(),
+            signature: harvested,
         };
         assert!(
             !forged.is_valid(),
             "a dialed peer must not be able to harvest a usable frame signature"
         );
-
-        // Nor is it a valid handshake response for anyone else: the listener's
-        // address is bound into what was signed.
-        let elsewhere = DeviceKey::generate().address();
-        assert!(!crypto::verify_signature(
-            &victim_address,
-            &handshake_transcript(&elsewhere, &digest),
-            &harvested,
-        ));
     }
 
     #[tokio::test]
@@ -653,7 +589,7 @@ mod tests {
             std::future::pending::<()>().await;
         });
 
-        let handshake = tokio::spawn(async move { accept_handshake(&mut listener_side, &DeviceKey::generate().address()).await });
+        let handshake = tokio::spawn(async move { accept_handshake(&mut listener_side).await });
         tokio::time::advance(HANDSHAKE_TIMEOUT + Duration::from_secs(1)).await;
 
         let result = handshake.await.unwrap();

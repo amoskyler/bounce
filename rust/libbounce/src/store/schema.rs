@@ -18,7 +18,7 @@ use rusqlite::{Connection, OptionalExtension};
 use crate::error::{Error, Result};
 
 /// Bumped whenever the schema changes in a way that needs a migration.
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// Create every table and index, if they do not already exist.
 pub fn create(connection: &Connection) -> Result<()> {
@@ -435,6 +435,36 @@ pub fn create(connection: &Connection) -> Result<()> {
             offered_at  INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (hash, address)
         );
+
+        -- The offers themselves, kept as stored frames.
+        --
+        -- This port originally treated them as ephemeral and bounded their
+        -- gossip by novelty instead. That is the reason a file record arriving
+        -- through catch-up named no holder at all: offers are the only thing
+        -- that says who has the bytes, and a device that joined later had
+        -- never heard one. Go stores them (`chat/file.go:344`) and replays
+        -- them through the reference flow like anything else, which is what
+        -- makes a chunk findable long after it was first announced.
+        --
+        -- `last_request_time` is carried because Go carries it; both sides
+        -- keep it local (`msgpack:"-"`).
+        CREATE TABLE IF NOT EXISTS chunk_offers (
+            id                 BLOB PRIMARY KEY NOT NULL,
+            scope              INTEGER NOT NULL DEFAULT 0,
+            destination        BLOB,
+            author             BLOB,
+            file_id            BLOB NOT NULL,
+            hash               TEXT NOT NULL,
+            location           TEXT NOT NULL,
+            timestamp          INTEGER NOT NULL DEFAULT 0,
+            saved_at           INTEGER NOT NULL DEFAULT 0,
+            last_request_time  INTEGER NOT NULL DEFAULT 0,
+            signer             TEXT NOT NULL DEFAULT '',
+            original_payload   BLOB NOT NULL DEFAULT x'',
+            signature          BLOB NOT NULL DEFAULT x''
+        );
+        CREATE INDEX IF NOT EXISTS idx_chunk_offers_hash ON chunk_offers (hash);
+        CREATE INDEX IF NOT EXISTS idx_chunk_offers_file ON chunk_offers (file_id);
 
         -- A change to a direct message thread.
         --

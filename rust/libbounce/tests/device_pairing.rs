@@ -31,6 +31,9 @@ async fn start(directory: Arc<StaticDirectory>) -> Instance {
     let store = Arc::new(Store::in_memory().expect("opens"));
     let (engine, events) = Engine::new(key.clone(), Arc::clone(&store), network);
     tokio::spawn(Arc::clone(&engine).run_listener());
+    // The chunk engine is what issues chunk requests; the application spawns it
+    // alongside the listener (`bounce-node/src/lib.rs`), so the harness does too.
+    tokio::spawn(Arc::clone(&engine).run_chunk_engine());
     Instance { engine, store, events, address, key }
 }
 
@@ -480,4 +483,308 @@ async fn a_contact_cannot_change_our_settings() {
 
     assert!(result.is_err(), "a contact's device may not reconfigure us");
     assert_eq!(bo.engine.settings().unwrap().default_read_receipts, before);
+}
+
+#[tokio::test]
+async fn the_joining_device_sees_the_one_that_admitted_it_as_connected() {
+    // Both devices are on the same socket, so both must say the same thing
+    // about it. What they said instead was the opposite: the laptop showed the
+    // phone as connected while the phone showed the laptop as "Never
+    // connected", forever, because nothing on the phone ever credited the
+    // session it had joined over.
+    //
+    // `serve_peer` decides whether a peer is a known device once, when the
+    // socket opens, and only then records `last_seen` and announces the device
+    // online. Pairing is precisely the case where the peer becomes known
+    // *during* the session — over that very socket — so the phone's window
+    // for crediting the laptop had already closed by the time it knew who the
+    // laptop was. Go re-checks on every frame and re-stamps `last_seen`
+    // (`chat/remote_device.go:197-222`).
+    //
+    // It cannot heal on its own either: peering skips any address already
+    // connected, so as long as the pairing socket stays up neither side dials
+    // again, and no second session ever runs the code that would fix it.
+    let directory = Arc::new(StaticDirectory::new());
+    let laptop = start(Arc::clone(&directory)).await;
+    let mut phone = start(Arc::clone(&directory)).await;
+
+    laptop.engine.create_profile("Ada", "laptop").unwrap();
+    let code = laptop.engine.create_sync_code().unwrap();
+    Arc::clone(&phone.engine).request_to_sync(&code).await.unwrap();
+    wait_for(&mut phone.events, 10, |event| {
+        matches!(event, Event::ProfileCreated { .. }).then_some(())
+    })
+    .await
+    .expect("the phone joins");
+
+    // The pairing socket is still open at this point, on both sides.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let stored = phone
+        .store
+        .device_by_address(&laptop.address)
+        .unwrap()
+        .expect("the phone knows the laptop");
+    assert_ne!(
+        stored.last_seen, 0,
+        "the phone must record having been connected to the laptop",
+    );
+
+    // And the snapshot a client rebuilds from has to agree with the events it
+    // was sent. The phone reloads it the moment pairing completes — the
+    // profile it did not have now exists — so a snapshot that reports every
+    // device offline overwrites the truth rather than confirming it.
+    for (side, state, peer) in [
+        ("phone", phone.engine.initial_state().unwrap(), &laptop.address),
+        ("laptop", laptop.engine.initial_state().unwrap(), &phone.address),
+    ] {
+        let view = state
+            .sync_devices
+            .iter()
+            .find(|device| &device.address == peer)
+            .unwrap_or_else(|| panic!("{side} lists the other device"));
+        assert!(
+            view.online,
+            "{side} should report the device it is connected to as online",
+        );
+    }
+}
+
+#[tokio::test]
+async fn renaming_a_device_does_not_report_it_offline() {
+    // `DeviceUpdated` carries a whole device record and the client replaces
+    // its own with it, so anything the view gets wrong is not a momentary
+    // glitch — it sticks until the next event says otherwise. The rename path
+    // knew only whether the device was this one, so it answered the presence
+    // question with that, and renaming the phone from the laptop greyed the
+    // phone out until the session ended.
+    let directory = Arc::new(StaticDirectory::new());
+    let mut laptop = start(Arc::clone(&directory)).await;
+    let mut phone = start(Arc::clone(&directory)).await;
+
+    let profile = laptop.engine.create_profile("Ada", "laptop").unwrap();
+    let code = laptop.engine.create_sync_code().unwrap();
+    Arc::clone(&phone.engine).request_to_sync(&code).await.unwrap();
+    wait_for(&mut phone.events, 10, |event| {
+        matches!(event, Event::ProfileCreated { .. }).then_some(())
+    })
+    .await
+    .expect("the phone joins");
+
+    let phone_device = laptop
+        .store
+        .devices_for_user(profile.id)
+        .unwrap()
+        .into_iter()
+        .find(|device| device.address == phone.address)
+        .expect("the laptop knows the phone");
+
+    laptop.engine.rename_device(phone_device.id, "phone").expect("renames");
+
+    let updated = wait_for(&mut laptop.events, 10, |event| match event {
+        Event::DeviceUpdated { device } if device.id == phone_device.id => Some(device.clone()),
+        _ => None,
+    })
+    .await
+    .expect("the laptop hears about its own rename");
+
+    assert_eq!(updated.name, "phone");
+    assert!(!updated.local);
+    assert!(
+        updated.online,
+        "a rename must not knock a connected device offline",
+    );
+}
+
+#[tokio::test]
+async fn a_joining_device_receives_the_profile_picture() {
+    // A device that joins later has no history at all: everything it knows
+    // arrives through the reference flow. So anything that flow declines to
+    // offer is not merely delayed on a new device, it is absent — which is how
+    // a freshly linked device came to show every avatar as a blank circle
+    // while the device that admitted it showed them all.
+    let directory = Arc::new(StaticDirectory::new());
+    let laptop = start(Arc::clone(&directory)).await;
+    let mut phone = start(Arc::clone(&directory)).await;
+
+    laptop.engine.create_profile("Ada", "laptop").unwrap();
+
+    let picture: Vec<u8> = (0..7000).map(|index| (index % 251) as u8).collect();
+    laptop
+        .engine
+        .set_profile_image(libbounce::engine::files::OutgoingAttachment {
+            name: "ada.png".into(),
+            data: picture.clone(),
+            is_image: true,
+            width: 96,
+            height: 96,
+            blur_hash: String::new(),
+            ..Default::default()
+        })
+        .await
+        .expect("sets the picture");
+
+    let code = laptop.engine.create_sync_code().unwrap();
+    Arc::clone(&phone.engine).request_to_sync(&code).await.unwrap();
+
+    let joined = wait_for(&mut phone.events, 15, |event| match event {
+        Event::ProfileCreated { user, .. } => Some(user.clone()),
+        _ => None,
+    })
+    .await
+    .expect("the phone joins");
+
+    // The profile record names the picture, as it did before — that half was
+    // never the problem.
+    let image_id = *joined.images.last().expect("the profile names a picture");
+
+    let complete = wait_for(&mut phone.events, 20, |event| match event {
+        Event::FileComplete { file_id } if *file_id == image_id => Some(*file_id),
+        _ => None,
+    })
+    .await;
+
+    assert_eq!(complete, Some(image_id), "and the bytes have to follow it");
+    assert_eq!(
+        phone.engine.file_data(image_id).unwrap().as_deref(),
+        Some(picture.as_slice()),
+    );
+}
+
+#[tokio::test]
+async fn a_joining_device_learns_who_the_profile_knows() {
+    // `apply_add_user` is documented as "the one path that both sides and every
+    // later-arriving device take", and `AddUser` sorts first in the catch-up
+    // order table so a contact is established before anything that refers to
+    // them. Neither was reachable: the reference flow never listed `add_users`
+    // among the tables it draws from, `peer_may_have` had no arm for the type,
+    // the store could not produce its payload, and the catch-up dispatcher had
+    // nowhere to send it.
+    //
+    // So a device that joined later did not learn the contacts — and since a
+    // frame is only accepted from a device that speaks for a known user,
+    // everything those contacts had ever said was then rejected on arrival.
+    let directory = Arc::new(StaticDirectory::new());
+    let laptop = start(Arc::clone(&directory)).await;
+    let carol = start(Arc::clone(&directory)).await;
+    let mut phone = start(Arc::clone(&directory)).await;
+
+    laptop.engine.create_profile("Ada", "laptop").unwrap();
+    let carol_user = carol.engine.create_profile("Carol", "carol").unwrap();
+
+    let code = carol.engine.create_pairing_code().expect("code");
+    Arc::clone(&laptop.engine).request_to_add_user(&code).await.expect("adds carol");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        laptop.store.user(carol_user.id).unwrap().is_some(),
+        "the laptop knows Carol before the phone joins",
+    );
+
+    let sync = laptop.engine.create_sync_code().unwrap();
+    Arc::clone(&phone.engine).request_to_sync(&sync).await.unwrap();
+    wait_for(&mut phone.events, 15, |event| {
+        matches!(event, Event::ProfileCreated { .. }).then_some(())
+    })
+    .await
+    .expect("the phone joins");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let known = phone.store.user(carol_user.id).unwrap();
+    assert!(known.is_some(), "the phone must be told who the profile knows");
+    assert_eq!(known.unwrap().name, "Carol");
+
+    // And her devices with her, or nothing she signs can be attributed.
+    assert!(
+        !phone.store.devices_for_user(carol_user.id).unwrap().is_empty(),
+        "a contact without devices is a contact nothing can be accepted from",
+    );
+}
+
+#[tokio::test]
+async fn a_contact_learns_about_a_newly_linked_device() {
+    // `handle_sync_device_request` broadcasts the new `Device` frame to
+    // everyone, because a contact who does not know about a device will refuse
+    // everything that device signs. Nothing received it: this port had no
+    // handler for `FrameType::Device`, so a frame it broadcast itself landed in
+    // the dispatcher's "no handler for frame type yet" arm on every peer.
+    let directory = Arc::new(StaticDirectory::new());
+    let laptop = start(Arc::clone(&directory)).await;
+    let bob = start(Arc::clone(&directory)).await;
+    let mut phone = start(Arc::clone(&directory)).await;
+
+    let ada = laptop.engine.create_profile("Ada", "laptop").unwrap();
+    bob.engine.create_profile("Bob", "bob").unwrap();
+
+    let code = bob.engine.create_pairing_code().expect("code");
+    Arc::clone(&laptop.engine).request_to_add_user(&code).await.expect("adds bob");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert_eq!(
+        bob.store.devices_for_user(ada.id).unwrap().len(),
+        1,
+        "Bob starts knowing only the laptop",
+    );
+
+    let sync = laptop.engine.create_sync_code().unwrap();
+    Arc::clone(&phone.engine).request_to_sync(&sync).await.unwrap();
+    wait_for(&mut phone.events, 15, |event| {
+        matches!(event, Event::ProfileCreated { .. }).then_some(())
+    })
+    .await
+    .expect("the phone joins");
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let known = bob.store.devices_for_user(ada.id).unwrap();
+    assert_eq!(known.len(), 2, "Bob must learn about Ada's new device");
+    assert!(known.iter().any(|device| device.address == phone.address));
+
+    // And the group Bob now holds still validates, which is what makes the
+    // introduction chain worth carrying at all.
+    let ada_as_bob_sees_her = bob.store.user(ada.id).unwrap().expect("known");
+    assert!(libbounce::device_group::user_has_valid_device_group(
+        &ada_as_bob_sees_her
+    ));
+}
+
+#[tokio::test]
+async fn a_setting_changed_while_a_sibling_was_away_reaches_it_on_reconnection() {
+    // Live delivery of an `UpdateSettings` already worked; replay did not.
+    // `update_settings` was absent from the reference sources, so a change made
+    // while another of your devices was off left the two disagreeing
+    // permanently — the frame was stored, could be served on request, and was
+    // never offered to anybody.
+    let directory = Arc::new(StaticDirectory::new());
+    let laptop = start(Arc::clone(&directory)).await;
+    let mut phone = start(Arc::clone(&directory)).await;
+
+    laptop.engine.create_profile("Ada", "laptop").unwrap();
+    let code = laptop.engine.create_sync_code().unwrap();
+    Arc::clone(&phone.engine).request_to_sync(&code).await.unwrap();
+    wait_for(&mut phone.events, 15, |event| {
+        matches!(event, Event::ProfileCreated { .. }).then_some(())
+    })
+    .await
+    .expect("the phone joins");
+
+    assert!(phone.engine.settings().unwrap().default_read_receipts);
+
+    // The phone goes away, and the laptop changes its mind.
+    phone.engine.disconnect_all().await;
+    laptop.engine.disconnect_all().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    laptop
+        .engine
+        .set_default_read_receipts(false)
+        .await
+        .expect("changes the setting");
+
+    // Reconnecting is the only route left.
+    Arc::clone(&phone.engine).connect(&laptop.address).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    assert!(
+        !phone.engine.settings().unwrap().default_read_receipts,
+        "the phone must catch up on a setting it missed",
+    );
 }

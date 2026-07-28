@@ -93,7 +93,7 @@ interface NativeNode {
 
 interface NativeModule {
   BounceNode: {
-    open(dataDirectory: string, useTor: boolean, goCompatible: boolean): NativeNode;
+    open(dataDirectory: string, useTor: boolean): NativeNode;
   };
 }
 
@@ -138,18 +138,11 @@ export class BounceEngine extends EventEmitter {
    * Turning it off is a development affordance; the interface surfaces which
    * mode is in force rather than letting it pass unnoticed.
    *
-   * `goCompatible` makes outbound handshakes match the Go client. It is needed
-   * to dial a Go peer, and it lets every address dialled obtain a signature
-   * from this device. Inbound connections from Go peers work either way.
    */
-  static open(
-    dataDirectory: string,
-    useTor: boolean,
-    goCompatible: boolean,
-  ): BounceEngine {
+  static open(dataDirectory: string, useTor: boolean): BounceEngine {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const native = require(resolveNativeModule()) as NativeModule;
-    const node = native.BounceNode.open(dataDirectory, useTor, goCompatible);
+    const node = native.BounceNode.open(dataDirectory, useTor);
 
     const engine = new BounceEngine(node);
 

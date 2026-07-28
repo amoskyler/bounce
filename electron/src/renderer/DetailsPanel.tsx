@@ -13,7 +13,8 @@
 
 import * as React from 'react';
 
-import { Avatar } from './Avatar';
+import { ImageViewer } from './Attachments';
+import { Avatar, useAvatarImage } from './Avatar';
 import { CloseIcon } from './icons';
 import { choosePicture, prepareImage } from './outgoing-image';
 import { shortAddress } from './format';
@@ -63,6 +64,10 @@ export function DetailsPanel({ conversation, state, onClose }: DetailsProps) {
   const user = state.users[conversation.id];
   const defaults = useProfileDefaults(state);
   const [pictureError, setPictureError] = React.useState<string | null>(null);
+  const [viewingPicture, setViewingPicture] = React.useState(false);
+
+  // The resolved URL, which is also the answer to "is there a picture to open".
+  const pictureUrl = useAvatarImage(group ? group.images : user?.images);
 
   return (
     <aside className="details" aria-label="Conversation details">
@@ -103,6 +108,11 @@ export function DetailsPanel({ conversation, state, onClose }: DetailsProps) {
               name={conversation.name}
               images={group ? group.images : user?.images}
               size={96}
+              // Only when there is something to enlarge. Initials on a tint
+              // look the same at any size, so a button here would promise
+              // something it could not deliver.
+              onClick={pictureUrl ? () => setViewingPicture(true) : undefined}
+              label={pictureUrl ? `View ${conversation.name}'s picture` : undefined}
             />
           )}
           <div className="details__name">{conversation.name}</div>
@@ -131,6 +141,14 @@ export function DetailsPanel({ conversation, state, onClose }: DetailsProps) {
           user && <ContactDetails key={user.id} user={user} state={state} defaults={defaults} />
         )}
       </div>
+
+      {viewingPicture && pictureUrl && (
+        <ImageViewer
+          src={pictureUrl}
+          alt={conversation.name}
+          onClose={() => setViewingPicture(false)}
+        />
+      )}
     </aside>
   );
 }

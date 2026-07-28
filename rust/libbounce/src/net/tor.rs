@@ -59,7 +59,7 @@ use tor_proto::stream::IncomingStreamRequest;
 use tor_rtcompat::tokio::TokioRustlsRuntime;
 
 use super::{
-    accept_handshake, dial_handshake, HandshakeMode, Network, PeerConnection, BOUNCE_PORT,
+    accept_handshake, dial_handshake, Network, PeerConnection, BOUNCE_PORT,
 };
 use crate::crypto::DeviceKey;
 use crate::error::{Error, Result};
@@ -86,7 +86,6 @@ pub struct TorNetwork {
     /// Connections that have completed the handshake.
     accepted: Mutex<mpsc::Receiver<PeerConnection<DataStream>>>,
     address: String,
-    handshake: HandshakeMode,
 }
 
 impl TorNetwork {
@@ -194,17 +193,7 @@ impl TorNetwork {
             _service: service,
             accepted: Mutex::new(receiver),
             address,
-            handshake: HandshakeMode::default(),
         })
-    }
-
-    /// Choose what this instance signs when dialing.
-    ///
-    /// See [`HandshakeMode`]: the compatible mode is required to reach a Go
-    /// peer and carries a real cost.
-    pub fn with_handshake_mode(mut self, mode: HandshakeMode) -> Self {
-        self.handshake = mode;
-        self
     }
 
     /// The onion address this device publishes.
@@ -237,7 +226,7 @@ impl Network for TorNetwork {
             .await
             .map_err(|error| Error::Network(format!("could not reach {address}: {error}")))?;
 
-        dial_handshake(&mut stream, &self.key, address, self.handshake).await?;
+        dial_handshake(&mut stream, &self.key).await?;
 
         Ok(PeerConnection {
             peer_address: address.to_string(),
@@ -283,7 +272,7 @@ async fn handshake_inbound(
 
     // A v3 onion service learns nothing about who connected to it, so this
     // handshake is the only thing that establishes the peer's identity.
-    match accept_handshake(&mut stream, &local_address).await {
+    match accept_handshake(&mut stream).await {
         Ok(peer_address) => Some(PeerConnection {
             peer_address,
             local_address,

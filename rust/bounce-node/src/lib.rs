@@ -33,7 +33,7 @@ use tokio::sync::Mutex;
 use libbounce::crypto::DeviceKey;
 use libbounce::engine::files::OutgoingAttachment;
 use libbounce::engine::{Engine, Event, GroupPermission};
-use libbounce::net::{HandshakeMode, StaticDirectory, TcpNetwork, TorNetwork, Transport};
+use libbounce::net::{StaticDirectory, TcpNetwork, TorNetwork, Transport};
 use libbounce::store::Store;
 use libbounce::types::FrameType;
 
@@ -114,22 +114,11 @@ impl BounceNode {
     /// The device key is persisted as `device_key` and is the device's
     /// identity: deleting it and starting again produces a different device
     /// that other members of the device group will not recognise.
-    /// `go_compatible` makes outbound handshakes match the Go implementation.
-    ///
-    /// Required to dial a Go peer, and **it lets every address you dial obtain
-    /// a signature from this device** — see `libbounce::net`. Inbound
-    /// connections from Go peers work either way.
     #[napi(factory)]
-    pub fn open(data_directory: String, use_tor: bool, go_compatible: bool) -> Result<Self> {
+    pub fn open(data_directory: String, use_tor: bool) -> Result<Self> {
         let directory = std::path::PathBuf::from(&data_directory);
         std::fs::create_dir_all(&directory).map_err(to_napi_error)?;
         install_logging(&directory);
-
-        let handshake = if go_compatible {
-            HandshakeMode::Compatible
-        } else {
-            HandshakeMode::Strict
-        };
 
         let key = load_or_create_key(&directory)?;
         let address = key.address();
@@ -153,7 +142,7 @@ impl BounceNode {
                     &directory.join("tor-cache"),
                 ))
                 .map_err(to_napi_error)?;
-            Transport::Tor(tor.with_handshake_mode(handshake))
+            Transport::Tor(tor)
         } else {
             // Two clients on one machine are separate processes with separate
             // data directories, so the rendezvous file has to live somewhere
@@ -166,7 +155,7 @@ impl BounceNode {
             let tcp = runtime
                 .block_on(TcpNetwork::bind(key.clone(), peers))
                 .map_err(to_napi_error)?;
-            Transport::Tcp(tcp.with_handshake_mode(handshake))
+            Transport::Tcp(tcp)
         };
 
         let transport = network.name().to_string();
@@ -209,6 +198,7 @@ impl BounceNode {
         // prunes once on start-up, but a client left open for a week would
         // otherwise keep everything that expired during it, so the sweep has
         // to run for the life of the process.
+        runtime.spawn(Arc::clone(&engine).run_chunk_engine());
         runtime.spawn(Arc::clone(&engine).run_retention());
 
         Ok(BounceNode {

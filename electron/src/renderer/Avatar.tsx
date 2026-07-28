@@ -104,7 +104,7 @@ function initialsFor(name: string): string {
  * initials stand in, exactly as they do for someone with no photo at all. The
  * next render after the bytes land picks the URL up.
  */
-function useAvatarImage(images: readonly string[] | undefined): string | undefined {
+export function useAvatarImage(images: readonly string[] | undefined): string | undefined {
   const fileId = images && images.length > 0 ? images[images.length - 1] : undefined;
   const [, forceRender] = React.useReducer((count: number) => count + 1, 0);
 
@@ -142,19 +142,38 @@ type AvatarProps = {
   size?: number;
   /** Shows the presence dot when true. */
   online?: boolean;
+  /** Makes the avatar a button. */
+  onClick?: () => void;
+  /** Overrides the tooltip and, when clickable, the accessible name. */
+  label?: string;
   className?: string;
 };
 
-export function Avatar({ id, name, images, size = 48, online = false, className }: AvatarProps) {
+export function Avatar({
+  id,
+  name,
+  images,
+  size = 48,
+  online = false,
+  className,
+  onClick,
+  label,
+}: AvatarProps) {
   const { background, foreground } = paletteFor(id);
   const image = useAvatarImage(images);
+
+  // A button only when it does something. An avatar that is merely decorative
+  // must not be in the tab order or announce itself as actionable.
+  const Tag = onClick ? 'button' : 'div';
 
   return (
     // The tint stays under the image rather than being dropped: it is what
     // shows through a photo with transparency, and what is on screen for the
     // moment between the element being laid out and the image decoding.
-    <div
-      className={className ? `avatar ${className}` : 'avatar'}
+    <Tag
+      className={[className ? `avatar ${className}` : 'avatar', onClick && 'avatar--clickable']
+        .filter(Boolean)
+        .join(' ')}
       style={
         {
           '--avatar-size': `${size}px`,
@@ -162,7 +181,10 @@ export function Avatar({ id, name, images, size = 48, online = false, className 
           color: foreground,
         } as React.CSSProperties
       }
-      title={name}
+      title={label ?? name}
+      aria-label={onClick ? (label ?? name) : undefined}
+      onClick={onClick}
+      type={onClick ? 'button' : undefined}
     >
       {image === undefined ? (
         <span className="avatar__initials">{initialsFor(name)}</span>
@@ -172,6 +194,6 @@ export function Avatar({ id, name, images, size = 48, online = false, className 
         <img className="avatar__image" src={image} alt="" draggable={false} />
       )}
       {online && <span className="avatar__presence" aria-label="online" />}
-    </div>
+    </Tag>
   );
 }

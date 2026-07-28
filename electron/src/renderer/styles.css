@@ -55,6 +55,19 @@
    */
   --traffic-light-inset: 10px;
   --titlebar-reserve: 40px;
+  /*
+   * What a bubble has to leave beside it, so the widest step cannot squeeze the
+   * controls off the edge:
+   *
+   *   avatar column (28) + its gap (8)          = 36
+   *   hover row: 3 x 20 buttons + 2 x 12 gaps   = 84
+   *   the row's own offset from the bubble      =  8
+   *
+   * Derived rather than picked, because all three numbers are set elsewhere and
+   * a bubble that overlaps its own action row is not obviously a width bug.
+   */
+  --message-gutter: 128px;
+
   --bubble-radius: 18px;
   --bubble-radius-tight: 4px;
   --avatar-size: 48px;
@@ -92,6 +105,8 @@
 
   --scrollbar-thumb: rgba(0, 0, 0, 0.2);
   --overlay: rgba(0, 0, 0, 0.4);
+  /* What the presence ring is cut out of; each pane overrides it. */
+  --avatar-ring: #ffffff;
   --panel-background: #ffffff;
   --menu-item-active: var(--gray-15);
   --shadow: 0 4px 20px rgba(0, 0, 0, 0.16);
@@ -126,6 +141,7 @@
 
   --scrollbar-thumb: rgba(255, 255, 255, 0.2);
   --overlay: rgba(0, 0, 0, 0.6);
+  --avatar-ring: var(--gray-90);
   --panel-background: var(--gray-80);
   --menu-item-active: var(--gray-65);
   --shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
@@ -208,6 +224,30 @@ textarea {
   background-clip: padding-box;
 }
 
+/*
+ * Overlays opt out of the window's drag regions.
+ *
+ * On macOS the window is frameless and the pane headers carry
+ * `-webkit-app-region: drag` so the title bar band can be used to move the
+ * window. Chromium hands those regions to the OS as *window-level rectangles*,
+ * and an element painted on top of one does not exclude itself — it has to say
+ * so. Without this, the close button on the image viewer sits at `top: 12px`,
+ * inside the 40px band, and every press on it moved the window instead: the
+ * button never saw a click, so Escape closed the viewer and the X did nothing.
+ *
+ * Anything that can cover the top band needs this, which is every overlay that
+ * positions itself against the viewport.
+ */
+.image-viewer,
+.modal__backdrop,
+.menu--at-pointer,
+.reaction-picker,
+.reaction-viewer,
+.emoji-picker,
+.emoji-suggestions {
+  -webkit-app-region: no-drag;
+}
+
 /* Keyboard users get a visible ring; pointer users do not. */
 :focus-visible {
   outline: 2px solid var(--ultramarine);
@@ -288,6 +328,7 @@ textarea {
  * that module clamps to — keep the three in step.
  */
 .left-pane {
+  --avatar-ring: var(--left-pane-background);
   position: relative;
   width: var(--left-pane-width);
   min-width: 240px;
@@ -537,11 +578,15 @@ textarea {
 
 .conversation-row:hover {
   background: var(--row-hover);
+  /* The presence ring is cut out of whatever is behind the avatar, and on a
+     row that is hovered or selected that is no longer the pane. */
+  --avatar-ring: var(--row-hover);
 }
 
 .conversation-row--selected,
 .conversation-row--selected:hover {
   background: var(--row-selected);
+  --avatar-ring: var(--row-selected);
 }
 
 .conversation-row__body {
@@ -663,6 +708,17 @@ textarea {
  * Avatars
  * -------------------------------------------------------------------------- */
 
+/* Clickable avatars are buttons, and a button brings its own resets. */
+.avatar--clickable {
+  cursor: pointer;
+  padding: 0;
+  border: none;
+}
+
+.avatar--clickable:hover {
+  filter: brightness(0.92);
+}
+
 .avatar {
   position: relative;
   flex-shrink: 0;
@@ -682,15 +738,30 @@ textarea {
   letter-spacing: 0.01em;
 }
 
+/*
+ * Presence, sized and placed against the avatar rather than fixed.
+ *
+ * It was 12px whatever the avatar was — a third the width of a 28px timeline
+ * avatar and a speck on a 96px one — and pinned to `right: 0; bottom: 0`, which
+ * on a circle is the corner of the *bounding box*, so it floated off the edge
+ * at 45 degrees rather than sitting on it. The inset below places it on the
+ * circumference, and the ring is what separates it from a dark photo.
+ *
+ * The ring takes the colour of whatever the avatar is drawn on, which differs
+ * between the sidebar and the conversation in dark mode; each pane sets it.
+ */
 .avatar__presence {
   position: absolute;
-  right: 0;
-  bottom: 0;
-  width: 12px;
-  height: 12px;
+  /* Sits on the circle's edge: cos(45°) ≈ 0.707, so the inset from the corner
+     is about 15% of the diameter once the dot's own size is allowed for. */
+  right: 6%;
+  bottom: 6%;
+  width: max(8px, calc(var(--avatar-size) * 0.26));
+  height: max(8px, calc(var(--avatar-size) * 0.26));
   border-radius: 50%;
   background: var(--green);
-  border: 2px solid var(--left-pane-background);
+  box-shadow: 0 0 0 max(1.5px, calc(var(--avatar-size) * 0.045)) var(--avatar-ring);
+  transform: translate(35%, 35%);
 }
 
 /* --------------------------------------------------------------------------
@@ -814,15 +885,40 @@ textarea {
 }
 
 /*
- * Signal's `.module-message__container-outer`: 306px, widening in two steps as
- * the window grows.
+ * Signal's `.module-message__container-outer`, with its widest step corrected.
  *
- * This was the largest single departure. At `min(480px, 70%)` a paragraph ran
- * nearly twice as wide as Signal's, which changes where every line breaks and
- * is most of why the timeline read as a different application even where the
- * colours matched. A container query rather than a viewport one, because what
- * decides the measure is how much room the timeline has — the sidebar is
- * resizable and either right-hand panel can be open.
+ * The steps and their thresholds are Signal's, measured on the timeline's own
+ * width (`getWidthBreakpoint`, `timelineUtil.std.ts:211`): 306px below 515,
+ * 370px below 607, and wider above that.
+ *
+ * The widest step is where this deliberately departs. Signal uses `50vw` —
+ * *viewport* width, not timeline width — and their own source says why:
+ *
+ *   NOTE(evanhahn): I wanted this to be 66% of the timeline, but I could not
+ *   make that work without introducing layout bugs for some message types.
+ *   This constant, though not ideal, fixes those bugs.
+ *
+ * So 50vw is a workaround for a constraint we do not have. It also is not 50%
+ * of anything the reader can see: with a 300px sidebar on a 1600px window the
+ * timeline is 1300px and 50vw is 800px — 62% of it. Taking the number at face
+ * value and writing `50%` of the container, which is what this used to do,
+ * produced 650px and a noticeably narrower column than Signal's.
+ *
+ * The unit is the substance of it, not a detail. Because Signal's cap is a
+ * fraction of the *window* and ours is a fraction of the *column*, Signal's
+ * share of the column grows as the sidebar takes more of a smaller window —
+ * 64% of the column on a 1400px window with a 300px sidebar, but 78% of it once
+ * that sidebar is dragged to 500px. A fixed percentage of the column cannot
+ * follow that, and is visibly narrower exactly when somebody has made the
+ * sidebar wide.
+ *
+ * So the proportional term is whichever is larger: Signal's number, or the 66%
+ * their note says they were aiming for. That is never narrower than Signal in
+ * any geometry, and wider on the roomy ones where they said they wanted more.
+ *
+ * What actually bounds it is the furniture either side: the avatar column, and
+ * the hover action row, which lives in the gutter and must not be pushed off
+ * the edge.
  */
 .message-group__stack {
   display: flex;
@@ -839,15 +935,15 @@ textarea {
   position: relative;
 }
 
-@container timeline (min-width: 689px) {
+@container timeline (min-width: 515px) {
   .message-group__stack {
     max-width: 370px;
   }
 }
 
-@container timeline (min-width: 1000px) {
+@container timeline (min-width: 607px) {
   .message-group__stack {
-    max-width: 50%;
+    max-width: min(max(50vw, 66%), calc(100% - var(--message-gutter)));
   }
 }
 
@@ -1454,17 +1550,26 @@ textarea {
  * covered by it: a fixed amount of quiet space above the composer, rather than
  * a variable amount of movement.
  */
+/*
+ * A line of type, not a bubble.
+ *
+ * Drawn as a bubble it reads as a *message* — the same shape, the same fill, in
+ * the place the next message will appear — so a glance at the thread counts it
+ * as one. It is not a message; it is a note about the thread, and it belongs in
+ * the same register as a date separator.
+ *
+ * Dropping the fill also lets it shrink: the padding existed to give the bubble
+ * a body, and without one the whole strip is about half the height.
+ */
 .typing {
   position: absolute;
   inset-inline-start: 16px;
-  bottom: 6px;
+  bottom: 4px;
   z-index: 2;
   display: flex;
   align-items: center;
-  gap: 4px;
-  padding: 11px 14px;
-  border-radius: var(--bubble-radius);
-  background: var(--bubble-incoming-background);
+  gap: 6px;
+  padding: 2px 2px;
   width: fit-content;
   max-width: calc(100% - 32px);
   /* Long enough to register as arriving, short enough not to be a transition
@@ -1486,8 +1591,8 @@ textarea {
 }
 
 .typing__dot {
-  width: 7px;
-  height: 7px;
+  width: 5px;
+  height: 5px;
   border-radius: 50%;
   background: var(--text-tertiary);
   animation: typing-pulse 1.4s infinite ease-in-out;

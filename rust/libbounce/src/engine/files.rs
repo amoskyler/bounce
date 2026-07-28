@@ -515,7 +515,7 @@ impl<N: Network + 'static> Engine<N> {
             self.store.set_file_path(file_id, &record.path)?;
         }
 
-        self.request_missing_chunks(&record).await
+        self.seed_chunk_engine(&record)
     }
 
     /// Broadcast each file's metadata, then advertise every chunk of it.
@@ -559,6 +559,11 @@ impl<N: Network + 'static> Engine<N> {
         let body = crate::msgpack::to_vec(&offer)?;
         let container = SignedContainer::create(&self.key, body);
         offer.signed = SignedFrame::from_container(&container);
+
+        // Kept, like any other frame we author, so the reference flow can hand
+        // it to a peer that was not connected when it went out — including a
+        // device that did not exist yet.
+        self.store.save_chunk_offer(&offer)?;
 
         tracing::debug!(file = %record.id, hash = %hash, "offering a chunk");
         self.broadcast(&offer).await
@@ -642,15 +647,18 @@ impl<N: Network + 'static> Engine<N> {
         // happens to share them.
         self.report_progress(&record).await?;
 
-        // Relay onward, then ask whoever has already offered chunks for them.
+        // Relay onward, then hand the chunk engine whatever holders we already
+        // know of. Offers routinely arrive before the record that explains
+        // them, so the stored ones are consulted here rather than assumed
+        // absent (`chat/file.go:300-319`).
         self.broadcast(&record).await?;
-        self.request_missing_chunks(&record).await?;
+        self.seed_chunk_engine(&record)?;
         Ok(())
     }
 
     /// Somebody says they hold a chunk. Remember where, and ask for it if we
     /// want it.
-    pub(super) async fn handle_chunk_offer(&self, _peer: &str, payload: &[u8]) -> Result<()> {
+    pub(super) async fn handle_chunk_offer(&self, peer: &str, payload: &[u8]) -> Result<()> {
         let (mut offer, signed) = self.unpack_signed::<ChunkOffer>(payload)?;
         offer.signed = signed;
 
@@ -673,15 +681,20 @@ impl<N: Network + 'static> Engine<N> {
             ));
         }
 
-        // Offers are not stored as frames, so gossip is bounded by novelty
-        // instead: an offer that tells us nothing new goes no further.
-        if !self
-            .store
-            .record_chunk_location(&offer.hash, &offer.location, offer.timestamp)?
-        {
-            tracing::trace!(hash = %offer.hash, "a chunk offer we already had");
+        // An offer already held is neither stored again nor relayed, which is
+        // what bounds the gossip — Go decides this on the frame id
+        // (`chat/file.go:462-471`) and so does this.
+        //
+        // It used to be decided on (hash, location) with nothing stored at
+        // all. That bounds the relay just as well and throws the frame away,
+        // and a frame thrown away is one the reference flow can never replay:
+        // it is why a file arriving through catch-up knew of no holder.
+        if !self.store.save_chunk_offer(&offer)? {
+            tracing::trace!(offer = %offer.id, hash = %offer.hash, "a chunk offer we already had");
             return Ok(());
         }
+        self.store
+            .record_chunk_location(&offer.hash, &offer.location, offer.timestamp)?;
         tracing::debug!(
             file = %offer.file_id, hash = %offer.hash, from = %offer.location,
             "a chunk was offered",
@@ -702,7 +715,26 @@ impl<N: Network + 'static> Engine<N> {
             return Ok(());
         }
 
-        self.request_chunk(&offer.hash, &offer.location).await;
+        self.send_ack(peer, offer.id, FrameType::ChunkOffer).await;
+
+        // Whoever sent it plainly has it, so it is never offered back to them
+        // (`chat/remote_device.go:243`).
+        self.store
+            .record_delivery(&crate::frames::transport::DeliveryRecord::new(
+                peer.to_string(),
+                offer.id,
+                FrameType::ChunkOffer,
+                crate::now(),
+            ))?;
+
+        // Handed to the scheduler rather than acted on here. Offers gossip, so
+        // the holder named is very often somebody we have never spoken to, and
+        // asking on the spot was how a request came to be written to nobody
+        // and never repeated.
+        self.chunk_engine
+            .lock()
+            .expect("chunk engine")
+            .add_offer(&offer.hash, &offer.location, &self.network.address());
         Ok(())
     }
 
@@ -777,6 +809,9 @@ impl<N: Network + 'static> Engine<N> {
             self.store.mark_chunk_downloaded(file_id, index)?;
         }
 
+        // Nobody needs to go looking for this one any more.
+        self.chunk_engine.lock().expect("chunk engine").completed(&hash);
+
         // Having it means we can serve it.
         self.offer_chunk(&record, &hash).await?;
         self.report_progress(&record).await?;
@@ -788,19 +823,98 @@ impl<N: Network + 'static> Engine<N> {
         let reply: ChunkUnavailable = crate::msgpack::from_slice(payload)?;
         self.store.forget_chunk_location(&reply.hash, peer)?;
 
-        // Try the next holder we know of, if there is one.
-        for location in self.store.chunk_locations(&reply.hash)? {
-            if location != peer {
-                self.request_chunk(&reply.hash, &location).await;
-                break;
-            }
-        }
+        // Struck off as a holder. The scheduler picks another on its next
+        // pass, so there is nothing to chase here (`chat/file.go:1796`).
+        self.chunk_engine
+            .lock()
+            .expect("chunk engine")
+            .remove(peer, &reply.hash);
         Ok(())
     }
 
     // ---------------------------------------------------------------------
     // Fetching
     // ---------------------------------------------------------------------
+
+    /// Give the scheduler every holder we know of for a file's chunks.
+    ///
+    /// Offers and file records race, and either can arrive first — an offer
+    /// for a file we have never heard of is remembered, and a record for a
+    /// file whose offers arrived first has to go looking for them. This is the
+    /// second case (`chat/file.go:300-319`).
+    fn seed_chunk_engine(&self, record: &File) -> Result<()> {
+        if !record.wanted {
+            return Ok(());
+        }
+        let me = self.network.address();
+        let mut engine = self.chunk_engine.lock().expect("chunk engine");
+        for hash in record.chunk_hashes() {
+            if self.store.has_chunk(&hash)? {
+                continue;
+            }
+            for location in self.store.chunk_locations(&hash)? {
+                engine.add_offer(&hash, &location, &me);
+            }
+        }
+        Ok(())
+    }
+
+    /// Load the scheduler from what the database already knows.
+    ///
+    /// Every offer we hold for a chunk of an unfinished file, which is how a
+    /// download interrupted by a restart resumes (`chat/chunk_engine.go:30`).
+    pub(super) fn load_chunk_engine(&self) -> Result<()> {
+        let me = self.network.address();
+        let offers = self.store.offers_for_wanted_chunks(&me)?;
+        let mut engine = self.chunk_engine.lock().expect("chunk engine");
+        for offer in offers {
+            engine.add_offer(&offer.hash, &offer.location, &me);
+        }
+        Ok(())
+    }
+
+    /// Ask for whatever the scheduler says to ask for, for as long as the
+    /// engine runs.
+    ///
+    /// Spawned once at start-up. Everything that wants bytes adds holders to
+    /// the engine and returns; this is the only thing that sends a request, so
+    /// there is exactly one place that decides who is asked and how often.
+    pub async fn run_chunk_engine(self: std::sync::Arc<Self>) {
+        if let Err(error) = self.load_chunk_engine() {
+            tracing::warn!(%error, "could not load the chunk engine");
+        }
+
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(super::chunks::TICK_SECONDS)).await;
+            self.make_any_chunk_requests().await;
+        }
+    }
+
+    /// One pass of the scheduler.
+    pub(super) async fn make_any_chunk_requests(&self) {
+        // Both of these are read before the lock is taken, so the engine never
+        // holds it across a database call or a write to the network.
+        let wanted = match self.store.wanted_chunk_hashes() {
+            Ok(wanted) => wanted,
+            Err(error) => {
+                tracing::warn!(%error, "could not work out which chunks are still wanted");
+                return;
+            }
+        };
+        let connected = self.connected_addresses_now();
+
+        let plan = {
+            let mut engine = self.chunk_engine.lock().expect("chunk engine");
+            if engine.is_idle() {
+                return;
+            }
+            engine.plan(&connected, &wanted, crate::now())
+        };
+
+        for (location, hash) in plan {
+            self.request_chunk(&hash, &location).await;
+        }
+    }
 
     /// Ask one device for one chunk.
     async fn request_chunk(&self, hash: &str, location: &str) {
@@ -818,43 +932,6 @@ impl<N: Network + 'static> Engine<N> {
             }
             Err(error) => tracing::warn!(%error, "could not encode a chunk request"),
         }
-    }
-
-    /// Ask for every chunk of a file we do not have, from whoever has offered
-    /// it.
-    async fn request_missing_chunks(&self, record: &File) -> Result<()> {
-        if !record.wanted {
-            return Ok(());
-        }
-        for hash in record.chunk_hashes() {
-            if self.store.has_chunk(&hash)? {
-                continue;
-            }
-            // One holder at a time: a `ChunkUnavailable` moves on to the next,
-            // so asking everyone at once would only duplicate the transfer.
-            if let Some(location) = self.store.chunk_locations(&hash)?.into_iter().next() {
-                self.request_chunk(&hash, &location).await;
-            }
-        }
-        Ok(())
-    }
-
-    /// Ask a device that just connected for anything still outstanding.
-    ///
-    /// Chunk offers are ephemeral — they are not stored, so the reference flow
-    /// never replays them — which means a download interrupted by a
-    /// disconnection would otherwise never resume. Asking the peer directly
-    /// costs one frame per missing chunk and is answered with
-    /// [`ChunkUnavailable`] if they do not have it.
-    pub(super) async fn resume_downloads(&self, peer: &str) -> Result<()> {
-        for record in self.store.incomplete_wanted_files()? {
-            for hash in record.chunk_hashes() {
-                if !self.store.has_chunk(&hash)? {
-                    self.request_chunk(&hash, peer).await;
-                }
-            }
-        }
-        Ok(())
     }
 
     /// Emit how far along a file is, and mark it done once it is whole.

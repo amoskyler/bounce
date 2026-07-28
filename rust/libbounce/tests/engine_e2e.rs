@@ -48,6 +48,9 @@ async fn start(name: &str, directory: Arc<StaticDirectory>) -> Instance {
         .expect("creates a profile");
 
     tokio::spawn(Arc::clone(&engine).run_listener());
+    // The chunk engine is what issues chunk requests; the application spawns it
+    // alongside the listener (`bounce-node/src/lib.rs`), so the harness does too.
+    tokio::spawn(Arc::clone(&engine).run_chunk_engine());
 
     Instance {
         engine,
@@ -3034,4 +3037,49 @@ async fn withdrawing_a_reaction_reaches_a_peer_who_was_offline() {
         );
         assert!(shown.is_empty(), "{name} resurrected the reaction: {shown:?}");
     }
+}
+
+#[tokio::test]
+async fn a_connected_contact_is_online_in_the_snapshot_and_stays_online_across_an_update() {
+    // Presence reaches the client twice over: once in the boot snapshot, and
+    // once per `UserOnline`. The events fire when a session opens and never
+    // again, so anything that rebuilds a contact's record from a view has to
+    // carry the same answer — otherwise the two disagree and the last one to
+    // arrive wins.
+    //
+    // Both got it wrong in the same way, by reporting a constant `false`: a
+    // restart showed every contact offline until they happened to reconnect,
+    // and a contact who merely changed their name went grey mid-conversation.
+    let directory = Arc::new(StaticDirectory::new());
+    let mut alice = start("Alice", Arc::clone(&directory)).await;
+    let bob = start("Bob", Arc::clone(&directory)).await;
+
+    introduce(&alice, &bob);
+
+    // Nobody is dialled yet, so the honest answer is offline.
+    let cold = alice.engine.initial_state().unwrap();
+    let bob_view = cold.users.iter().find(|user| user.id == bob.user.id).unwrap();
+    assert!(!bob_view.online, "no session, no presence");
+
+    Arc::clone(&alice.engine).connect(&bob.address).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let warm = alice.engine.initial_state().unwrap();
+    let bob_view = warm.users.iter().find(|user| user.id == bob.user.id).unwrap();
+    assert!(bob_view.online, "a snapshot taken mid-session must say so");
+
+    // And an update about Bob must not be the thing that takes it away.
+    bob.engine.update_profile_name("Bobby").await.expect("renames");
+
+    let updated = wait_for(&mut alice.events, "Bob's new name", |event| match event {
+        Event::UserUpdated { user } if user.id == bob.user.id => Some(user.clone()),
+        _ => None,
+    })
+    .await;
+
+    assert_eq!(updated.name, "Bobby");
+    assert!(
+        updated.online,
+        "a profile update must not report a connected contact offline",
+    );
 }

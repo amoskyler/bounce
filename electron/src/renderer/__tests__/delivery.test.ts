@@ -10,7 +10,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { DELIVERY_LABELS, deliveryState, type Deliverable } from '../delivery';
+import {
+  DELIVERY_LABELS,
+  deliveryState,
+  showsDeliveryState,
+  type Deliverable,
+} from '../delivery';
 
 function message(overrides: Partial<Deliverable> = {}): Deliverable {
   return {
@@ -68,4 +73,21 @@ test('every state has a label', () => {
     assert.equal(typeof DELIVERY_LABELS[state], 'string');
     assert.ok(DELIVERY_LABELS[state].length > 0, state);
   }
+});
+
+test('a note to self carries no delivery state at all', () => {
+  // Notes to self are threaded under your own id, and the engine drops the
+  // author from the list of who was reached — a copy on your own second device
+  // is the same person twice, not a delivery. So the ladder has no rung a note
+  // to self can ever stand on, and `deliveryState` answers `sending` for one
+  // that arrived the instant it was written.
+  assert.equal(deliveryState(message()), 'sending');
+  assert.equal(showsDeliveryState({ thread: 'me' }, 'me'), false);
+});
+
+test('every other thread still shows one', () => {
+  assert.equal(showsDeliveryState({ thread: 'ada' }, 'me'), true);
+  // Before the profile has loaded there is no id to compare against, and a
+  // missing tick reads as a delivery fact rather than as a missing answer.
+  assert.equal(showsDeliveryState({ thread: 'ada' }, undefined), true);
 });

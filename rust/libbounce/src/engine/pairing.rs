@@ -58,6 +58,16 @@ use crate::wire::RawFrame;
 
 use super::{Engine, Event};
 
+/// How long to wait for a reference offer to be acknowledged before sending it
+/// again (`referenceRetrySeconds`, `chat/reference_engine.go:24`).
+const REFERENCE_OFFER_RETRY_SECONDS: u64 = 30;
+
+/// How long to keep trying before accepting that the peer is not listening.
+const REFERENCE_OFFER_GIVE_UP_SECONDS: i64 = 60;
+
+/// How often to look for the acknowledgement while waiting for it.
+const REFERENCE_OFFER_POLL_MILLIS: u64 = 100;
+
 impl<N: Network + 'static> Engine<N> {
     // ---------------------------------------------------------------------
     // On the device that already has the profile
@@ -143,7 +153,7 @@ impl<N: Network + 'static> Engine<N> {
             // know how much of it landed.
             self.store.forget_deliveries_to(peer)?;
             self.accept_sync(peer, &profile, false).await?;
-            self.offer_references_to(peer).await;
+            self.offer_references_to_soon(peer);
             return Ok(());
         }
 
@@ -182,7 +192,7 @@ impl<N: Network + 'static> Engine<N> {
         self.accept_sync(peer, &profile, true).await?;
 
         self.emit(Event::DeviceAdded {
-            device: self.device_view(&device, false, true),
+            device: self.device_view(&device, false),
         });
 
         // Everyone else in the profile, and every contact, needs to know the
@@ -195,7 +205,7 @@ impl<N: Network + 'static> Engine<N> {
         ))?;
         self.broadcast(&device).await?;
 
-        self.offer_references_to(peer).await;
+        self.offer_references_to_soon(peer);
         Ok(())
     }
 
@@ -242,18 +252,128 @@ impl<N: Network + 'static> Engine<N> {
         Ok(!self.build_reference_offer(peer)?.references.is_empty())
     }
 
-    async fn offer_references_to(&self, peer: &str) {
-        let Ok(offer) = self.build_reference_offer(peer) else {
-            return;
-        };
-        if offer.references.is_empty() {
-            return;
+    /// Ask for a reference offer to be sent to a peer.
+    ///
+    /// Returns immediately; the offer is sent, and resent if it is not
+    /// acknowledged, on a background task. Go spawns `sendReferences` the same
+    /// way from almost every one of its call sites.
+    pub(super) fn offer_references_to_soon(&self, peer: &str) {
+        let _ = self.reference_offers.send(peer.to_string());
+    }
+
+    /// Send a reference offer, and keep sending it until it is acknowledged.
+    ///
+    /// A reference offer is not a stored frame, so nothing re-offers it: if it
+    /// is lost, the peer simply never learns that any of this exists. And it
+    /// is lost more easily than most, because the moment it is most needed is
+    /// the moment a connection has just been re-established — Go's own comment
+    /// notes that sockets are often "disconnected but not yet reporting
+    /// errors" at exactly that point. This port sent it once.
+    ///
+    /// The offer is rebuilt on each attempt rather than resent verbatim, so an
+    /// attempt that follows a partial success carries only what is still
+    /// outstanding (`chat/reference_offer.go:140-178`).
+    pub(super) async fn offer_references_to(&self, peer: &str) {
+        let deadline = crate::now() + REFERENCE_OFFER_GIVE_UP_SECONDS;
+
+        loop {
+            let Ok(offer) = self.build_reference_offer(peer) else {
+                return;
+            };
+            if offer.references.is_empty() {
+                return;
+            }
+            let Ok(payload) = offer.encode() else {
+                return;
+            };
+            self.send_to(peer, RawFrame::new(FrameType::ReferenceOffer.as_u16(), payload))
+                .await;
+
+            // Go sleeps the whole interval and then looks once. Polling for
+            // it instead is the same protocol behaviour — resend after the
+            // interval, give up after the deadline — and it lets a peer that
+            // answered in milliseconds be released in milliseconds, which
+            // matters because nothing else can offer to this peer while this
+            // is running.
+            let waited_until = crate::now() + REFERENCE_OFFER_RETRY_SECONDS as i64;
+            let mut acknowledged = false;
+            while crate::now() < waited_until {
+                if self
+                    .store
+                    .is_delivered_to(peer, offer.id, FrameType::ReferenceOffer)
+                    .unwrap_or(false)
+                {
+                    acknowledged = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    REFERENCE_OFFER_POLL_MILLIS,
+                ))
+                .await;
+            }
+
+            // Acknowledged: the tracking row has done its job and is consumed,
+            // because nothing else will ever clear it.
+            if acknowledged {
+                let _ = self
+                    .store
+                    .forget_delivery(peer, offer.id, FrameType::ReferenceOffer);
+                return;
+            }
+
+            if crate::now() >= deadline {
+                tracing::warn!(%peer, "gave up trying to deliver a reference offer");
+                return;
+            }
         }
-        let Ok(payload) = offer.encode() else {
-            return;
-        };
-        self.send_to(peer, RawFrame::new(FrameType::ReferenceOffer.as_u16(), payload))
-            .await;
+    }
+
+    /// Serve reference-offer requests for as long as the engine runs.
+    ///
+    /// One task per peer at a time: a second request for a peer already being
+    /// offered to is folded into the one in flight, which rebuilds the offer
+    /// on its next attempt anyway. Go achieves the same with a per-peer mutex.
+    pub async fn run_reference_offers(
+        self: Arc<Self>,
+        mut requests: tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
+        // Peer address to whether another request came in while we were busy
+        // with that peer. Present means in flight; `true` means go again.
+        let in_flight: Arc<tokio::sync::Mutex<std::collections::HashMap<String, bool>>> =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
+        while let Some(peer) = requests.recv().await {
+            {
+                let mut flight = in_flight.lock().await;
+                if let Some(again) = flight.get_mut(&peer) {
+                    // Dropping it instead would lose the offer entirely: what
+                    // is outstanding when the second request arrives is not
+                    // what the first one sent, and the first is not going to
+                    // look again.
+                    *again = true;
+                    continue;
+                }
+                flight.insert(peer.clone(), false);
+            }
+
+            let engine = Arc::clone(&self);
+            let flight = Arc::clone(&in_flight);
+            tokio::spawn(async move {
+                loop {
+                    engine.offer_references_to(&peer).await;
+                    let mut held = flight.lock().await;
+                    match held.get(&peer) {
+                        Some(true) => {
+                            held.insert(peer.clone(), false);
+                        }
+                        _ => {
+                            held.remove(&peer);
+                            return;
+                        }
+                    }
+                }
+            });
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -351,7 +471,7 @@ impl<N: Network + 'static> Engine<N> {
 
         for device in &profile.devices {
             self.emit(Event::DeviceAdded {
-                device: self.device_view(device, device.address == me, device.address == peer),
+                device: self.device_view(device, device.address == me),
             });
         }
         self.emit(Event::ProfileCreated {
@@ -360,7 +480,7 @@ impl<N: Network + 'static> Engine<N> {
                 .devices
                 .iter()
                 .find(|device| device.address == me)
-                .map(|device| self.device_view(device, true, true))
+                .map(|device| self.device_view(device, true))
                 .expect("checked above"),
         });
 
@@ -546,6 +666,77 @@ impl<N: Network + 'static> Engine<N> {
     }
 
     /// Somebody's device group changed.
+    /// Somebody's device group grew.
+    ///
+    /// A `Device` frame is how a device added to any profile — ours or a
+    /// contact's — becomes known to everyone else. It is broadcast globally by
+    /// whoever admitted it (`handle_sync_device_request`) and gossiped onward
+    /// from there.
+    ///
+    /// This port had no handler for it at all, so a frame it broadcasts itself
+    /// fell into the dispatcher's "no handler for frame type yet" arm on every
+    /// peer that received it. Go has had `handleDevice` since the beginning
+    /// (`chat/protocol.go:203`, `chat/device.go:91`), and this follows it.
+    pub(super) async fn handle_device(&self, peer: &str, payload: &[u8]) -> Result<()> {
+        let device: Device = crate::msgpack::from_slice(payload)?;
+
+        // Nothing from a blocked user, though a peer who is not themselves
+        // blocked still gets an acknowledgement so they stop offering it.
+        if self
+            .store
+            .user(device.user_id)?
+            .is_some_and(|user| user.blocked)
+        {
+            if let Some(peer_device) = self.store.device_by_address(peer)? {
+                let blocked = self
+                    .store
+                    .user(peer_device.user_id)?
+                    .is_some_and(|user| user.blocked);
+                if !blocked {
+                    self.send_ack(peer, device.id, FrameType::Device).await;
+                }
+            }
+            return Ok(());
+        }
+
+        // Already known. Acknowledged so it stops being offered, and not
+        // gossiped onward — that is what bounds the relay.
+        if self.store.device_by_address(&device.address)?.is_some() {
+            self.send_ack(peer, device.id, FrameType::Device).await;
+            return Ok(());
+        }
+
+        let Some(owner) = self.store.user(device.user_id)? else {
+            return Err(Error::InvalidFrame(
+                "a device for a user we have never heard of".into(),
+            ));
+        };
+
+        // The introduction has to check out against the group we already hold.
+        // Without this the frame is an invitation to add any device to anyone's
+        // group and have every other device believe it.
+        if !device_group::is_valid_addition(&owner, &device) {
+            return Err(Error::NotPermitted(
+                "that device does not fit the device group it claims",
+            ));
+        }
+
+        let mut device = device;
+        device.saved_at = crate::now();
+        self.store.save_device(&device)?;
+        self.send_ack(peer, device.id, FrameType::Device).await;
+
+        // Only our own device group is something the interface lists.
+        if Some(device.user_id) == self.store.my_user_id().ok() {
+            self.emit(Event::DeviceAdded {
+                device: self.device_view(&device, false),
+            });
+        }
+
+        self.broadcast(&device).await?;
+        Ok(())
+    }
+
     pub(super) async fn handle_update_device(&self, peer: &str, payload: &[u8]) -> Result<()> {
         let (mut update, signed) = self.unpack_signed::<UpdateDevice>(payload)?;
         update.signed = signed;
@@ -607,7 +798,7 @@ impl<N: Network + 'static> Engine<N> {
 
         if let Ok(Some(device)) = self.store.device_by_address(address) {
             self.emit(Event::DeviceUpdated {
-                device: self.device_view(&device, false, false),
+                device: self.device_view(&device, false),
             });
         }
         Ok(())

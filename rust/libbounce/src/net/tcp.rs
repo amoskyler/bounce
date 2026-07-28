@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use tokio::net::{TcpListener, TcpStream};
 
-use super::{accept_handshake, dial_handshake, HandshakeMode, Network, PeerConnection};
+use super::{accept_handshake, dial_handshake, Network, PeerConnection};
 use crate::crypto::DeviceKey;
 use crate::error::{Error, Result};
 
@@ -111,7 +111,6 @@ pub struct TcpNetwork {
     key: DeviceKey,
     listener: TcpListener,
     directory: Arc<StaticDirectory>,
-    handshake: HandshakeMode,
 }
 
 impl TcpNetwork {
@@ -125,17 +124,7 @@ impl TcpNetwork {
             key,
             listener,
             directory,
-            handshake: HandshakeMode::default(),
         })
-    }
-
-    /// Choose what this instance signs when dialing.
-    ///
-    /// See [`HandshakeMode`]: the compatible mode is required to reach a Go
-    /// peer and carries a real cost.
-    pub fn with_handshake_mode(mut self, mode: HandshakeMode) -> Self {
-        self.handshake = mode;
-        self
     }
 
     /// The socket this instance is listening on.
@@ -158,7 +147,7 @@ impl Network for TcpNetwork {
 
     async fn accept(&self) -> Result<PeerConnection<TcpStream>> {
         let (mut stream, _) = self.listener.accept().await?;
-        let peer_address = accept_handshake(&mut stream, &self.key.address()).await?;
+        let peer_address = accept_handshake(&mut stream).await?;
 
         Ok(PeerConnection {
             peer_address,
@@ -174,7 +163,7 @@ impl Network for TcpNetwork {
             .ok_or_else(|| Error::Network(format!("no route to {address}")))?;
 
         let mut stream = TcpStream::connect(socket).await?;
-        dial_handshake(&mut stream, &self.key, address, self.handshake).await?;
+        dial_handshake(&mut stream, &self.key).await?;
 
         Ok(PeerConnection {
             peer_address: address.to_string(),

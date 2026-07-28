@@ -304,14 +304,7 @@ impl<N: Network + 'static> Engine<N> {
             .store
             .devices_for_user(my_id)?
             .iter()
-            .map(|device| {
-                // Whether a peer device is connected lives behind an async
-                // lock, and this call is synchronous, so it reports only the
-                // one thing it can know without waiting: this device is up,
-                // because it is the one asking.
-                let local = device.address == address;
-                self.device_view(device, local, local)
-            })
+            .map(|device| self.device_view(device, device.address == address))
             .collect())
     }
 
@@ -340,7 +333,7 @@ impl<N: Network + 'static> Engine<N> {
 
         let local = device.address == self.network.address();
         self.emit(Event::DeviceUpdated {
-            device: self.device_view(&device, local, local),
+            device: self.device_view(&device, local),
         });
         Ok(())
     }

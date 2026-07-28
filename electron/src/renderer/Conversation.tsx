@@ -43,7 +43,7 @@ import {
   searchSlashCommands,
   type SlashCommand,
 } from './slash';
-import { deliveryState } from './delivery';
+import { deliveryState, showsDeliveryState } from './delivery';
 import {
   BounceLogo,
   DeliveryTick,
@@ -154,6 +154,7 @@ type ConversationProps = {
   onCopyAddress: () => void;
   onShowDetails: () => void;
   onShowMessageInfo: (message: Message) => void;
+  onShowUser: (userId: string) => void;
   onError: (message: string) => void;
 };
 
@@ -178,6 +179,7 @@ export function ConversationView({
   onCopyAddress,
   onShowDetails,
   onShowMessageInfo,
+  onShowUser,
   onError,
 }: ConversationProps) {
   const messages = state.messagesByThread[conversation.id] ?? [];
@@ -251,6 +253,7 @@ export function ConversationView({
         onReply={setReplyTo}
         onToggleReaction={toggleReaction}
         onDelete={deleteMessage}
+        onShowUser={onShowUser}
       />
 
       {conversation.invitationPending ? (
@@ -452,6 +455,7 @@ function Timeline({
   onReply,
   onToggleReaction,
   onDelete,
+  onShowUser,
 }: {
   threadId: string;
   messages: Message[];
@@ -467,6 +471,7 @@ function Timeline({
   onReply: (message: Message) => void;
   onToggleReaction: (message: Message, emoji: string, mine: boolean) => void;
   onDelete: (message: Message, everyone: boolean) => void;
+  onShowUser: (userId: string) => void;
 }) {
   const scrollRef = React.useRef<HTMLDivElement>(null);
   const atBottomRef = React.useRef(true);
@@ -762,6 +767,7 @@ function Timeline({
         onReply={onReply}
         onToggleReaction={onToggleReaction}
         onDelete={onDelete}
+        onShowUser={onShowUser}
         onJumpTo={jumpToMessage}
         flashed={flashedId === message.id}
         names={names}
@@ -899,6 +905,7 @@ function MessageRow({
   onReply,
   onToggleReaction,
   onDelete,
+  onShowUser,
   onJumpTo,
   flashed,
   names,
@@ -916,6 +923,8 @@ function MessageRow({
   onReply: (message: Message) => void;
   onToggleReaction: (message: Message, emoji: string, mine: boolean) => void;
   onDelete: (message: Message, everyone: boolean) => void;
+  /** Open somebody's details, whoever's conversation is selected. */
+  onShowUser: (userId: string) => void;
   /** Scroll to a message; false when it is not in this thread. */
   onJumpTo: (messageId: string) => boolean;
   /** Briefly highlighted, having just been jumped to. */
@@ -961,7 +970,16 @@ function MessageRow({
       <div className="message-group__avatar-slot">
         {/* In groups, the avatar sits beside the last bubble of an incoming run. */}
         {isGroup && !message.outgoing && !continuesAfter && (
-          <Avatar id={message.author} name={authorName} images={author?.images} size={28} />
+          <Avatar
+            id={message.author}
+            name={authorName}
+            images={author?.images}
+            size={28}
+            // The face is the most direct handle on the person in a group —
+            // the alternative is finding them again in the member list.
+            onClick={() => onShowUser(message.author)}
+            label={`Info about ${authorName}`}
+          />
         )}
       </div>
 
@@ -1030,7 +1048,9 @@ function MessageRow({
             {message.expiresAt > 0 && (
               <ExpireTimer expiresAt={message.expiresAt} writtenAt={message.writtenAt} />
             )}
-            {message.outgoing && !deleted && <DeliveryStatus message={message} />}
+            {message.outgoing && !deleted && showsDeliveryState(message, state.profile?.id) && (
+              <DeliveryStatus message={message} />
+            )}
           </span>
           {deleted ? (
             <span className="bubble__deleted">

@@ -5,7 +5,7 @@
 import * as React from 'react';
 
 import { Avatar } from './Avatar';
-import { deliveryState } from './delivery';
+import { deliveryState, showsDeliveryState } from './delivery';
 import {
   ComposeIcon,
   DeliveryTick,
@@ -325,7 +325,7 @@ function ConversationRow({ conversation, state, selected, onSelect }: RowProps) 
           {/* Signal puts the tick here too, so the list answers "did that
               send?" without opening the thread. Only when the newest message
               is ours and is not being displaced by a draft. */}
-          {!draft && latest?.outgoing && (
+          {!draft && latest?.outgoing && showsDeliveryState(latest, state.profile?.id) && (
             <DeliveryTick
               state={deliveryState(latest)}
               className="conversation-row__status"

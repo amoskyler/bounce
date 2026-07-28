@@ -29,6 +29,7 @@
 //! Only then is it stored. Handlers downstream can therefore treat a stored
 //! frame as authentic, and nothing re-checks it.
 
+mod chunks;
 pub mod event;
 pub mod files;
 pub mod interaction;
@@ -38,10 +39,10 @@ pub mod retention;
 pub mod settings;
 pub mod system;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex};
 use uuid::Uuid;
 
 pub use event::{
@@ -62,7 +63,7 @@ use crate::frames::pairing::{
     AddUser, AddUserRequest, AddUserRequestAccepted, AddUserRequestRejected, SyncDeviceOffer,
 };
 use crate::frames::message::{DirectMessage, Draft, GroupMessage, ReadReceipt, TypingIndicator};
-use crate::frames::update::{UpdateDm, UpdateDmType, UpdateUser};
+use crate::frames::update::{UpdateDeviceType, UpdateDm, UpdateDmType, UpdateUser};
 use crate::frames::transport::{
     Ack, CatchUp, CatchUpFrame, DeliveryRecord, ReferenceOffer, ReferenceRequest,
 };
@@ -183,7 +184,15 @@ pub struct Engine<N: Network> {
     store: Arc<Store>,
     network: Arc<N>,
     events: mpsc::UnboundedSender<Event>,
-    peers: RwLock<HashMap<String, Peer>>,
+    /// The open sessions, under a *synchronous* lock.
+    ///
+    /// It has to be readable without awaiting, because who is connected is
+    /// part of the boot snapshot and `initial_state` is called straight from
+    /// the client rather than from inside the runtime. Nothing here is ever
+    /// held across an await — every use takes the guard, writes to some
+    /// channels, and drops it — so an async lock bought nothing but the
+    /// inability to answer that question.
+    peers: std::sync::RwLock<HashMap<String, Peer>>,
     /// Serialises frame handling. Handlers read-modify-write state that spans
     /// several tables, and the volume is low enough that a single lock is
     /// simpler and safer than per-table locking.
@@ -193,6 +202,21 @@ pub struct Engine<N: Network> {
     pending_add_requests: Mutex<HashMap<String, i64>>,
     /// Dial history, so a device is not hammered and a dead one is backed off.
     peering: Mutex<peering::PeeringState>,
+    /// Who holds which chunk, and what we have asked for. Synchronous, because
+    /// the scheduler decides under the lock and sends after dropping it.
+    chunk_engine: std::sync::Mutex<chunks::ChunkEngine>,
+    /// Asks the peering loop to look again without waiting out its interval.
+    /// Go spawns `auditPeers` outright after a catch-up; this is the same
+    /// thing from a context that has no `Arc` to spawn with.
+    audit_now: tokio::sync::Notify,
+    /// Peers owed a reference offer. Sending one can take a minute of retries,
+    /// so it never happens on the caller's task.
+    reference_offers: mpsc::UnboundedSender<String>,
+    /// The other end, taken by `run_listener`. Held here rather than spawned
+    /// from `new` because an engine can be built outside a runtime — several
+    /// unit tests do exactly that to reach a synchronous method — and spawning
+    /// there would panic.
+    offer_requests: std::sync::Mutex<Option<mpsc::UnboundedReceiver<String>>>,
 }
 
 impl<N: Network + 'static> Engine<N> {
@@ -203,16 +227,21 @@ impl<N: Network + 'static> Engine<N> {
         network: Arc<N>,
     ) -> (Arc<Self>, mpsc::UnboundedReceiver<Event>) {
         let (events, receiver) = mpsc::unbounded_channel();
+        let (reference_offers, offer_requests) = mpsc::unbounded_channel();
         let engine = Arc::new(Engine {
             key,
             store,
             network,
             events,
-            peers: RwLock::new(HashMap::new()),
+            peers: std::sync::RwLock::new(HashMap::new()),
             handler_lock: Mutex::new(()),
             typing: Mutex::new(TypingState::default()),
             pending_add_requests: Mutex::new(HashMap::new()),
             peering: Mutex::new(peering::PeeringState::default()),
+            chunk_engine: std::sync::Mutex::new(chunks::ChunkEngine::default()),
+            audit_now: tokio::sync::Notify::new(),
+            reference_offers,
+            offer_requests: std::sync::Mutex::new(Some(offer_requests)),
         });
         (engine, receiver)
     }
@@ -274,7 +303,7 @@ impl<N: Network + 'static> Engine<N> {
     /// Exists for tests that need a device to look offline without tearing
     /// down its store and key. Peering re-establishes whatever it needs.
     pub async fn disconnect_all(&self) {
-        self.peers.write().await.clear();
+        self.peers.write().expect("peer map").clear();
     }
 
     /// The devices this engine currently holds a session with.
@@ -283,7 +312,32 @@ impl<N: Network + 'static> Engine<N> {
     /// it is broadcast; everyone else has to wait for the reference flow on a
     /// later connection.
     pub async fn connected_addresses(&self) -> Vec<String> {
-        self.peers.read().await.keys().cloned().collect()
+        self.peers.read().expect("peer map").keys().cloned().collect()
+    }
+
+    /// The same set, without awaiting, for peering.
+    fn connected_addresses_now(&self) -> HashSet<String> {
+        self.peers.read().expect("peer map").keys().cloned().collect()
+    }
+
+    /// Whether a session is open to this exact device.
+    fn is_connected(&self, address: &str) -> bool {
+        self.peers.read().expect("peer map").contains_key(address)
+    }
+
+    /// Whether any device belonging to `user` is connected right now.
+    ///
+    /// Somebody is reachable if *any* of their devices is; presence is a fact
+    /// about the person, which is the granularity the sidebar shows it at.
+    fn user_is_online(&self, user: Uuid) -> bool {
+        self.store
+            .devices_for_user(user)
+            .map(|devices| {
+                devices
+                    .iter()
+                    .any(|device| !device.is_revoked() && self.is_connected(&device.address))
+            })
+            .unwrap_or(false)
     }
 
     pub fn store(&self) -> &Arc<Store> {
@@ -347,13 +401,25 @@ impl<N: Network + 'static> Engine<N> {
 
         self.emit(Event::ProfileCreated {
             user: self.user_view(&user, false),
-            device: self.device_view(&device, true, true),
+            device: self.device_view(&device, true),
         });
 
         Ok(user)
     }
 
     /// Everything a freshly attached client needs to render.
+    ///
+    /// Presence included, by way of `user_view` and `device_view`, which read
+    /// the live peer map. `UserOnline` and `DeviceOnline` fire once, when a
+    /// session opens, and a client rebuilding from this snapshot cannot hear
+    /// them again — so a snapshot that reported everybody offline did not
+    /// merely start pessimistic, it overwrote what the client already knew and
+    /// stayed wrong for the life of the session.
+    ///
+    /// A joining device reloads this the instant pairing completes, because
+    /// the profile it did not have now exists. That is how a freshly paired
+    /// device came to describe the very socket it had just arrived over as
+    /// "Never connected".
     pub fn initial_state(&self) -> Result<InitialState> {
         let profile = self.store.profile()?;
         let my_id = profile.as_ref().map(|p| p.id);
@@ -398,7 +464,7 @@ impl<N: Network + 'static> Engine<N> {
                 .iter()
                 .map(|device| {
                     let local = device.address == self.network.address();
-                    self.device_view(device, local, local)
+                    self.device_view(device, local)
                 })
                 .collect(),
             None => Vec::new(),
@@ -781,7 +847,7 @@ impl<N: Network + 'static> Engine<N> {
         }
 
         for address in in_scope {
-            if !self.peers.read().await.contains_key(&address) {
+            if !self.peers.read().expect("peer map").contains_key(&address) {
                 continue;
             }
             let offer = self.build_reference_offer(&address)?;
@@ -2653,7 +2719,7 @@ impl<N: Network + 'static> Engine<N> {
         let payload = frame.payload()?;
         let raw = RawFrame::new(frame.frame_type().as_u16(), payload);
 
-        let peers = self.peers.read().await;
+        let peers = self.peers.read().expect("peer map");
         let in_scope = targets.len();
         let mut written = 0usize;
         let mut offline = 0usize;
@@ -2709,7 +2775,7 @@ impl<N: Network + 'static> Engine<N> {
 
     /// Write a frame to one specific device.
     async fn send_to(&self, address: &str, frame: RawFrame) {
-        let peers = self.peers.read().await;
+        let peers = self.peers.read().expect("peer map");
         if let Some(peer) = peers.get(address) {
             let _ = peer.sender.try_send(frame);
         }
@@ -2721,6 +2787,13 @@ impl<N: Network + 'static> Engine<N> {
 
     /// Accept connections until the network stops producing them.
     pub async fn run_listener(self: Arc<Self>) {
+        // The reference-offer sender rides along here: this is the point at
+        // which the engine is live and inside a runtime, and everything that
+        // asks for an offer does so as a consequence of a connection.
+        if let Some(requests) = self.offer_requests.lock().expect("offer requests").take() {
+            tokio::spawn(Arc::clone(&self).run_reference_offers(requests));
+        }
+
         loop {
             match self.network.accept().await {
                 Ok(connection) => {
@@ -2758,7 +2831,7 @@ impl<N: Network + 'static> Engine<N> {
         let (mut reader, mut writer) = tokio::io::split(connection.stream);
 
         let (sender, mut queue) = mpsc::channel::<Outbound>(256);
-        self.peers.write().await.insert(
+        self.peers.write().expect("peer map").insert(
             peer_address.clone(),
             Peer {
                 sender: sender.clone(),
@@ -2786,24 +2859,18 @@ impl<N: Network + 'static> Engine<N> {
 
         // Open with a reference offer, so a peer that has been away catches up
         // without either side re-sending what the other already holds.
-        if let Ok(offer) = self.build_reference_offer(&peer_address) {
-            if !offer.references.is_empty() {
-                let _ = sender
-                    .try_send(RawFrame::new(
-                        FrameType::ReferenceOffer.as_u16(),
-                        offer.encode()?,
-                    ));
-            }
-        }
+        //
+        // Through the retrying path, like Go's `remote_device.go:97`. A socket
+        // that has only just been established is the likeliest one to be dead
+        // without saying so, and the opening offer is the frame that decides
+        // whether anything else happens at all.
+        self.offer_references_to_soon(&peer_address);
 
-        // Chunk offers are ephemeral, so an interrupted download has nothing
-        // to resume from until somebody offers again. Asking outright costs a
-        // frame per missing chunk and is answered either way.
-        if device_is_known {
-            if let Err(error) = self.resume_downloads(&peer_address).await {
-                tracing::debug!(%error, "could not resume downloads");
-            }
-        }
+        // Nothing is asked for here. A new session may make holders reachable
+        // that were not before, and the chunk engine notices that on its next
+        // pass — asking from the session start instead was this port's own
+        // invention, and it fired exactly once per connection, which on a
+        // socket that stays up for days means exactly once.
 
         let result = loop {
             // A stranger is held to a small frame limit so they cannot exhaust
@@ -2823,6 +2890,29 @@ impl<N: Network + 'static> Engine<N> {
                     .device_by_address(&peer_address)
                     .map(|device| device.is_some())
                     .unwrap_or(false);
+
+                // A stranger who has just become one of our own devices, which
+                // is exactly what pairing is: the joining device dials before
+                // it knows anybody, and learns who it is talking to from a
+                // frame on this very socket. The credit at the top of the
+                // session was skipped because there was nobody to credit yet.
+                //
+                // Doing it on the transition rather than on every frame — Go
+                // re-stamps continuously (`chat/remote_device.go:197-222`) —
+                // matches what the rest of this function already does, which
+                // is to record when a session began and let the online flag
+                // carry the rest.
+                //
+                // Without this the omission is permanent, not transient:
+                // peering never dials an address it is already connected to,
+                // so the pairing socket is the only session these two devices
+                // will ever have, and no later one comes along to fix it.
+                if device_is_known {
+                    if let Err(error) = self.store.mark_device_seen(&peer_address, crate::now()) {
+                        tracing::debug!(%error, peer = %peer_address, "could not record a new device as seen");
+                    }
+                    self.emit_device_online(&peer_address).await;
+                }
             }
 
             match wire::read_frame(&mut reader, device_is_known).await {
@@ -2845,7 +2935,7 @@ impl<N: Network + 'static> Engine<N> {
             }
         }
 
-        self.peers.write().await.remove(&peer_address);
+        self.peers.write().expect("peer map").remove(&peer_address);
         writer_task.abort();
         self.emit_device_offline(&peer_address).await;
 
@@ -2907,6 +2997,7 @@ impl<N: Network + 'static> Engine<N> {
             }
             FrameType::AddUserRequestRejected => self.handle_add_user_rejected(peer).await,
             FrameType::AddUser => self.handle_add_user(peer, &frame.payload).await,
+            FrameType::Device => self.handle_device(peer, &frame.payload).await,
             FrameType::UpdateDevice => self.handle_update_device(peer, &frame.payload).await,
             FrameType::UpdateSettings => self.handle_update_settings(peer, &frame.payload).await,
             FrameType::SyncDeviceRequest => {
@@ -3293,11 +3384,23 @@ impl<N: Network + 'static> Engine<N> {
 
             // Tell the interface which user now has the message, so the tick
             // marks can update.
-            if let Ok(Some(user_id)) = self.store.device_owner(peer) {
-                self.emit(Event::MessageDelivered {
-                    message_id: reference.frame_id,
-                    user_id,
-                });
+            //
+            // Only for the two frame types that *are* messages. Go switches on
+            // the type and calls `MessageDelivered` for exactly these
+            // (`chat/ack.go:83-131`); firing it for everything meant an
+            // acknowledged file, receipt or device record was announced to the
+            // client as a delivered message under its own frame id, and the
+            // client dutifully looked for a message with that id.
+            if matches!(
+                frame_type,
+                FrameType::DirectMessage | FrameType::GroupMessage
+            ) {
+                if let Ok(Some(user_id)) = self.store.device_owner(peer) {
+                    self.emit(Event::MessageDelivered {
+                        message_id: reference.frame_id,
+                        user_id,
+                    });
+                }
             }
         }
         Ok(())
@@ -3413,6 +3516,102 @@ impl<N: Network + 'static> Engine<N> {
                 None => false,
             },
 
+            // An introduction reaches the same two parties it is between: our
+            // own devices, so a device that joins later inherits the contact,
+            // and the counterparty, who is the other signatory.
+            // (`chat/reference_offer.go:541`.)
+            FrameType::AddUser => match self.store.add_user_record(frame_id)? {
+                Some(record) => peer_user == my_id || crate::xor(record.xor, my_id) == peer_user,
+                None => false,
+            },
+
+            // Device group membership (`chat/reference_offer.go:481`).
+            //
+            // Our own devices may learn about every device we know of — a
+            // sibling has to be able to attribute anything any contact signs.
+            // Anyone else gets ours, their own, and those of people they share
+            // a group with, and never the record of the device being offered
+            // to, which already has it.
+            FrameType::Device => match self.store.device_by_id(frame_id)? {
+                Some(device) => {
+                    if peer_user == my_id {
+                        true
+                    } else {
+                        device.user_id == my_id
+                            || device.user_id == peer_user
+                            || self
+                                .store
+                                .users_sharing_a_group_with(peer_user)?
+                                .contains(&device.user_id)
+                    }
+                }
+                None => false,
+            },
+
+            // Changes to a device group (`chat/reference_offer.go:862`).
+            //
+            // Our own devices get every change; everybody else gets only
+            // revocations, and only from the same overlap a device record
+            // itself travels through. A rename is nobody else's business, but a
+            // revocation is everybody's — until a contact learns of it they go
+            // on accepting frames signed by the revoked device as genuinely
+            // ours, which is the whole point of revoking it.
+            FrameType::UpdateDevice => match self.store.update_device(frame_id)? {
+                Some(update) => {
+                    if peer_user == my_id {
+                        true
+                    } else if update.update_type != UpdateDeviceType::Revoke.as_u16() {
+                        false
+                    } else {
+                        update.author == my_id
+                            || update.author == peer_user
+                            || self
+                                .store
+                                .users_sharing_a_group_with(peer_user)?
+                                .contains(&update.author)
+                    }
+                }
+                None => false,
+            },
+
+            // Profile-wide preferences are one person's, and reach only their
+            // own devices (`chat/reference_offer.go:991`).
+            FrameType::UpdateSettings => {
+                peer_user == my_id && self.store.update_settings_frame(frame_id)?.is_some()
+            }
+
+            // An offer says where the bytes of a chunk are, so it travels with
+            // the same audience as the file it belongs to
+            // (`chat/reference_offer.go:1125`, which sorts offers into the
+            // same scope buckets). Judged on the offer's own scope rather than
+            // the file's: the file record may not have reached us yet, and
+            // offers routinely arrive first.
+            FrameType::ChunkOffer => match self.store.chunk_offer(frame_id)? {
+                Some(offer) => match Scope::from_i64(offer.scope) {
+                    Ok(Scope::Sync) => peer_user == my_id,
+                    Ok(Scope::User) => {
+                        peer_user == my_id || crate::xor(offer.destination, my_id) == peer_user
+                    }
+                    Ok(Scope::Group) | Ok(Scope::GroupWithInvites) => {
+                        match self.store.group(offer.destination)? {
+                            Some(group) => group.member_ids().contains(&peer_user),
+                            None => false,
+                        }
+                    }
+                    Ok(Scope::Global) => {
+                        offer.author == my_id
+                            || peer_user == my_id
+                            || peer_user == offer.author
+                            || self
+                                .store
+                                .users_sharing_a_group_with(offer.author)?
+                                .contains(&peer_user)
+                    }
+                    _ => false,
+                },
+                None => false,
+            }
+
             // A draft is nobody's business but this profile's own devices.
             FrameType::Draft => peer_user == my_id && self.store.draft(frame_id)?.is_some(),
 
@@ -3473,6 +3672,28 @@ impl<N: Network + 'static> Engine<N> {
                             None => false,
                         }
                     }
+                    // Avatars, profile and group alike (`engine/files.rs`
+                    // stages both as global). This has to mirror
+                    // `scope::global_addresses`, or the two routes to the same
+                    // file disagree: ours may go to anyone we know, and
+                    // somebody else's is relayed only inside the overlap,
+                    // because a shared group is the proof that its author
+                    // already exposes their profile to that person.
+                    //
+                    // Falling through to `_ => false` meant an avatar was
+                    // offered to nobody at all once the moment of broadcast had
+                    // passed, while the `UpdateUser` naming it replayed
+                    // perfectly — so a contact who was away, or a device that
+                    // joined afterwards, held an image id with no image.
+                    Ok(Scope::Global) => {
+                        record.author == my_id
+                            || peer_user == my_id
+                            || peer_user == record.author
+                            || self
+                                .store
+                                .users_sharing_a_group_with(record.author)?
+                                .contains(&peer_user)
+                    }
                     _ => false,
                 },
                 None => false,
@@ -3483,6 +3704,12 @@ impl<N: Network + 'static> Engine<N> {
 
     async fn handle_reference_offer(&self, peer: &str, payload: &[u8]) -> Result<()> {
         let offer: ReferenceOffer = crate::msgpack::from_slice(payload)?;
+
+        // The offer itself is acknowledged, which is how the sender learns it
+        // arrived at all (`chat/reference_offer.go:1403`). It is not a stored
+        // frame; the acknowledgement exists solely so an offer written to a
+        // socket that had already died can be sent again.
+        self.send_ack(peer, offer.id, FrameType::ReferenceOffer).await;
 
         let mut wanted = Vec::new();
         let mut already_held = Vec::new();
@@ -3529,6 +3756,7 @@ impl<N: Network + 'static> Engine<N> {
         };
 
         let mut frames: Vec<(CatchUpFrame, i64)> = Vec::new();
+        let peer_device = self.store.device_by_address(peer)?;
 
         for reference in request.references {
             let Ok(frame_type) = reference.kind() else {
@@ -3536,6 +3764,18 @@ impl<N: Network + 'static> Engine<N> {
             };
             // Re-check entitlement: a request is not authorization.
             if !self.peer_may_have(peer_user, my_id, reference.frame_id, frame_type)? {
+                continue;
+            }
+            // And re-check capability, which the offer side already applies.
+            // A peer should never be asking for a frame type it never had
+            // offered — but the cost of humouring one that does is not a
+            // dropped frame. Go refuses the entire catch-up bundle if it
+            // contains a type it does not allow in one, and as of upstream
+            // `dafec89` that path takes `catchUpMutex` a second time while
+            // already holding it (`chat/catch_up.go:124` and `:137`), which
+            // deadlocks the client and takes its whole reference flow with it.
+            // One frame we should not have sent would be enough.
+            if !crate::store::accepts(peer_device.as_ref(), frame_type) {
                 continue;
             }
             let Some(payload) = self.store.frame_payload(reference.frame_id, frame_type)? else {
@@ -3598,6 +3838,23 @@ impl<N: Network + 'static> Engine<N> {
         }
 
         self.emit(Event::SyncComplete);
+
+        // Offer again. Go does this from three places after a catch-up
+        // (`chat/catch_up.go:337`, `:350`, `:568`), and the reason it matters
+        // most is the case its own comment describes: a device we did not
+        // recognise when the socket opened was offered nothing, and handling
+        // its catch-up is often exactly what teaches us who it is. Without a
+        // second offer the two sides sit connected with everything still to
+        // say. It is also what makes a large initial sync converge in waves
+        // rather than in one shot that either works or does not.
+        if self.store.device_by_address(peer)?.is_some() {
+            self.offer_references_to_soon(peer);
+        }
+
+        // A catch-up is the likeliest moment to have learned about devices
+        // worth dialling — contacts arrive in it, and each brings its own.
+        self.audit_now.notify_one();
+
         Ok(())
     }
 
@@ -3611,18 +3868,27 @@ impl<N: Network + 'static> Engine<N> {
     /// never existed and whose progress could never leave zero. The loss was
     /// permanent: the sender's acknowledgement had already retired the frame.
     ///
-    /// The ephemeral file frames are deliberately absent. Chunk offers,
-    /// requests and the chunks themselves are not stored and never enter the
-    /// reference flow, so there is nothing for catch-up to replay.
+    /// Chunk requests and the chunks themselves are deliberately absent: they
+    /// are not stored and never enter the reference flow, so there is nothing
+    /// for catch-up to replay. Chunk *offers* are a different matter — they
+    /// are stored precisely so they can be replayed, since they are the only
+    /// record of who holds a chunk.
     async fn handle_frame_unlocked(&self, peer: &str, frame: RawFrame) -> Result<()> {
         let frame_type = FrameType::from_u16(frame.frame_type)?;
         match frame_type {
+            // Sorted first by `catch_up_order`, so the contact exists before
+            // the frames that only mean anything once it does. A device that
+            // joins later has no other way to learn who the profile knows, and
+            // a frame signed by a device belonging to nobody is refused.
+            FrameType::AddUser => self.handle_add_user(peer, &frame.payload).await,
+            FrameType::Device => self.handle_device(peer, &frame.payload).await,
             FrameType::DirectMessage => self.handle_direct_message(peer, &frame.payload).await,
             FrameType::GroupMessage => self.handle_group_message(peer, &frame.payload).await,
             FrameType::GroupCreation => self.handle_group_creation(peer, &frame.payload).await,
             FrameType::UpdateGroup => self.handle_update_group(peer, &frame.payload).await,
             FrameType::ReadReceipt => self.handle_read_receipt(peer, &frame.payload).await,
             FrameType::File => self.handle_file(peer, &frame.payload).await,
+            FrameType::ChunkOffer => self.handle_chunk_offer(peer, &frame.payload).await,
             FrameType::UpdateDm => self.handle_update_dm(peer, &frame.payload).await,
             FrameType::UpdateUser => self.handle_update_user(peer, &frame.payload).await,
             FrameType::Draft => self.handle_draft(peer, &frame.payload).await,
@@ -3649,7 +3915,19 @@ impl<N: Network + 'static> Engine<N> {
     // Views
     // ---------------------------------------------------------------------
 
-    fn user_view(&self, user: &User, _is_profile: bool) -> UserView {
+    /// One contact, as the client sees them.
+    ///
+    /// `online` is read from the live peer map rather than defaulted, because
+    /// this view is both the boot snapshot and the payload of every
+    /// `UserUpdated` — and the client replaces its whole record from either.
+    /// Reporting a constant `false` therefore did not merely start pessimistic:
+    /// a contact who was connected went grey the moment they changed their
+    /// name or their picture, and stayed grey until the session ended.
+    fn user_view(&self, user: &User, is_profile: bool) -> UserView {
+        // Not for ourselves. Our own devices being reachable is not the same
+        // question, and the note-to-self row does not ask it.
+        let online = !is_profile && self.user_is_online(user.id);
+
         UserView {
             id: user.id,
             name: user.name.clone(),
@@ -3672,11 +3950,21 @@ impl<N: Network + 'static> Engine<N> {
             typing_indicators_overridden: user.typing_indicators_overridden,
             typing_indicators_enabled: user.typing_indicators_enabled,
             last_opened: user.last_opened,
-            online: false,
+            online,
         }
     }
 
-    fn device_view(&self, device: &Device, local: bool, online: bool) -> DeviceView {
+    /// One of this profile's own devices.
+    ///
+    /// Like `user_view`, `online` is derived rather than passed in. Every
+    /// caller used to supply it, and most of them guessed: renaming a device
+    /// from another one reported it offline (`engine/settings.rs`), because
+    /// the only thing the rename path knew was whether the device was this
+    /// one. This device is always reachable from itself.
+    fn device_view(&self, device: &Device, local: bool) -> DeviceView {
+        let online =
+            !device.is_revoked() && (local || self.is_connected(&device.address));
+
         DeviceView {
             id: device.id,
             name: device.name.clone(),

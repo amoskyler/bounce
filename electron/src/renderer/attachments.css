@@ -271,7 +271,15 @@
   cursor: default;
 }
 
+/*
+ * The control this was all about.
+ *
+ * The overlay above already subtracts the whole viewport from the window's drag
+ * regions, which is enough — but this button is the one that failed, and saying
+ * it here means it no longer depends on the order Chromium subtracts rects in.
+ */
 .image-viewer__close {
+  -webkit-app-region: no-drag;
   position: absolute;
   top: 12px;
   right: 12px;

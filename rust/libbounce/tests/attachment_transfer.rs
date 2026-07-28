@@ -51,7 +51,33 @@ async fn start(name: &str, directory: Arc<StaticDirectory>) -> Instance {
     let (engine, events) = Engine::new(key, store, network);
     let user = engine.create_profile(name, "laptop").expect("profile");
     tokio::spawn(Arc::clone(&engine).run_listener());
+    // The chunk engine is what issues chunk requests; the application spawns it
+    // alongside the listener (`bounce-node/src/lib.rs`), so the harness does too.
+    tokio::spawn(Arc::clone(&engine).run_chunk_engine());
     Instance { engine, events, id: user.id }
+}
+
+/// The same, with no profile: a device waiting to be linked to one.
+async fn start_blank(name: &str, directory: Arc<StaticDirectory>) -> Instance {
+    let key = DeviceKey::generate();
+    let network = Arc::new(TcpNetwork::bind(key.clone(), directory).await.expect("binds"));
+    let blobs = std::env::temp_dir().join(format!(
+        "bounce-blobs-{}-{name}-{}",
+        std::process::id(),
+        Uuid::new_v4()
+    ));
+    let store = Arc::new(
+        Store::in_memory()
+            .expect("opens")
+            .with_blobs_directory(&blobs)
+            .expect("blobs directory"),
+    );
+    let (engine, events) = Engine::new(key, store, network);
+    tokio::spawn(Arc::clone(&engine).run_listener());
+    // The chunk engine is what issues chunk requests; the application spawns it
+    // alongside the listener (`bounce-node/src/lib.rs`), so the harness does too.
+    tokio::spawn(Arc::clone(&engine).run_chunk_engine());
+    Instance { engine, events, id: Uuid::nil() }
 }
 
 async fn wait_for<T>(
@@ -485,4 +511,286 @@ async fn a_large_file_can_be_attached_to_a_message_by_path() {
     );
 
     let _ = std::fs::remove_file(&source);
+}
+
+#[tokio::test]
+async fn a_profile_picture_set_while_offline_arrives_on_reconnection() {
+    // The live path and the replay path have to agree on who may have a file,
+    // and for avatars they did not. An avatar is staged with `Scope::Global`
+    // (`engine/files.rs`), and `peer_may_have` answered `Global` from its
+    // catch-all `_ => false` arm — so a picture was offered to precisely
+    // nobody once the moment of broadcast had passed.
+    //
+    // Everything around it kept working, which is what made it look like a
+    // rendering fault: the `UpdateUser` naming the picture *is* replayed, so
+    // the contact learns an image id and then never receives the bytes behind
+    // it. And a device that joins a profile later gets its whole world through
+    // this flow, so it sees no pictures at all.
+    logging();
+
+    let directory = Arc::new(StaticDirectory::new());
+    let alice = start("Alice", Arc::clone(&directory)).await;
+    let mut bob = start("Bob", Arc::clone(&directory)).await;
+
+    let code = bob.engine.create_pairing_code().expect("code");
+    Arc::clone(&alice.engine).request_to_add_user(&code).await.expect("pairs");
+
+    let mut alice_events = alice.events;
+    wait_for(&mut alice_events, "alice to add bob", 10, |event| {
+        matches!(event, Event::UserAdded { .. }).then_some(())
+    })
+    .await
+    .expect("alice adds bob");
+    wait_for(&mut bob.events, "bob to add alice", 10, |event| {
+        matches!(event, Event::UserAdded { .. }).then_some(())
+    })
+    .await
+    .expect("bob adds alice");
+
+    // Bob goes away before Alice chooses a picture, so the only route left is
+    // the reference flow.
+    bob.engine.disconnect_all().await;
+    alice.engine.disconnect_all().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let picture: Vec<u8> = (0..9000).map(|index| (index % 251) as u8).collect();
+    alice
+        .engine
+        .set_profile_image(OutgoingAttachment {
+            name: "me.png".into(),
+            data: picture.clone(),
+            is_image: true,
+            width: 96,
+            height: 96,
+            blur_hash: String::new(),
+            ..Default::default()
+        })
+        .await
+        .expect("sets the picture");
+
+    tokio::spawn(Arc::clone(&bob.engine).run_peering());
+    tokio::spawn(Arc::clone(&alice.engine).run_peering());
+
+    let updated = wait_for(&mut bob.events, "bob to see the new picture", 20, |event| {
+        match event {
+            Event::UserUpdated { user } if !user.images.is_empty() => Some(user.clone()),
+            _ => None,
+        }
+    })
+    .await
+    .expect("the profile update is replayed");
+
+    let image_id = *updated.images.last().expect("an image id");
+
+    let complete = wait_for(&mut bob.events, "the picture to download", 25, |event| {
+        match event {
+            Event::FileComplete { file_id } if *file_id == image_id => Some(*file_id),
+            _ => None,
+        }
+    })
+    .await;
+
+    assert_eq!(
+        complete,
+        Some(image_id),
+        "an avatar named by a replayed update must be fetchable too",
+    );
+    assert_eq!(
+        bob.engine.file_data(image_id).unwrap().as_deref(),
+        Some(picture.as_slice()),
+    );
+}
+
+#[tokio::test]
+async fn a_joining_device_downloads_every_file_it_is_told_about() {
+    // The shape a real second device arrives in: a profile with a history
+    // behind it, so every file record lands in one catch-up burst rather than
+    // one at a time with a live chunk offer beside it.
+    //
+    // That difference is the whole of it. A file learned about live comes with
+    // an offer saying who holds it; a file learned about from catch-up comes
+    // with nothing, because offers are never stored and so are never replayed.
+    logging();
+
+    let directory = Arc::new(StaticDirectory::new());
+    let alice = start("Alice", Arc::clone(&directory)).await;
+    let mut bob = start("Bob", Arc::clone(&directory)).await;
+    let mut phone = start_blank("phone", Arc::clone(&directory)).await;
+
+    let code = bob.engine.create_pairing_code().expect("code");
+    Arc::clone(&alice.engine).request_to_add_user(&code).await.expect("pairs");
+
+    let mut alice_events = alice.events;
+    wait_for(&mut alice_events, "alice to add bob", 10, |event| {
+        matches!(event, Event::UserAdded { .. }).then_some(())
+    })
+    .await
+    .expect("alice adds bob");
+    wait_for(&mut bob.events, "bob to add alice", 10, |event| {
+        matches!(event, Event::UserAdded { .. }).then_some(())
+    })
+    .await
+    .expect("bob adds alice");
+
+    // A history: several attachments and an avatar, all authored here.
+    let mut expected = Vec::new();
+    for index in 0..8u8 {
+        let payload: Vec<u8> = (0..2048).map(|byte| (byte % 251) as u8 ^ index).collect();
+        let sent = alice
+            .engine
+            .send_direct_message_with_attachments(
+                bob.id,
+                &format!("photo {index}"),
+                vec![OutgoingAttachment {
+                    name: format!("photo-{index}.png"),
+                    data: payload,
+                    is_image: true,
+                    width: 32,
+                    height: 32,
+                    blur_hash: String::new(),
+                    ..Default::default()
+                }],
+                None,
+            )
+            .await
+            .expect("sends");
+        expected.push(sent.attachments[0].file_id);
+    }
+
+    let avatar: Vec<u8> = (0..5000).map(|index| (index % 251) as u8).collect();
+    alice
+        .engine
+        .set_profile_image(OutgoingAttachment {
+            name: "ada.png".into(),
+            data: avatar,
+            is_image: true,
+            width: 96,
+            height: 96,
+            blur_hash: String::new(),
+            ..Default::default()
+        })
+        .await
+        .expect("sets the picture");
+
+    // Now the second device arrives, and receives all of that at once.
+    let sync = alice.engine.create_sync_code().expect("sync code");
+    Arc::clone(&phone.engine).request_to_sync(&sync).await.expect("asks to join");
+
+    let joined = wait_for(&mut phone.events, "the phone to join", 15, |event| match event {
+        Event::ProfileCreated { user, .. } => Some(user.clone()),
+        _ => None,
+    })
+    .await
+    .expect("the phone joins");
+    expected.push(*joined.images.last().expect("the profile names a picture"));
+
+    let mut done = std::collections::HashSet::new();
+    while done.len() < expected.len() {
+        let Some(file_id) = wait_for(&mut phone.events, "a file to finish", 25, |event| {
+            match event {
+                Event::FileComplete { file_id } => Some(*file_id),
+                _ => None,
+            }
+        })
+        .await
+        else {
+            break;
+        };
+        done.insert(file_id);
+    }
+
+    let missing: Vec<_> = expected.iter().filter(|id| !done.contains(id)).collect();
+    assert!(
+        missing.is_empty(),
+        "{} of {} files never arrived: {missing:?}",
+        missing.len(),
+        expected.len(),
+    );
+}
+
+#[tokio::test]
+async fn a_relayed_offer_does_not_strand_a_download() {
+    // Chunk offers gossip. An offer names the device holding the chunk, and it
+    // is relayed onward by everyone who receives it — so a device learns about
+    // holders it has never spoken to and, in the case of a second device that
+    // has only ever dialled its own profile, cannot speak to.
+    //
+    // Both places that act on a location fired it blind: `send_to` a device
+    // with no open session writes to nobody and returns success, so the
+    // request simply evaporated. Nothing retried it, and the peer that relayed
+    // the offer — which is by definition connected, and here holds the bytes —
+    // was never asked.
+    //
+    // This is what left a freshly linked device with a row of half-loaded
+    // pictures: the ones whose holder it happened to have a session with
+    // arrived, and the rest sat at nothing with no request outstanding.
+    logging();
+
+    let directory = Arc::new(StaticDirectory::new());
+    let alice = start("Alice", Arc::clone(&directory)).await;
+    let mut carol = start("Carol", Arc::clone(&directory)).await;
+    let mut phone = start_blank("phone", Arc::clone(&directory)).await;
+
+    let code = carol.engine.create_pairing_code().expect("code");
+    Arc::clone(&alice.engine).request_to_add_user(&code).await.expect("pairs");
+
+    let mut alice_events = alice.events;
+    wait_for(&mut alice_events, "alice to add carol", 10, |event| {
+        matches!(event, Event::UserAdded { .. }).then_some(())
+    })
+    .await
+    .expect("alice adds carol");
+    wait_for(&mut carol.events, "carol to add alice", 10, |event| {
+        matches!(event, Event::UserAdded { .. }).then_some(())
+    })
+    .await
+    .expect("carol adds alice");
+
+    // The phone joins Alice's profile. Peering is deliberately never started
+    // on it, so its only session is the one it paired over — exactly the
+    // position a new device is in before it has dialled anybody else.
+    let sync = alice.engine.create_sync_code().expect("sync code");
+    Arc::clone(&phone.engine).request_to_sync(&sync).await.expect("asks to join");
+    wait_for(&mut phone.events, "the phone to join", 15, |event| {
+        matches!(event, Event::ProfileCreated { .. }).then_some(())
+    })
+    .await
+    .expect("the phone joins");
+
+    // Carol sends a picture. Alice relays both the record and Carol's offers
+    // to the phone, which can reach Alice and cannot reach Carol.
+    let payload: Vec<u8> = (0..6000).map(|index| (index % 251) as u8).collect();
+    let sent = carol
+        .engine
+        .send_direct_message_with_attachments(
+            alice.id,
+            "from Carol",
+            vec![OutgoingAttachment {
+                name: "carol.png".into(),
+                data: payload.clone(),
+                is_image: true,
+                width: 48,
+                height: 48,
+                blur_hash: String::new(),
+                ..Default::default()
+            }],
+            None,
+        )
+        .await
+        .expect("sends");
+    let file_id = sent.attachments[0].file_id;
+
+    let complete = wait_for(&mut phone.events, "the phone to finish the file", 25, |event| {
+        match event {
+            Event::FileComplete { file_id: id } if *id == file_id => Some(*id),
+            _ => None,
+        }
+    })
+    .await;
+
+    assert_eq!(complete, Some(file_id), "the phone must get the bytes from Alice");
+    assert_eq!(
+        phone.engine.file_data(file_id).unwrap().as_deref(),
+        Some(payload.as_slice()),
+    );
 }

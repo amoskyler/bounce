@@ -38,6 +38,9 @@ async fn start(name: &str, directory: Arc<StaticDirectory>) -> Instance {
     let (engine, events) = Engine::new(key.clone(), Arc::clone(&store), Arc::clone(&network));
     let user = engine.create_profile(name, &format!("{name}'s laptop")).expect("profile");
     tokio::spawn(Arc::clone(&engine).run_listener());
+    // The chunk engine is what issues chunk requests; the application spawns it
+    // alongside the listener (`bounce-node/src/lib.rs`), so the harness does too.
+    tokio::spawn(Arc::clone(&engine).run_chunk_engine());
 
     Instance { engine, store, events, user, address, key }
 }

@@ -159,7 +159,12 @@ impl<N: Network + 'static> Engine<N> {
         tokio::spawn(Arc::clone(&self).run_keep_alive());
 
         loop {
-            tokio::time::sleep(AUDIT_INTERVAL).await;
+            // Whichever comes first: the regular interval, or somebody saying
+            // they have just learned about devices worth dialling.
+            tokio::select! {
+                _ = tokio::time::sleep(AUDIT_INTERVAL) => {}
+                _ = self.audit_now.notified() => {}
+            }
             self.audit(CONNECTIONS_PER_THREAD).await;
         }
     }
@@ -181,7 +186,7 @@ impl<N: Network + 'static> Engine<N> {
             tokio::time::sleep(KEEP_ALIVE_INTERVAL).await;
 
             let frame = RawFrame::new(FrameType::KeepAlive.as_u16(), payload.clone());
-            let peers = self.peers.read().await;
+            let peers = self.peers.read().expect("peer map");
             for peer in peers.values() {
                 // A full queue means the peer is not keeping up, in which case
                 // it does not need a keep-alive to know we are here.
@@ -211,7 +216,7 @@ impl<N: Network + 'static> Engine<N> {
         let cutoff = now - ACTIVE_WITHIN_SECONDS;
         let me = self.network.address();
 
-        let connected: HashSet<String> = self.peers.read().await.keys().cloned().collect();
+        let connected: HashSet<String> = self.connected_addresses_now();
         let peering = self.peering.lock().await;
 
         // A device is worth dialling if it is not us, not revoked, not already
@@ -382,7 +387,7 @@ impl<N: Network + 'static> Engine<N> {
     async fn conversation_addresses(&self, conversation: Uuid) -> Result<Vec<String>> {
         let now = crate::now();
         let me = self.network.address();
-        let connected: HashSet<String> = self.peers.read().await.keys().cloned().collect();
+        let connected: HashSet<String> = self.connected_addresses_now();
         let peering = self.peering.lock().await;
 
         let members = match self.store.group(conversation)? {

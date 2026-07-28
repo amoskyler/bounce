@@ -109,26 +109,11 @@ function startEngine(): void {
   // restart is not workable.
   const useTor = process.env.BOUNCE_NO_TOR !== '1';
 
-  // Needed to dial a Go client, which expects the older handshake. See
-  // libbounce::net for what accepting it costs.
-  const goCompatible = process.env.BOUNCE_GO_COMPAT === '1';
-
-  engine = BounceEngine.open(
-    join(app.getPath('userData'), 'bounce'),
-    useTor,
-    goCompatible,
-  );
+  engine = BounceEngine.open(join(app.getPath('userData'), 'bounce'), useTor);
   console.log(
     `Bounce is running on ${engine.transport} at ${engine.address}` +
       (engine.anonymous ? '' : ' — WITHOUT metadata protection'),
   );
-  if (goCompatible) {
-    console.warn(
-      'BOUNCE_GO_COMPAT is on: outbound handshakes use the Go format, which ' +
-        'lets any address you dial obtain a signature from this device.',
-    );
-  }
-
   engine.on('event', (event: unknown) => {
     mainWindow?.webContents.send('bounce:event', event);
   });

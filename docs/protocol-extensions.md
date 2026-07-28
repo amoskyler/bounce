@@ -2,20 +2,46 @@
 
 **For the maintainers of the Go implementation (`chat/`, `ui/`, `fyne/`, `android/`).**
 
-> **Draft, not yet sent.** Everything described here is implemented on our side,
-> including the capability gate, so part one is belt-and-braces rather than a
-> prerequisite. Remove this note before sending.
+> **Part one has already landed upstream.** Commit `8739043` ("don't disconnect
+> from newer clients") drops the `conn.Close()` on an unknown frame type, which
+> is exactly what part one asked for. What follows is kept for the reasoning and
+> because one hazard remains — see the note below. Part two is unchanged and
+> still open.
 
 This document has two halves and they can be acted on independently.
 
-- **[Part one](#part-one-the-compatibility-request)** asks for a small change so
-  that Go builds tolerate two new frame types instead of disconnecting. It is
-  roughly fifteen lines and requires implementing nothing.
+- **[Part one](#part-one-the-compatibility-request)** asked for a small change so
+  that Go builds tolerate two new frame types instead of disconnecting.
+  **Done upstream in `8739043`.**
 - **[Part two](#part-two-the-frame-specifications)** is the full specification of
   what those frames mean, so the features can be implemented whenever you choose.
 
-Nothing here requires feature parity. Part one alone is enough to keep the two
-implementations on the same network.
+Nothing here requires feature parity.
+
+## One hazard that remains, and is now worse
+
+A live frame of an unknown type is discarded harmlessly. A *catch-up bundle*
+containing one is still refused whole (`chat/catch_up.go:131`), and since
+`dafec89` that refusal path is a self-deadlock:
+
+```go
+catchUpMutex.Lock()          // chat/catch_up.go:124, before the loop
+for i, fr := range cu.Frames {
+    if _, present := allowedCatchUpFrames[fr.Type]; !present {
+        ...
+        catchUpMutex.Lock()  // chat/catch_up.go:137 — almost certainly Unlock
+        return nil, false
+    }
+```
+
+`sync.Mutex` is not reentrant, so this blocks forever while holding
+`catchUpMutex` — and `getReferenceOfferFor` and `hasAnyReferencesFor` take the
+same mutex, so the client's whole reference flow stops with it. A single
+unexpected frame type in one bundle is enough.
+
+We gate extension frames on an advertised capability, on both the offer and the
+request side, so we will not send you one. But the deadlock is worth fixing on
+its own account: any peer, on any implementation, can trigger it by accident.
 
 ---
 

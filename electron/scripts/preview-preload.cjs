@@ -143,7 +143,14 @@ const state = {
     },
   ],
   users: [
-    user(ada, 'Ada Lovelace', { online: true, lastActivity: now - 120 }),
+    // One contact with a picture: the initials path was the only one any
+    // capture had ever shown, so nothing about avatars-with-images — the
+    // presence ring over a photo, the full-size viewer — could be reviewed.
+    user(ada, 'Ada Lovelace', {
+      online: true,
+      lastActivity: now - 120,
+      images: ['00000000-0000-4000-8000-0000000000f0'],
+    }),
     user(grace, 'Grace Hopper', { lastActivity: now - 5 * HOUR }),
     user(alan, 'Alan Turing', { lastActivity: now - 30 * HOUR }),
     // A muted thread, a name long enough to truncate, and somebody with no
@@ -206,6 +213,19 @@ const state = {
       deliveredTo: [grace, alan],
       readBy: [grace],
     }),
+    // Long enough to reach the width cap, which nothing else here does — a
+    // fixture of one-line messages cannot show whether the widest step is
+    // right, and that is the step people actually notice.
+    message(
+      'g0',
+      bookClub,
+      alan,
+      'I finally got through the appendix on the Bernoulli numbers and I think the ' +
+        'notation in the second table is doing something subtler than it lets on — ' +
+        'the recurrence is stated for the general case but every worked example ' +
+        'quietly assumes the index is even, which is fine until it is not.',
+      now - 2.2 * HOUR,
+    ),
     message('g4', bookClub, ada, 'I will bring the second volume.', now - 40 * 60, {
       reactions: [
         { emoji: '\u2764\ufe0f', users: [me, grace], mine: true },
@@ -376,6 +396,36 @@ const api = {
     'bounce:df7wwi7bnsctfrvlza4pvtk6u6e34ddwwkjagnadtp5iwpjwrvq5bpad:0f8a1c3d5e7b9a2c4d6e8f0a1b2c3d4e',
   requestToAddUser: async () => undefined,
   markAsRead: async () => undefined,
+
+  /*
+   * The profile-wide defaults.
+   *
+   * Missing until now, and its absence threw inside `DetailsPanel` — which
+   * meant no capture had ever rendered the details pane, so nothing about it
+   * could be reviewed and any bug in it looked like the control that opens it
+   * being broken.
+   */
+  settings: async () => ({
+    defaultGroupRetention: 0,
+    defaultDmRetention: 0,
+    defaultReadReceipts: true,
+    defaultTypingIndicators: true,
+    newGroupRestrictPosting: false,
+    newGroupRestrictGroupEdits: false,
+    newGroupRestrictUserManagement: true,
+    autoJoinGroups: 0,
+    blockedGroups: [],
+  }),
+  setUserNotes: async () => undefined,
+  setUserAlias: async () => undefined,
+  setMutedUntil: async () => undefined,
+  setRetention: async () => undefined,
+  setReadReceipts: async () => undefined,
+  setTypingIndicators: async () => undefined,
+  setUserBlocked: async () => undefined,
+  setOpenDm: async () => undefined,
+  setLastOpened: async () => undefined,
+  reachFor: async () => undefined,
 
   /*
    * Reacting and deleting, backed by the same event stream the engine uses.

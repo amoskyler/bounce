@@ -12,7 +12,7 @@
 
 pub mod schema;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -20,7 +20,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
-use crate::frames::file::File;
+use crate::frames::file::{ChunkOffer, File};
 use crate::frames::group::{Confirmation, Group, GroupCreation, UpdateGroup};
 use crate::frames::identity::{Device, IntroductionSignature, ProfileSettings, User};
 use crate::frames::interaction::{DeleteMessage, Reaction};
@@ -1056,6 +1056,23 @@ impl Store {
     /// Used when a device re-pairs: its first attempt evidently did not
     /// finish, and we cannot know how much of what we sent it survived, so the
     /// reference flow is made to offer everything again.
+    /// Drop one delivery record.
+    ///
+    /// A reference offer is delivery-tracked so the sender can tell whether it
+    /// landed, but it is not a stored frame — nothing would ever re-offer it —
+    /// so the row is consumed once it has answered that question, exactly as
+    /// Go consumes it (`chat/reference_offer.go:157`).
+    pub fn forget_delivery(&self, address: &str, frame_id: Uuid, frame_type: FrameType) -> Result<()> {
+        self.with(|connection| {
+            connection.execute(
+                "DELETE FROM delivery_records
+                 WHERE destination = ?1 AND frame_id = ?2 AND frame_type = ?3",
+                params![address, uuid_bytes(frame_id), frame_type.as_u16()],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn forget_deliveries_to(&self, address: &str) -> Result<()> {
         self.with(|connection| {
             connection.execute(
@@ -2176,6 +2193,26 @@ impl Store {
             // paired with the table it lives in and with whether that table
             // records when the frame was written — only messages age out.
             let sources = [
+                // First, and not merely for tidiness: a contact has to exist
+                // before anything they signed can be attributed to them, which
+                // is why `FrameType::catch_up_order` puts `AddUser` at 0.
+                // Leaving the table out of this list is what left a device that
+                // joined later not knowing who the profile knew — and therefore
+                // rejecting every frame every contact had ever sent.
+                ("add_users", FrameType::AddUser, false),
+                // Device group membership and its changes, then the profile's
+                // own preferences — the rest of what Go offers
+                // (`chat/reference_offer.go:279-294`) and what this port had
+                // only ever been able to *serve*: `frame_payload` could
+                // produce all three, but nothing put them in an offer, so the
+                // code answering for them was unreachable.
+                ("devices", FrameType::Device, false),
+                ("update_devices", FrameType::UpdateDevice, false),
+                ("update_settings", FrameType::UpdateSettings, false),
+                ("confirmations", FrameType::Confirmation, false),
+                // Who holds which chunk. Without these a file record that
+                // arrives by replay names no holder at all.
+                ("chunk_offers", FrameType::ChunkOffer, false),
                 ("direct_messages", FrameType::DirectMessage, true),
                 ("group_messages", FrameType::GroupMessage, true),
                 ("group_creations", FrameType::GroupCreation, false),
@@ -2238,12 +2275,17 @@ impl Store {
     /// Whether a frame is present locally, used to answer a reference offer.
     pub fn has_frame(&self, frame_id: Uuid, frame_type: FrameType) -> Result<bool> {
         let table = match frame_type {
+            FrameType::AddUser => "add_users",
             FrameType::DirectMessage => "direct_messages",
             FrameType::GroupMessage => "group_messages",
             FrameType::GroupCreation => "group_creations",
             FrameType::UpdateGroup => "update_groups",
             FrameType::ReadReceipt => "read_receipts",
             FrameType::Device => "devices",
+            FrameType::UpdateDevice => "update_devices",
+            FrameType::UpdateSettings => "update_settings",
+            FrameType::Confirmation => "confirmations",
+            FrameType::ChunkOffer => "chunk_offers",
             FrameType::File => "files",
             FrameType::UpdateDm => "update_dms",
             FrameType::UpdateUser => "update_users",
@@ -2268,6 +2310,18 @@ impl Store {
         use crate::frames::Broadcastable;
 
         Ok(match frame_type {
+            FrameType::AddUser => self
+                .add_user_record(frame_id)?
+                .map(|record| record.payload())
+                .transpose()?,
+            FrameType::Device => self
+                .device_by_id(frame_id)?
+                .map(|device| device.payload())
+                .transpose()?,
+            FrameType::ChunkOffer => self
+                .chunk_offer(frame_id)?
+                .map(|offer| offer.payload())
+                .transpose()?,
             FrameType::DirectMessage => self
                 .direct_message(frame_id)?
                 .map(|message| message.payload())
@@ -2325,6 +2379,12 @@ impl Store {
     /// When this device first stored a frame, which is the catch up sort key.
     pub fn frame_saved_at(&self, frame_id: Uuid, frame_type: FrameType) -> Result<Option<i64>> {
         let table = match frame_type {
+            FrameType::AddUser => "add_users",
+            FrameType::Device => "devices",
+            FrameType::UpdateDevice => "update_devices",
+            FrameType::UpdateSettings => "update_settings",
+            FrameType::Confirmation => "confirmations",
+            FrameType::ChunkOffer => "chunk_offers",
             FrameType::DirectMessage => "direct_messages",
             FrameType::GroupMessage => "group_messages",
             FrameType::GroupCreation => "group_creations",
@@ -2719,6 +2779,96 @@ impl Store {
                 )?;
             }
             Ok(inserted > 0)
+        })
+    }
+
+    /// Keep a chunk offer as a stored frame.
+    ///
+    /// Novelty here is the offer's *id*, exactly as in Go
+    /// (`chat/file.go:462-471`): an offer already held is neither re-saved nor
+    /// relayed, which is what bounds the gossip. Bounding it on
+    /// (hash, location) instead — as this port used to — throws the frame away,
+    /// and a frame thrown away is one the reference flow can never replay.
+    pub fn save_chunk_offer(&self, offer: &ChunkOffer) -> Result<bool> {
+        self.with(|connection| {
+            let inserted = connection.execute(
+                r#"INSERT INTO chunk_offers (
+                    id, scope, destination, author, file_id, hash, location,
+                    timestamp, saved_at, last_request_time,
+                    signer, original_payload, signature
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                ON CONFLICT (id) DO NOTHING"#,
+                params![
+                    uuid_bytes(offer.id),
+                    offer.scope,
+                    uuid_bytes(offer.destination),
+                    uuid_bytes(offer.author),
+                    uuid_bytes(offer.file_id),
+                    offer.hash,
+                    offer.location,
+                    offer.timestamp,
+                    offer.saved_at,
+                    offer.last_request_time,
+                    offer.signed.signer,
+                    offer.signed.original_payload,
+                    offer.signed.signature,
+                ],
+            )?;
+            Ok(inserted > 0)
+        })
+    }
+
+    /// One chunk offer by its frame id, for the reference flow.
+    pub fn chunk_offer(&self, id: Uuid) -> Result<Option<ChunkOffer>> {
+        self.with(|connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT * FROM chunk_offers WHERE id = ?1",
+                    params![uuid_bytes(id)],
+                    row_to_chunk_offer,
+                )
+                .optional()?)
+        })
+    }
+
+    /// Every stored offer for a chunk we are still missing.
+    ///
+    /// Go loads exactly this at start-up to seed its chunk engine
+    /// (`chat/chunk_engine.go:41-60`), skipping offers that name this device.
+    pub fn offers_for_wanted_chunks(&self, me: &str) -> Result<Vec<ChunkOffer>> {
+        self.with(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT o.* FROM chunk_offers AS o
+                 JOIN chunks AS c ON c.hash = o.hash
+                 JOIN files AS f ON f.id = c.file_id
+                 WHERE o.location != ?1
+                   AND c.downloaded = 0
+                   AND f.wanted = 1
+                   AND f.downloaded = 0
+                 GROUP BY o.id",
+            )?;
+            let offers = statement
+                .query_map(params![me], row_to_chunk_offer)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(offers)
+        })
+    }
+
+    /// Every chunk hash belonging to a file we want and have not finished.
+    ///
+    /// The aggregate form of Go's `chunkWanted` (`chat/chunk_engine.go:429`),
+    /// answered once per scheduler tick rather than once per chunk.
+    pub fn wanted_chunk_hashes(&self) -> Result<HashSet<String>> {
+        self.with(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT DISTINCT c.hash FROM chunks AS c
+                 JOIN files AS f ON f.id = c.file_id
+                 WHERE c.downloaded = 0 AND f.wanted = 1 AND f.downloaded = 0",
+            )?;
+            let hashes = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<HashSet<_>, _>>()?;
+            Ok(hashes)
         })
     }
 
@@ -3247,6 +3397,22 @@ fn row_to_reaction(row: &Row) -> rusqlite::Result<Reaction> {
         scope: row.get("scope")?,
         delete_at: row.get("delete_at")?,
         saved_at: row.get("saved_at")?,
+    })
+}
+
+fn row_to_chunk_offer(row: &Row) -> rusqlite::Result<ChunkOffer> {
+    Ok(ChunkOffer {
+        signed: row_to_signed_frame(row)?,
+        id: row_uuid(row, "id")?,
+        scope: row.get("scope")?,
+        destination: row_uuid(row, "destination")?,
+        author: row_uuid(row, "author")?,
+        file_id: row_uuid(row, "file_id")?,
+        hash: row.get("hash")?,
+        location: row.get("location")?,
+        timestamp: row.get("timestamp")?,
+        saved_at: row.get("saved_at")?,
+        last_request_time: row.get("last_request_time")?,
     })
 }
 
